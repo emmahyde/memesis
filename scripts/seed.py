@@ -201,7 +201,6 @@ def seed(kept: list[dict], project_context: str = None, dry_run: bool = False):
 
         try:
             Memory.create(
-                file_path=str(file_path),
                 stage="consolidated",
                 title=title,
                 summary=summary,

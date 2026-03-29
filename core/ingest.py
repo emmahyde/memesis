@@ -218,7 +218,6 @@ class NativeMemoryIngestor:
             now = datetime.now().isoformat()
             try:
                 new_mem = Memory.create(
-                    file_path=str(file_path),
                     stage="consolidated",
                     title=mem["name"],
                     summary=(mem.get("description") or "")[:150],

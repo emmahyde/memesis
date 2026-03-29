@@ -5,7 +5,6 @@ Implements D-07 (3+ reinforcements for crystallized), D-08 (cross-project promot
 and D-09 (demotion for unused memories).
 """
 
-import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -142,31 +141,16 @@ class LifecycleManager:
         """
         memory = Memory.get_by_id(memory_id)
         current_stage = memory.stage
-        file_path = Path(memory.file_path) if memory.file_path else None
 
-        base_dir = get_base_dir()
-        archived_path = base_dir / 'archived' / (file_path.name if file_path else f"{memory_id}.md")
-        archived_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Move file first
-        if file_path and file_path.exists():
-            shutil.move(str(file_path), str(archived_path))
-
-        # DB operations -- roll back file move on failure
-        try:
-            ConsolidationLog.create(
-                timestamp=datetime.now().isoformat(),
-                action='deprecated',
-                memory_id=memory_id,
-                from_stage=current_stage,
-                to_stage='archived',
-                rationale=rationale,
-            )
-            memory.delete_instance()
-        except Exception:
-            if archived_path.exists() and file_path:
-                shutil.move(str(archived_path), str(file_path))
-            raise
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
+            action='deprecated',
+            memory_id=memory_id,
+            from_stage=current_stage,
+            to_stage='archived',
+            rationale=rationale,
+        )
+        memory.delete_instance()
 
     def get_promotion_candidates(self) -> list[dict]:
         """

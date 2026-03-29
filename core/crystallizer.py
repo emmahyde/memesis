@@ -339,7 +339,6 @@ class Crystallizer:
 
         now = datetime.now().isoformat()
         crystal_mem = Memory.create(
-            file_path=str(file_path),
             stage="crystallized",
             title=result["title"],
             summary=result["insight"][:150],

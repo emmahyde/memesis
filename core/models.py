@@ -13,11 +13,8 @@ from datetime import datetime
 
 from peewee import (
     AutoField,
-    BooleanField,
-    CharField,
     CompositeKey,
     FloatField,
-    ForeignKeyField,
     IntegerField,
     Model,
     SqliteDatabase,
@@ -44,7 +41,6 @@ class Memory(BaseModel):
     """Maps to the ``memories`` table."""
 
     id = TextField(primary_key=True, default=lambda: str(uuid.uuid4()))
-    file_path = TextField(null=True)
     stage = TextField()
     title = TextField(null=True)
     summary = TextField(null=True)
@@ -254,8 +250,8 @@ class NarrativeThread(BaseModel):
     title = TextField()
     summary = TextField(null=True)
     narrative = TextField(null=True)
-    created_at = TextField()
-    updated_at = TextField()
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+    updated_at = TextField(default=lambda: datetime.now().isoformat())
     last_surfaced_at = TextField(null=True)
 
     class Meta:

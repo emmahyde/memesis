@@ -391,7 +391,6 @@ class SelfReflector:
 
         now = datetime.now().isoformat()
         mem = Memory.create(
-            file_path=str(file_path),
             stage="instinctive",
             title=title,
             summary=summary,
