@@ -47,6 +47,7 @@ def _get_consolidation_count(base_dir: Path) -> int:
 def _increment_consolidation_count(base_dir: Path) -> int:
     """Increment and persist the consolidation counter. Returns new count."""
     counter_path = base_dir / "meta" / "consolidation-count.json"
+    counter_path.parent.mkdir(parents=True, exist_ok=True)
     count = _get_consolidation_count(base_dir) + 1
     counter_path.write_text(json.dumps({"count": count}))
     return count
