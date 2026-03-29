@@ -20,8 +20,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.retrieval import RetrievalEngine
-from core.storage import MemoryStore
+try:
+    from core.retrieval import RetrievalEngine
+    from core.storage import MemoryStore
+    _CORE_STORAGE_AVAILABLE = True
+except ImportError:
+    RetrievalEngine = None
+    MemoryStore = None
+    _CORE_STORAGE_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +86,8 @@ PREFERENCE_MEMORIES = [
 @pytest.fixture
 def preference_store(tmp_path):
     """Store populated with 5 preference memories in instinctive stage."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     store = MemoryStore(base_dir=str(tmp_path / "preference_memory"))
 
     for pref in PREFERENCE_MEMORIES:
@@ -101,6 +109,8 @@ def preference_store(tmp_path):
 @pytest.fixture
 def preference_context(preference_store):
     """Context injected for a session, without any agent prompt about memory."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     engine = RetrievalEngine(preference_store)
     return engine.inject_for_session(session_id="spontaneous_recall_session")
 

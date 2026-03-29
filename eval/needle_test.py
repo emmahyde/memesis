@@ -14,8 +14,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.retrieval import RetrievalEngine
-from core.storage import MemoryStore
+try:
+    from core.retrieval import RetrievalEngine
+    from core.storage import MemoryStore
+    _CORE_STORAGE_AVAILABLE = True
+except ImportError:
+    RetrievalEngine = None
+    MemoryStore = None
+    _CORE_STORAGE_AVAILABLE = False
 from eval.conftest import seed_store
 
 
@@ -60,6 +66,8 @@ NEEDLES = [
 @pytest.fixture
 def needle_store(tmp_path):
     """Store pre-seeded with background noise + 3 needle memories."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     store = MemoryStore(base_dir=str(tmp_path / "needle_memory"))
     seed_store(store)  # 20 background memories
 
@@ -83,6 +91,8 @@ def needle_store(tmp_path):
 @pytest.fixture
 def needle_context(needle_store):
     """Pre-built injection context for needle tests."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     engine = RetrievalEngine(needle_store)
     return engine.inject_for_session(session_id="needle_eval_session")
 

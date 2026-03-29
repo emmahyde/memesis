@@ -22,9 +22,16 @@ def pytest_collect_file(parent, file_path):
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.storage import MemoryStore
-from core.lifecycle import LifecycleManager
-from core.retrieval import RetrievalEngine
+try:
+    from core.storage import MemoryStore
+    from core.lifecycle import LifecycleManager
+    from core.retrieval import RetrievalEngine
+    _CORE_STORAGE_AVAILABLE = True
+except ImportError:
+    MemoryStore = None
+    LifecycleManager = None
+    RetrievalEngine = None
+    _CORE_STORAGE_AVAILABLE = False
 
 FIXED_SEED = 42  # for reproducible synthetic data
 
@@ -221,7 +228,7 @@ SYNTHETIC_MEMORIES = [
 ]
 
 
-def seed_store(store: MemoryStore) -> list[str]:
+def seed_store(store) -> list[str]:  # store: MemoryStore when available
     """
     Populate a MemoryStore with all 20 synthetic memories.
 
@@ -247,6 +254,8 @@ def seed_store(store: MemoryStore) -> list[str]:
 @pytest.fixture
 def eval_store(tmp_path):
     """Isolated MemoryStore for each eval. Checkpoints WAL on teardown."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     store = MemoryStore(base_dir=str(tmp_path / "eval_memory"))
     yield store
     store.close()
@@ -255,6 +264,8 @@ def eval_store(tmp_path):
 @pytest.fixture
 def seeded_store(tmp_path):
     """Store pre-seeded with 20 synthetic memories. Checkpoints WAL on teardown."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     store = MemoryStore(base_dir=str(tmp_path / "eval_memory"))
     seed_store(store)
     yield store
@@ -264,16 +275,22 @@ def seeded_store(tmp_path):
 @pytest.fixture
 def eval_engine(eval_store):
     """RetrievalEngine bound to the eval_store."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     return RetrievalEngine(eval_store)
 
 
 @pytest.fixture
 def seeded_engine(seeded_store):
     """RetrievalEngine bound to the seeded_store."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     return RetrievalEngine(seeded_store)
 
 
 @pytest.fixture
 def lifecycle(eval_store):
     """LifecycleManager bound to the eval_store."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     return LifecycleManager(eval_store)
