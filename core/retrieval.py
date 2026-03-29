@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from peewee import fn
+
 from .database import get_base_dir, get_vec_store
 from .models import Memory, NarrativeThread, RetrievalLog, ThreadMember, db
 
@@ -111,6 +113,12 @@ class RetrievalEngine:
 
         # Tier 2 — Crystallized (context-relevant knowledge)
         if tier2:
+            from .flags import get_flag as _get_flag
+            if _get_flag("provenance_signals"):
+                provenance_map = self._compute_provenance_batch([m.id for m in tier2])
+            else:
+                provenance_map = {}
+
             sections.append("")
             sections.append("## Context-Relevant Knowledge")
             for memory in tier2:
@@ -118,6 +126,8 @@ class RetrievalEngine:
                 title = memory.title or "Memory"
                 importance = memory.importance or 0.5
                 sections.append(f"### {title} (importance: {importance:.2f})")
+                if memory.id in provenance_map:
+                    sections.append(f"*{provenance_map[memory.id]}*")
                 summary = (memory.summary or "").strip()
                 if summary:
                     sections.append(f"*{summary}*")
@@ -420,6 +430,110 @@ class RetrievalEngine:
                 budget_remaining -= cost
 
         return selected
+
+    def _compute_provenance_batch(self, memory_ids: list[str]) -> dict[str, str]:
+        """
+        Compute human-readable provenance strings for a batch of memory IDs.
+
+        Issues a single aggregating query against RetrievalLog to get per-memory
+        session counts and earliest retrieval timestamps, then formats strings:
+
+        - session_count > 1: "Established across N sessions over M weeks"
+          (uses "over less than a week" when weeks == 0)
+        - session_count <= 1 or no log entries: "First observed {relative_time}"
+          where relative_time is computed from Memory.created_at
+          ("recently" for <1 day, "N days ago", "N weeks ago", etc.)
+
+        Returns a dict mapping memory_id -> provenance string.
+        """
+        if not memory_ids:
+            return {}
+
+        # Single batched query: session_count + earliest per memory_id
+        rows = list(
+            RetrievalLog.select(
+                RetrievalLog.memory_id,
+                fn.COUNT(RetrievalLog.session_id.distinct()).alias("session_count"),
+                fn.MIN(RetrievalLog.timestamp).alias("earliest"),
+            )
+            .where(RetrievalLog.memory_id.in_(memory_ids))
+            .group_by(RetrievalLog.memory_id)
+        )
+
+        log_by_id: dict[str, tuple[int, str | None]] = {
+            row.memory_id: (row.session_count, row.earliest)
+            for row in rows
+        }
+
+        now = datetime.now()
+        result: dict[str, str] = {}
+
+        # Collect IDs needing created_at fallback (single-session or no log entries)
+        fallback_ids = [
+            mid for mid in memory_ids
+            if mid not in log_by_id or log_by_id[mid][0] <= 1
+        ]
+
+        # Batch-load created_at for fallback IDs (one query)
+        created_at_by_id: dict[str, str | None] = {}
+        if fallback_ids:
+            for mem in Memory.select(Memory.id, Memory.created_at).where(Memory.id.in_(fallback_ids)):
+                created_at_by_id[mem.id] = mem.created_at
+
+        for mid in memory_ids:
+            if mid in log_by_id:
+                session_count, earliest_str = log_by_id[mid]
+            else:
+                session_count, earliest_str = 0, None
+
+            if session_count > 1 and earliest_str:
+                # Multi-session: compute span in weeks
+                try:
+                    earliest_dt = datetime.fromisoformat(earliest_str)
+                except (ValueError, TypeError):
+                    earliest_dt = now
+
+                days_span = (now - earliest_dt).days
+                weeks = days_span // 7
+
+                if weeks == 0:
+                    week_phrase = "over less than a week"
+                elif weeks == 1:
+                    week_phrase = "over 1 week"
+                else:
+                    week_phrase = f"over {weeks} weeks"
+
+                result[mid] = f"Established across {session_count} sessions {week_phrase}"
+            else:
+                # Single-session or zero-session: relative time from created_at
+                created_str = created_at_by_id.get(mid)
+                relative = self._relative_time(created_str, now)
+                result[mid] = f"First observed {relative}"
+
+        return result
+
+    @staticmethod
+    def _relative_time(created_str: str | None, now: datetime) -> str:
+        """Format a relative time string from a created_at ISO string."""
+        if not created_str:
+            return ""
+        try:
+            created_dt = datetime.fromisoformat(created_str)
+        except (ValueError, TypeError):
+            return ""
+
+        delta_days = (now - created_dt).days
+        if delta_days < 1:
+            return "recently"
+        elif delta_days == 1:
+            return "1 day ago"
+        elif delta_days < 7:
+            return f"{delta_days} days ago"
+        elif delta_days < 14:
+            return "1 week ago"
+        else:
+            weeks = delta_days // 7
+            return f"{weeks} weeks ago"
 
     def _thompson_rerank(self, memories: list) -> list:
         """Re-rank memories using Thompson sampling over Beta(usage+1, unused+1).
