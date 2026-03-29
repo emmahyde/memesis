@@ -2,10 +2,12 @@
 """UserPromptSubmit hook — just-in-time memory injection based on prompt content.
 
 Fires on every user message. Extracts key terms from the prompt, searches
-the memory index via FTS, and injects relevant memories that weren't already
-loaded at SessionStart.
+the memory index via hybrid RRF (FTS + optional vector), and injects relevant
+memories that weren't already loaded at SessionStart.
 
-Must be fast: FTS only, no LLM calls, small token budget (~2000 tokens).
+Must be fast: FTS < 10ms, vec KNN < 3ms, RRF merge < 1ms.  The embedding call
+(~200-400ms) is attempted but never required — FTS-only hybrid is used if
+Bedrock is unavailable.
 """
 
 import json
@@ -17,8 +19,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.database import init_db
+from core.database import get_vec_store, init_db
 from core.models import Memory, RetrievalLog
+from core.retrieval import RetrievalEngine
 
 # Max characters (~500 tokens) for just-in-time injection.
 # Deliberately small — this supplements SessionStart, not replaces it.
@@ -94,25 +97,55 @@ def search_and_inject(
 ) -> str:
     """
     Search for memories relevant to the prompt and format for injection.
+
+    Uses hybrid RRF (FTS + optional vector) via RetrievalEngine.  The FTS
+    query is built from extracted terms; the embedding is generated from the
+    raw prompt (natural language).  If embedding fails, FTS-only hybrid runs.
     """
     terms = extract_query_terms(prompt)
     if not terms:
         return ""
 
-    query = " OR ".join(Memory.sanitize_fts_term(t) for t in terms)
+    # Build FTS query string (FTS leg of hybrid_search)
+    fts_query = " OR ".join(Memory.sanitize_fts_term(t) for t in terms)
 
+    # Attempt embedding from raw prompt text (vector leg of hybrid_search)
+    query_embedding = None
     try:
-        results = Memory.search_fts(query, limit=10)
+        from core.embeddings import embed_text
+        query_embedding = embed_text(prompt[:500])
+    except Exception:
+        pass  # FTS-only hybrid fallback
+
+    # Run hybrid RRF via RetrievalEngine
+    try:
+        engine = RetrievalEngine()
+        ranked = engine.hybrid_search(
+            query=fts_query,
+            query_embedding=query_embedding,
+            k=10,
+            vec_store=get_vec_store(),
+        )
     except Exception:
         return ""
 
-    if not results:
+    if not ranked:
         return ""
 
-    # Filter out already-injected and archived memories
+    # Hydrate Memory objects from ranked IDs
+    ranked_ids = [mid for mid, _ in ranked]
+    memories_by_id = {
+        m.id: m
+        for m in Memory.select().where(Memory.id.in_(ranked_ids))
+    }
+
+    # Build ordered candidate list (preserve RRF order)
+    all_candidates = [memories_by_id[mid] for mid, _ in ranked if mid in memories_by_id]
+
+    # Filter out already-injected, archived, and ephemeral memories
     already_injected = get_already_injected(session_id)
     candidates = [
-        m for m in results
+        m for m in all_candidates
         if m.id not in already_injected
         and not m.archived_at
         and m.stage != "ephemeral"
