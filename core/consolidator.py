@@ -128,9 +128,11 @@ class Consolidator:
             resolved = self._resolve_conflicts(conflicts, session_id)
 
         # 7. Check if kept observations match any archived memories → rehydrate
+        # Exclude memories that were just archived by contradiction resolution
+        just_archived = {r["memory_id"] for r in resolved if r["resolution_type"] == "superseded"}
         rehydrated = []
         if kept:
-            rehydrated = self._check_rehydration(kept)
+            rehydrated = self._check_rehydration(kept, exclude_ids=just_archived)
 
         return {
             "kept": kept,
@@ -476,17 +478,45 @@ class Consolidator:
             refined_content = result.get("refined_content", "")
 
             if resolution_type == "superseded":
-                # The new observation fully replaces the old memory
+                # The new observation fully replaces the old memory — archive it
+                superseded_note = (
+                    f"[Superseded] {refined_content}\n\n"
+                    f"---\nSuperseded by observation: {observation[:200]}"
+                )
+                self.store.update(
+                    memory_id,
+                    content=superseded_note,
+                    metadata={
+                        "title": f"[Superseded] {refined_title}",
+                        "summary": f"Superseded: {refined_content[:120]}",
+                    },
+                )
+                self.store.archive(memory_id)
+                log_action = "deprecated"
+            elif resolution_type == "scoped":
+                # Both memories survive with clarified scope
+                existing_tags = memory.get("tags", [])
+                if isinstance(existing_tags, str):
+                    import json as _json
+                    try:
+                        existing_tags = _json.loads(existing_tags)
+                    except (ValueError, TypeError):
+                        existing_tags = []
+                scope_tags = [t for t in existing_tags if t.startswith("scope:")]
+                if not scope_tags:
+                    existing_tags.append("scope:narrowed")
                 self.store.update(
                     memory_id,
                     content=refined_content,
                     metadata={
                         "title": refined_title,
                         "summary": refined_content[:150],
+                        "tags": existing_tags,
                     },
                 )
+                log_action = "merged"
             else:
-                # Scoped or coexist — refine with nuance
+                # Coexist — refine content, both memories valid as-is
                 self.store.update(
                     memory_id,
                     content=refined_content,
@@ -495,9 +525,10 @@ class Consolidator:
                         "summary": refined_content[:150],
                     },
                 )
+                log_action = "merged"
 
             self.store.log_consolidation(
-                action="merged",
+                action=log_action,
                 memory_id=memory_id,
                 from_stage=memory["stage"],
                 to_stage=memory["stage"],
@@ -542,7 +573,7 @@ class Consolidator:
             text = "\n".join(lines).strip()
         return json.loads(text)
 
-    def _check_rehydration(self, kept_ids: list[str]) -> list[str]:
+    def _check_rehydration(self, kept_ids: list[str], exclude_ids: set = None) -> list[str]:
         """
         Check if newly kept observations match any archived memories.
 
@@ -551,10 +582,13 @@ class Consolidator:
 
         Args:
             kept_ids: List of memory IDs that were just created (KEEP decisions).
+            exclude_ids: Memory IDs to skip (e.g., just-superseded memories).
 
         Returns:
             List of rehydrated memory IDs.
         """
+        if exclude_ids is None:
+            exclude_ids = set()
         relevance_engine = RelevanceEngine(self.store)
         rehydrated = []
 
@@ -569,6 +603,8 @@ class Consolidator:
             matches = relevance_engine.find_rehydration_by_observation(search_text)
 
             for match in matches:
+                if match["id"] in exclude_ids:
+                    continue
                 try:
                     self.store.unarchive(match["id"])
                     self.store.log_consolidation(
