@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 07-hybrid-rrf-retrieval-01-PLAN.md
-last_updated: "2026-03-29T22:13:05.522Z"
+stopped_at: Completed 07-hybrid-rrf-retrieval-02-PLAN.md
+last_updated: "2026-03-29T22:19:59.821Z"
 last_activity: 2026-03-29 — Phases 1-6 (cleanup) complete, gold set eval wired into report
 progress:
   total_phases: 27
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 2
-  completed_plans: 1
+  completed_plans: 2
   percent: 33
 ---
 
@@ -54,6 +54,7 @@ Progress: [███░░░░░░░] 33%
 | Phase 00.5-ai-eval-harness P02 | 2 | 1 tasks | 2 files |
 | Phase 00.5-ai-eval-harness P03 | 2 | 2 tasks | 3 files |
 | Phase 07-hybrid-rrf-retrieval P01 | 15 | 1 tasks | 2 files |
+| Phase 07-hybrid-rrf-retrieval P02 | 5 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -75,6 +76,10 @@ Recent decisions affecting current work:
 - [Phase 07-hybrid-rrf-retrieval]: RRF uses position-based rank, not raw BM25/distance scores
 - [Phase 07-hybrid-rrf-retrieval]: VecStore accepted as parameter to avoid circular imports - keeps hybrid_search independently testable
 - [Phase 07-hybrid-rrf-retrieval]: Fallback to FTS-only when vec_store is None, unavailable, or query_embedding is None
+- [Phase 07-hybrid-rrf-retrieval]: query=None preserves backward-compatible static sort in get_crystallized_for_context
+- [Phase 07-hybrid-rrf-retrieval]: inject_for_session does not call embed_text - embedding responsibility belongs to the hook caller for 500ms budget
+- [Phase 07-hybrid-rrf-retrieval]: active_search calls embed_text lazily - Tier 3 latency acceptable, Tier 2 is not
+- [Phase 07-hybrid-rrf-retrieval]: project_context boost = 1/(60+0.5) added to RRF score - keeps local memories competitive without overriding strong semantic matches
 
 ### Pending Todos
 
@@ -88,6 +93,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T22:13:05.519Z
-Stopped at: Completed 07-hybrid-rrf-retrieval-01-PLAN.md
+Last session: 2026-03-29T22:19:59.818Z
+Stopped at: Completed 07-hybrid-rrf-retrieval-02-PLAN.md
 Resume file: None
