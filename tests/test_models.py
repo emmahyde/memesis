@@ -88,15 +88,11 @@ class TestDatabaseInit:
         finally:
             close_db()
 
-    def test_init_dirs_creates_structure(self, store):
-        """Test directory structure creation."""
+    def test_init_dirs_creates_base(self, store):
+        """Test base directory creation (stage dirs no longer created)."""
         base_dir = store
-        assert (base_dir / 'ephemeral').exists()
-        assert (base_dir / 'consolidated').exists()
-        assert (base_dir / 'crystallized').exists()
-        assert (base_dir / 'instinctive').exists()
-        assert (base_dir / 'meta').exists()
-        assert (base_dir / 'archived').exists()
+        assert base_dir.exists()
+        assert (base_dir / 'index.db').exists()
 
     def test_database_initialized(self, store):
         """Test SQLite database is initialized with correct schema."""
