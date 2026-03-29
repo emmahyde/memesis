@@ -116,6 +116,10 @@ class FeedbackLoop:
 
             usage_map[memory_id] = was_used
 
+            # Update SM-2 spaced injection schedule
+            from .spaced import update_sm2_schedule
+            update_sm2_schedule(memory, was_used)
+
             if was_used:
                 _record_usage(memory_id, session_id)
                 # Normalize confidence to [0, 1] — score of 4 = 0 confidence,

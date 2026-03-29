@@ -59,6 +59,9 @@ class Memory(BaseModel):
     content_hash = TextField(null=True)
     archived_at = TextField(null=True)
     subsumed_by = TextField(null=True)
+    next_injection_due = TextField(null=True)
+    injection_ease_factor = FloatField(default=2.5, null=True)
+    injection_interval_days = FloatField(default=1.0, null=True)
 
     class Meta:
         table_name = "memories"

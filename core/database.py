@@ -167,6 +167,9 @@ def _run_migrations():
         ("content", "TEXT"),
         ("archived_at", "TEXT"),
         ("subsumed_by", "TEXT"),
+        ("next_injection_due", "TEXT"),
+        ("injection_ease_factor", "REAL DEFAULT 2.5"),
+        ("injection_interval_days", "REAL DEFAULT 1.0"),
     ]:
         if col not in mem_cols:
             try:
