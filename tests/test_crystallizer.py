@@ -3,12 +3,12 @@ Tests for the crystallization engine — episodic → semantic memory transforma
 """
 
 import json
-import sqlite3
 import struct
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import apsw
 import numpy as np
 import pytest
 
@@ -49,11 +49,12 @@ def _create_consolidated(store, title, content, tags=None, reinforcement_count=0
         },
     )
     if reinforcement_count > 0:
-        with sqlite3.connect(store.db_path) as conn:
-            conn.execute(
-                "UPDATE memories SET reinforcement_count = ? WHERE id = ?",
-                (reinforcement_count, mem_id),
-            )
+        conn = apsw.Connection(str(store.db_path))
+        conn.execute(
+            "UPDATE memories SET reinforcement_count = ? WHERE id = ?",
+            (reinforcement_count, mem_id),
+        )
+        conn.close()
     return mem_id
 
 
@@ -251,11 +252,12 @@ def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, store):
 
     crystallizer.crystallize_candidates()
 
-    with sqlite3.connect(store.db_path) as conn:
-        rows = conn.execute(
-            "SELECT action, rationale FROM consolidation_log WHERE memory_id = ?",
-            (mem_id,),
-        ).fetchall()
+    conn = apsw.Connection(str(store.db_path))
+    rows = list(conn.execute(
+        "SELECT action, rationale FROM consolidation_log WHERE memory_id = ?",
+        (mem_id,),
+    ))
+    conn.close()
     actions = [r[0] for r in rows]
     assert "subsumed" in actions
 

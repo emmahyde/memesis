@@ -3,13 +3,13 @@ Tests for narrative thread detection, synthesis, and retrieval integration.
 """
 
 import json
-import sqlite3
 import struct
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import apsw
 import numpy as np
 import pytest
 
@@ -42,11 +42,12 @@ def _create_memory(store, title, content, stage="consolidated", tags=None, creat
         },
     )
     if created_at:
-        with sqlite3.connect(store.db_path) as conn:
-            conn.execute(
-                "UPDATE memories SET created_at = ? WHERE id = ?",
-                (created_at, mem_id),
-            )
+        conn = apsw.Connection(str(store.db_path))
+        conn.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            (created_at, mem_id),
+        )
+        conn.close()
     return mem_id
 
 
@@ -159,11 +160,12 @@ class TestThreadDetector:
             start = datetime(2026, 1, 1)
         for i, mid in enumerate(mem_ids):
             ts = (start + timedelta(hours=i * gap_hours)).isoformat()
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    "UPDATE memories SET created_at = ? WHERE id = ?",
-                    (ts, mid),
-                )
+            conn = apsw.Connection(str(store.db_path))
+            conn.execute(
+                "UPDATE memories SET created_at = ? WHERE id = ?",
+                (ts, mid),
+            )
+            conn.close()
 
     def test_no_candidates_returns_empty(self, store):
         detector = ThreadDetector(store)
@@ -261,11 +263,12 @@ class TestThreadDetector:
         start = datetime(2026, 1, 1)
         for i, mid in enumerate(reversed(ids)):
             ts = (start + timedelta(hours=i * 48)).isoformat()
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    "UPDATE memories SET created_at = ? WHERE id = ?",
-                    (ts, mid),
-                )
+            conn = apsw.Connection(str(store.db_path))
+            conn.execute(
+                "UPDATE memories SET created_at = ? WHERE id = ?",
+                (ts, mid),
+            )
+            conn.close()
 
         detector = ThreadDetector(store)
         clusters = detector.detect_threads()
@@ -462,9 +465,9 @@ class TestLastSurfacedAtMigration:
         """A freshly initialised MemoryStore must include last_surfaced_at in narrative_threads."""
         s = MemoryStore(base_dir=str(tmp_path / "memory"))
         try:
-            with sqlite3.connect(s.db_path) as conn:
-                cursor = conn.execute("PRAGMA table_info(narrative_threads)")
-                columns = [row[1] for row in cursor.fetchall()]
+            conn = apsw.Connection(str(s.db_path))
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(narrative_threads)")]
+            conn.close()
             assert "last_surfaced_at" in columns
         finally:
             s.close()
@@ -599,11 +602,12 @@ class TestEmbeddingClustering:
             start = datetime(2026, 1, 1)
         for i, mid in enumerate(mem_ids):
             ts = (start + timedelta(hours=i * gap_hours)).isoformat()
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    "UPDATE memories SET created_at = ? WHERE id = ?",
-                    (ts, mid),
-                )
+            conn = apsw.Connection(str(store.db_path))
+            conn.execute(
+                "UPDATE memories SET created_at = ? WHERE id = ?",
+                (ts, mid),
+            )
+            conn.close()
 
     def test_semantically_similar_memories_cluster(self, store):
         """Memories with highly similar embeddings form at least one cluster."""
