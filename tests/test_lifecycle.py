@@ -2,11 +2,11 @@
 Tests for lifecycle state machine with promotion/demotion rules.
 """
 
-import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import apsw
 import pytest
 
 # Add parent directory to path for imports
@@ -30,14 +30,14 @@ def manager(store):
 
 def _add_reinforcement_log(store, memory_id, timestamp, session_id="test-session"):
     """Helper: insert a consolidation_log 'promoted' entry at a specific timestamp."""
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            """INSERT INTO consolidation_log
-               (timestamp, session_id, action, memory_id, from_stage, to_stage, rationale)
-               VALUES (?, ?, 'promoted', ?, 'consolidated', 'consolidated', 'Reinforced')""",
-            (timestamp.isoformat(), session_id, memory_id),
-        )
-        conn.commit()
+    conn = apsw.Connection(str(store.db_path))
+    conn.execute(
+        """INSERT INTO consolidation_log
+           (timestamp, session_id, action, memory_id, from_stage, to_stage, rationale)
+           VALUES (?, ?, 'promoted', ?, 'consolidated', 'consolidated', 'Reinforced')""",
+        (timestamp.isoformat(), session_id, memory_id),
+    )
+    conn.close()
 
 
 def test_promote_ephemeral_to_consolidated(store, manager):
@@ -69,18 +69,19 @@ def test_promote_ephemeral_to_consolidated(store, manager):
     assert file_path.parent.name == 'consolidated'
 
     # Verify transition logged
-    with sqlite3.connect(store.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.execute('''
-            SELECT * FROM consolidation_log
-            WHERE memory_id = ? AND action = 'promoted'
-        ''', (memory_id,))
-        log = cursor.fetchone()
+    conn = apsw.Connection(str(store.db_path))
+    cursor = conn.execute('''
+        SELECT * FROM consolidation_log
+        WHERE memory_id = ? AND action = 'promoted'
+    ''', (memory_id,))
+    row = next(cursor, None)
+    log = {d[0]: v for d, v in zip(cursor.description, row)} if row is not None else None
+    conn.close()
 
-        assert log is not None
-        assert log['from_stage'] == 'ephemeral'
-        assert log['to_stage'] == 'consolidated'
-        assert log['rationale'] == 'Ready for consolidation'
+    assert log is not None
+    assert log['from_stage'] == 'ephemeral'
+    assert log['to_stage'] == 'consolidated'
+    assert log['rationale'] == 'Ready for consolidation'
 
 
 def test_promote_consolidated_to_crystallized_with_reinforcement(store, manager):
@@ -229,18 +230,19 @@ def test_demote_memory(store, manager):
     assert memory['stage'] == 'consolidated'
 
     # Verify transition logged
-    with sqlite3.connect(store.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.execute('''
-            SELECT * FROM consolidation_log
-            WHERE memory_id = ? AND action = 'demoted'
-        ''', (memory_id,))
-        log = cursor.fetchone()
+    conn = apsw.Connection(str(store.db_path))
+    cursor = conn.execute('''
+        SELECT * FROM consolidation_log
+        WHERE memory_id = ? AND action = 'demoted'
+    ''', (memory_id,))
+    row = next(cursor, None)
+    log = {d[0]: v for d, v in zip(cursor.description, row)} if row is not None else None
+    conn.close()
 
-        assert log is not None
-        assert log['from_stage'] == 'crystallized'
-        assert log['to_stage'] == 'consolidated'
-        assert log['rationale'] == 'Low usage'
+    assert log is not None
+    assert log['from_stage'] == 'crystallized'
+    assert log['to_stage'] == 'consolidated'
+    assert log['rationale'] == 'Low usage'
 
 
 def test_demotion_can_skip_stages(store, manager):
@@ -281,17 +283,18 @@ def test_deprecate_memory(store, manager):
         store.get(memory_id)
 
     # Verify deprecation logged
-    with sqlite3.connect(store.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.execute('''
-            SELECT * FROM consolidation_log
-            WHERE memory_id = ? AND action = 'deprecated'
-        ''', (memory_id,))
-        log = cursor.fetchone()
+    conn = apsw.Connection(str(store.db_path))
+    cursor = conn.execute('''
+        SELECT * FROM consolidation_log
+        WHERE memory_id = ? AND action = 'deprecated'
+    ''', (memory_id,))
+    row = next(cursor, None)
+    log = {d[0]: v for d, v in zip(cursor.description, row)} if row is not None else None
+    conn.close()
 
-        assert log is not None
-        assert log['from_stage'] == 'ephemeral'
-        assert log['to_stage'] == 'archived'
+    assert log is not None
+    assert log['from_stage'] == 'ephemeral'
+    assert log['to_stage'] == 'archived'
 
 
 def test_get_promotion_candidates(store, manager):
@@ -400,12 +403,12 @@ def test_get_deprecation_candidates(store, manager):
 
     # Manually set last_injected_at to 40 days ago
     old_date = (datetime.now() - timedelta(days=40)).isoformat()
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            'UPDATE memories SET last_injected_at = ? WHERE id = ?',
-            (old_date, memory_id)
-        )
-        conn.commit()
+    conn = apsw.Connection(str(store.db_path))
+    conn.execute(
+        'UPDATE memories SET last_injected_at = ? WHERE id = ?',
+        (old_date, memory_id)
+    )
+    conn.close()
 
     candidates = manager.get_deprecation_candidates(stale_sessions=30)
 
@@ -529,13 +532,13 @@ def test_multiple_promotions_in_sequence(store, manager):
     assert stage == 'instinctive'
 
     # Verify all transitions logged
-    with sqlite3.connect(store.db_path) as conn:
-        cursor = conn.execute('''
-            SELECT COUNT(*) FROM consolidation_log
-            WHERE memory_id = ? AND action = 'promoted'
-        ''', (memory_id,))
-        count = cursor.fetchone()[0]
-        assert count == 3
+    conn = apsw.Connection(str(store.db_path))
+    count = next(conn.execute('''
+        SELECT COUNT(*) FROM consolidation_log
+        WHERE memory_id = ? AND action = 'promoted'
+    ''', (memory_id,)))[0]
+    conn.close()
+    assert count == 3
 
 
 # -------------------------------------------------------------------

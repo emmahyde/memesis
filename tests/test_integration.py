@@ -7,12 +7,12 @@ Runs in isolated tmp_path directories; no real filesystem pollution.
 """
 
 import json
-import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import apsw
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -162,19 +162,19 @@ class TestFullLifecycleEphemeralToCrystallized:
         # so the spacing check sees multi-day spread (in production, sessions
         # genuinely happen on different days).
         # ------------------------------------------------------------------
-        with sqlite3.connect(store.db_path) as conn:
-            rows = conn.execute(
-                """SELECT id, session_id FROM consolidation_log
-                   WHERE action = 'promoted' AND from_stage = to_stage
-                   ORDER BY id""",
-            ).fetchall()
-            for i, (row_id, _session_id) in enumerate(rows):
-                fake_date = (datetime(2026, 3, 10) + timedelta(days=i)).isoformat()
-                conn.execute(
-                    "UPDATE consolidation_log SET timestamp = ? WHERE id = ?",
-                    (fake_date, row_id),
-                )
-            conn.commit()
+        conn = apsw.Connection(str(store.db_path))
+        rows = list(conn.execute(
+            """SELECT id, session_id FROM consolidation_log
+               WHERE action = 'promoted' AND from_stage = to_stage
+               ORDER BY id""",
+        ))
+        for i, (row_id, _session_id) in enumerate(rows):
+            fake_date = (datetime(2026, 3, 10) + timedelta(days=i)).isoformat()
+            conn.execute(
+                "UPDATE consolidation_log SET timestamp = ? WHERE id = ?",
+                (fake_date, row_id),
+            )
+        conn.close()
 
         # ------------------------------------------------------------------
         # After session 4: reinforcement_count must be >= 3

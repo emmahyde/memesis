@@ -10,12 +10,13 @@ import json
 import logging
 import os
 import shutil
-import sqlite3
 import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import apsw
 
 try:
     import sqlite_vec
@@ -73,9 +74,10 @@ class MemoryStore:
         to collapse WAL/SHM files and avoid EMFILE exhaustion under load.
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.OperationalError:
+            conn = apsw.Connection(str(self.db_path))
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.close()
+        except apsw.Error:
             pass  # DB may already be cleaned up
 
     def __del__(self) -> None:
@@ -90,6 +92,13 @@ class MemoryStore:
         """Convert project path to safe directory name, matching Claude Code's convention."""
         import re
         return re.sub(r'[^a-zA-Z0-9-]', '-', path)
+
+    @staticmethod
+    def _row_dict(cursor, row):
+        """Convert a cursor row tuple to a dict using column names."""
+        if row is None:
+            return None
+        return {d[0]: v for d, v in zip(cursor.description, row)}
 
     def init_dirs(self) -> None:
         """Initialize directory structure."""
@@ -106,12 +115,14 @@ class MemoryStore:
         self._vec_available = False
         self.init_dirs()
 
-        with sqlite3.connect(self.db_path) as conn:
-            # Enable WAL mode for concurrent read safety
-            conn.execute('PRAGMA journal_mode=WAL')
-            conn.execute('PRAGMA synchronous=NORMAL')
-            conn.execute('PRAGMA busy_timeout=5000')
+        conn = apsw.Connection(str(self.db_path))
 
+        # PRAGMAs that change journal mode cannot run inside a transaction
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA busy_timeout=5000')
+
+        with conn:
             # Main memories table
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS memories (
@@ -160,13 +171,13 @@ class MemoryStore:
             # Migration: add project_context if upgrading from earlier schema
             try:
                 conn.execute("ALTER TABLE retrieval_log ADD COLUMN project_context TEXT")
-            except sqlite3.OperationalError:
+            except apsw.SQLError:
                 pass  # Column already exists
 
             # Migration: add archived_at for reversible archival
             try:
                 conn.execute("ALTER TABLE memories ADD COLUMN archived_at TEXT")
-            except sqlite3.OperationalError:
+            except apsw.SQLError:
                 pass  # Column already exists
 
             # Migration: add subsumed_by for inhibition (retrieval-induced
@@ -176,7 +187,7 @@ class MemoryStore:
             # during rehydration — they should not compete with their parent.
             try:
                 conn.execute("ALTER TABLE memories ADD COLUMN subsumed_by TEXT")
-            except sqlite3.OperationalError:
+            except apsw.SQLError:
                 pass  # Column already exists
 
             # Consolidation log
@@ -217,34 +228,63 @@ class MemoryStore:
             # Migration: add last_surfaced_at for thread recency tracking
             try:
                 conn.execute("ALTER TABLE narrative_threads ADD COLUMN last_surfaced_at TEXT")
-            except sqlite3.OperationalError:
+            except apsw.SQLError:
                 pass  # Column already exists
 
             # FTS sync is managed manually in create/update/delete methods
             # (SQLite readfile() is not available in standard builds)
 
-            conn.commit()
+            # Migration: ensure consolidation_log CHECK constraint includes
+            # 'subsumed' and 'archived'. SQLite can't ALTER CHECK constraints,
+            # so we detect the old schema and recreate the table.
+            schema_cursor = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='consolidation_log'"
+            )
+            schema = next(schema_cursor, None)
+            if schema and "'subsumed'" not in schema[0]:
+                rows = list(conn.execute(
+                    'SELECT timestamp, session_id, action, memory_id, '
+                    'from_stage, to_stage, rationale FROM consolidation_log'
+                ))
+                conn.execute('DROP TABLE consolidation_log')
+                conn.execute('''
+                    CREATE TABLE consolidation_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        session_id TEXT,
+                        action TEXT CHECK(action IN ('kept', 'pruned', 'promoted',
+                            'demoted', 'merged', 'deprecated', 'subsumed', 'archived')),
+                        memory_id TEXT,
+                        from_stage TEXT,
+                        to_stage TEXT,
+                        rationale TEXT
+                    )
+                ''')
+                for r in rows:
+                    conn.execute(
+                        'INSERT INTO consolidation_log '
+                        '(timestamp, session_id, action, memory_id, from_stage, to_stage, rationale) '
+                        'VALUES (?,?,?,?,?,?,?)', r
+                    )
+        conn.close()
 
-        # sqlite-vec setup — requires enable_load_extension (guaranteed by
-        # the plugin venv which uses a Python compiled with extension support).
+        # sqlite-vec setup via apsw — apsw bundles its own SQLite with
+        # extension loading always enabled, so no special Python build needed.
         if _SQLITE_VEC_AVAILABLE:
             try:
-                with sqlite3.connect(self.db_path) as vec_conn:
-                    vec_conn.enable_load_extension(True)
-                    sqlite_vec.load(vec_conn)
-                    vec_conn.enable_load_extension(False)
-                    vec_conn.execute('''
-                        CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
-                            memory_id TEXT PRIMARY KEY,
-                            embedding float[512]
-                        )
-                    ''')
-                    vec_conn.commit()
+                vec_conn = apsw.Connection(str(self.db_path))
+                vec_conn.enable_load_extension(True)
+                vec_conn.load_extension(sqlite_vec.loadable_path())
+                vec_conn.execute('''
+                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
+                        memory_id TEXT PRIMARY KEY,
+                        embedding float[512]
+                    )
+                ''')
+                vec_conn.close()
                 self._vec_available = True
-            except (AttributeError, Exception) as e:
-                # AttributeError: enable_load_extension not available on this Python
-                # Other: sqlite-vec load failure
-                logger.warning("sqlite-vec unavailable (need Python with extension loading): %s", e)
+            except Exception as e:
+                logger.warning("sqlite-vec unavailable: %s", e)
 
     def _fts_insert(self, conn, rowid: int, title: str, summary: str, tags: str, content: str) -> None:
         """Insert a row into the FTS5 index."""
@@ -262,18 +302,16 @@ class MemoryStore:
 
     def _get_rowid(self, conn, memory_id: str) -> Optional[int]:
         """Get the rowid for a memory by its UUID."""
-        cursor = conn.execute('SELECT rowid FROM memories WHERE id = ?', (memory_id,))
-        row = cursor.fetchone()
+        row = next(conn.execute('SELECT rowid FROM memories WHERE id = ?', (memory_id,)), None)
         return row[0] if row else None
 
-    def _vec_connect(self):
-        """Open a sqlite3 connection with sqlite-vec loaded. Caller must close."""
+    def _vec_conn(self):
+        """Open an apsw connection with sqlite-vec loaded. Caller must close."""
         if not self._vec_available:
             return None
-        conn = sqlite3.connect(self.db_path)
+        conn = apsw.Connection(str(self.db_path))
         conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+        conn.load_extension(sqlite_vec.loadable_path())
         return conn
 
     def _compute_content_hash(self, content: str) -> str:
@@ -362,10 +400,11 @@ class MemoryStore:
         now = metadata.get('created_at') or datetime.now().isoformat()
         tags_json = json.dumps(metadata.get('tags', []))
 
-        with sqlite3.connect(self.db_path) as conn:
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
             # Check for duplicate content
-            cursor = conn.execute('SELECT id FROM memories WHERE content_hash = ?', (content_hash,))
-            if cursor.fetchone():
+            row = next(conn.execute('SELECT id FROM memories WHERE content_hash = ?', (content_hash,)), None)
+            if row:
                 raise ValueError(f"Duplicate content detected (hash: {content_hash})")
 
             # Atomic write: tmp file + rename
@@ -400,7 +439,7 @@ class MemoryStore:
             # Sync FTS
             rowid = self._get_rowid(conn, memory_id)
             self._fts_insert(conn, rowid, metadata.get('title'), metadata.get('summary'), tags_json, full_content)
-            conn.commit()
+        conn.close()
 
         return memory_id
 
@@ -416,16 +455,16 @@ class MemoryStore:
         Raises:
             ValueError: If memory not found
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM memories WHERE id = ?', (memory_id,))
-            row = cursor.fetchone()
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
+            cursor = conn.execute('SELECT * FROM memories WHERE id = ?', (memory_id,))
+            row = next(cursor, None)
 
             if not row:
                 raise ValueError(f"Memory not found: {memory_id}")
 
-            file_path = Path(row['file_path'])
+            row_dict = self._row_dict(cursor, row)
+            file_path = Path(row_dict['file_path'])
             old_rowid = self._get_rowid(conn, memory_id)
 
             # Read existing content for FTS delete
@@ -461,7 +500,7 @@ class MemoryStore:
                 raise
 
             # FTS: delete old entry
-            self._fts_delete(conn, old_rowid, row['title'], row['summary'], row['tags'], old_file_content)
+            self._fts_delete(conn, old_rowid, row_dict['title'], row_dict['summary'], row_dict['tags'], old_file_content)
 
             # Update database
             now = datetime.now().isoformat()
@@ -485,7 +524,7 @@ class MemoryStore:
                         raise ValueError(f"Invalid stage: {metadata['stage']}")
                     updates['stage'] = metadata['stage']
 
-                    if metadata['stage'] != row['stage']:
+                    if metadata['stage'] != row_dict['stage']:
                         new_file_path = self.base_dir / metadata['stage'] / file_path.name
                         new_file_path.parent.mkdir(parents=True, exist_ok=True)
                         updates['file_path'] = str(new_file_path)
@@ -496,15 +535,15 @@ class MemoryStore:
             conn.execute(f'UPDATE memories SET {set_clause} WHERE id = ?', values)
 
             # FTS: insert new entry
-            new_title = updates.get('title', row['title'])
-            new_summary = updates.get('summary', row['summary'])
-            new_tags = updates.get('tags', row['tags'])
+            new_title = updates.get('title', row_dict['title'])
+            new_summary = updates.get('summary', row_dict['summary'])
+            new_tags = updates.get('tags', row_dict['tags'])
             self._fts_insert(conn, old_rowid, new_title, new_summary, new_tags, full_content)
-            conn.commit()
 
-            # Move file after DB commit — DB is source of truth
-            if 'file_path' in updates and updates['file_path'] != str(file_path):
-                shutil.move(file_path, updates['file_path'])
+        # Move file after DB commit — DB is source of truth
+        if 'file_path' in updates and updates['file_path'] != str(file_path):
+            shutil.move(file_path, updates['file_path'])
+        conn.close()
 
     def delete(self, memory_id: str) -> None:
         """
@@ -516,15 +555,16 @@ class MemoryStore:
         Raises:
             ValueError: If memory not found
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
             cursor = conn.execute('SELECT * FROM memories WHERE id = ?', (memory_id,))
-            row = cursor.fetchone()
+            row = next(cursor, None)
 
             if not row:
                 raise ValueError(f"Memory not found: {memory_id}")
 
-            file_path = Path(row['file_path'])
+            row_dict = self._row_dict(cursor, row)
+            file_path = Path(row_dict['file_path'])
             rowid = self._get_rowid(conn, memory_id)
 
             # Read file content for FTS delete
@@ -534,11 +574,11 @@ class MemoryStore:
                 file_path.unlink()
 
             # FTS: delete entry
-            self._fts_delete(conn, rowid, row['title'], row['summary'], row['tags'], file_content)
+            self._fts_delete(conn, rowid, row_dict['title'], row_dict['summary'], row_dict['tags'], file_content)
 
             # Delete from database
             conn.execute('DELETE FROM memories WHERE id = ?', (memory_id,))
-            conn.commit()
+        conn.close()
 
     def get(self, memory_id: str) -> dict:
         """
@@ -550,16 +590,15 @@ class MemoryStore:
         Raises:
             ValueError: If memory not found
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM memories WHERE id = ?', (memory_id,))
-            row = cursor.fetchone()
+        conn = apsw.Connection(str(self.db_path))
+        try:
+            cursor = conn.execute('SELECT * FROM memories WHERE id = ?', (memory_id,))
+            row = next(cursor, None)
 
             if not row:
                 raise ValueError(f"Memory not found: {memory_id}")
 
-            result = dict(row)
+            result = self._row_dict(cursor, row)
             result['tags'] = json.loads(result['tags']) if result['tags'] else []
 
             # Load content from file
@@ -570,6 +609,8 @@ class MemoryStore:
                 result['content'] = ''
 
             return result
+        finally:
+            conn.close()
 
     def list_by_stage(self, stage: str, include_archived: bool = False) -> list[dict]:
         """
@@ -585,21 +626,22 @@ class MemoryStore:
         if stage not in self.STAGES:
             raise ValueError(f"Invalid stage: {stage}")
 
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+        conn = apsw.Connection(str(self.db_path))
+        try:
             if include_archived:
-                cursor.execute('SELECT * FROM memories WHERE stage = ? ORDER BY updated_at DESC', (stage,))
+                cursor = conn.execute('SELECT * FROM memories WHERE stage = ? ORDER BY updated_at DESC', (stage,))
             else:
-                cursor.execute('SELECT * FROM memories WHERE stage = ? AND archived_at IS NULL ORDER BY updated_at DESC', (stage,))
+                cursor = conn.execute('SELECT * FROM memories WHERE stage = ? AND archived_at IS NULL ORDER BY updated_at DESC', (stage,))
 
             results = []
-            for row in cursor.fetchall():
-                result = dict(row)
+            for row in cursor:
+                result = self._row_dict(cursor, row)
                 result['tags'] = json.loads(result['tags']) if result['tags'] else []
                 results.append(result)
 
             return results
+        finally:
+            conn.close()
 
     @staticmethod
     def sanitize_fts_term(term: str) -> str:
@@ -630,11 +672,9 @@ class MemoryStore:
         Returns:
             List of memory dicts with relevance rank
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
-            cursor.execute('''
+        conn = apsw.Connection(str(self.db_path))
+        try:
+            cursor = conn.execute('''
                 SELECT m.*, rank
                 FROM memories_fts
                 JOIN memories m ON memories_fts.rowid = m.rowid
@@ -644,8 +684,8 @@ class MemoryStore:
             ''', (query, limit))
 
             results = []
-            for row in cursor.fetchall():
-                result = dict(row)
+            for row in cursor:
+                result = self._row_dict(cursor, row)
                 result['tags'] = json.loads(result['tags']) if result['tags'] else []
 
                 # Load content
@@ -656,6 +696,8 @@ class MemoryStore:
                 results.append(result)
 
             return results
+        finally:
+            conn.close()
 
     def search_by_tags(self, tags: list[str]) -> list[dict]:
         """
@@ -667,22 +709,24 @@ class MemoryStore:
         Returns:
             List of memory dicts
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM memories')
+        conn = apsw.Connection(str(self.db_path))
+        try:
+            cursor = conn.execute('SELECT * FROM memories')
 
             results = []
-            for row in cursor.fetchall():
-                memory_tags = json.loads(row['tags']) if row['tags'] else []
+            for row in cursor:
+                row_dict = self._row_dict(cursor, row)
+                memory_tags = json.loads(row_dict['tags']) if row_dict['tags'] else []
 
                 # AND logic: all requested tags must be present
                 if all(tag in memory_tags for tag in tags):
-                    result = dict(row)
+                    result = row_dict
                     result['tags'] = memory_tags
                     results.append(result)
 
             return results
+        finally:
+            conn.close()
 
     def record_injection(self, memory_id: str, session_id: str, project_context: str = None) -> None:
         """
@@ -695,7 +739,8 @@ class MemoryStore:
         """
         now = datetime.now().isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
             # Update memory metadata
             conn.execute('''
                 UPDATE memories
@@ -709,8 +754,7 @@ class MemoryStore:
                 INSERT INTO retrieval_log (timestamp, session_id, memory_id, retrieval_type, project_context)
                 VALUES (?, ?, ?, 'injected', ?)
             ''', (now, session_id, memory_id, project_context))
-
-            conn.commit()
+        conn.close()
 
     def record_usage(self, memory_id: str, session_id: str) -> None:
         """
@@ -722,7 +766,8 @@ class MemoryStore:
         """
         now = datetime.now().isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
             # Update memory metadata
             conn.execute('''
                 UPDATE memories
@@ -743,8 +788,7 @@ class MemoryStore:
                       WHERE memory_id = ? AND session_id = ?
                   )
             ''', (memory_id, session_id, memory_id, session_id))
-
-            conn.commit()
+        conn.close()
 
     def log_consolidation(
         self,
@@ -772,14 +816,15 @@ class MemoryStore:
 
         now = datetime.now().isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
             conn.execute('''
                 INSERT INTO consolidation_log (
                     timestamp, session_id, action, memory_id,
                     from_stage, to_stage, rationale
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (now, session_id, action, memory_id, from_stage, to_stage, rationale))
-            conn.commit()
+        conn.close()
 
     def get_retrieval_log(self, limit: int = 100) -> list[dict]:
         """
@@ -791,16 +836,17 @@ class MemoryStore:
         Returns:
             List of log entry dicts
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('''
+        conn = apsw.Connection(str(self.db_path))
+        try:
+            cursor = conn.execute('''
                 SELECT * FROM retrieval_log
                 ORDER BY timestamp DESC
                 LIMIT ?
             ''', (limit,))
 
-            return [dict(row) for row in cursor.fetchall()]
+            return [self._row_dict(cursor, row) for row in cursor]
+        finally:
+            conn.close()
 
     def get_session_injections(self, session_id: str) -> list[str]:
         """
@@ -812,12 +858,15 @@ class MemoryStore:
         Returns:
             List of distinct memory_id strings
         """
-        with sqlite3.connect(self.db_path) as conn:
+        conn = apsw.Connection(str(self.db_path))
+        try:
             cursor = conn.execute(
                 "SELECT DISTINCT memory_id FROM retrieval_log WHERE session_id = ?",
                 (session_id,),
             )
-            return [row[0] for row in cursor.fetchall()]
+            return [row[0] for row in cursor]
+        finally:
+            conn.close()
 
     def archive(self, memory_id: str) -> None:
         """
@@ -833,9 +882,10 @@ class MemoryStore:
         """
         now = datetime.now().isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute('SELECT id FROM memories WHERE id = ?', (memory_id,))
-            if not cursor.fetchone():
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
+            row = next(conn.execute('SELECT id FROM memories WHERE id = ?', (memory_id,)), None)
+            if not row:
                 raise ValueError(f"Memory not found: {memory_id}")
 
             # Only set archived_at — do NOT update updated_at, which would
@@ -844,7 +894,7 @@ class MemoryStore:
                 'UPDATE memories SET archived_at = ? WHERE id = ?',
                 (now, memory_id),
             )
-            conn.commit()
+        conn.close()
 
     def unarchive(self, memory_id: str) -> None:
         """
@@ -858,16 +908,17 @@ class MemoryStore:
         """
         now = datetime.now().isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute('SELECT id FROM memories WHERE id = ?', (memory_id,))
-            if not cursor.fetchone():
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
+            row = next(conn.execute('SELECT id FROM memories WHERE id = ?', (memory_id,)), None)
+            if not row:
                 raise ValueError(f"Memory not found: {memory_id}")
 
             conn.execute(
                 'UPDATE memories SET archived_at = NULL, updated_at = ? WHERE id = ?',
                 (now, memory_id),
             )
-            conn.commit()
+        conn.close()
 
     def list_archived(self) -> list[dict]:
         """
@@ -876,20 +927,21 @@ class MemoryStore:
         Returns:
             List of memory dicts (without content) where archived_at is set.
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute(
+        conn = apsw.Connection(str(self.db_path))
+        try:
+            cursor = conn.execute(
                 'SELECT * FROM memories WHERE archived_at IS NOT NULL ORDER BY archived_at DESC'
             )
 
             results = []
-            for row in cursor.fetchall():
-                result = dict(row)
+            for row in cursor:
+                result = self._row_dict(cursor, row)
                 result['tags'] = json.loads(result['tags']) if result['tags'] else []
                 results.append(result)
 
             return results
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # Narrative thread operations
@@ -923,11 +975,12 @@ class MemoryStore:
         thread_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
             # Validate all member IDs exist
             for mid in member_ids:
-                cursor = conn.execute('SELECT id FROM memories WHERE id = ?', (mid,))
-                if not cursor.fetchone():
+                row = next(conn.execute('SELECT id FROM memories WHERE id = ?', (mid,)), None)
+                if not row:
                     raise ValueError(f"Memory not found: {mid}")
 
             conn.execute(
@@ -941,8 +994,7 @@ class MemoryStore:
                     'INSERT INTO thread_members (thread_id, memory_id, position) VALUES (?, ?, ?)',
                     (thread_id, mid, position),
                 )
-
-            conn.commit()
+        conn.close()
 
         return thread_id
 
@@ -956,25 +1008,26 @@ class MemoryStore:
         Raises:
             ValueError: If thread not found.
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-
+        conn = apsw.Connection(str(self.db_path))
+        try:
             cursor = conn.execute(
                 'SELECT * FROM narrative_threads WHERE id = ?', (thread_id,)
             )
-            row = cursor.fetchone()
+            row = next(cursor, None)
             if not row:
                 raise ValueError(f"Thread not found: {thread_id}")
 
-            result = dict(row)
+            result = self._row_dict(cursor, row)
 
             members = conn.execute(
                 'SELECT memory_id FROM thread_members WHERE thread_id = ? ORDER BY position',
                 (thread_id,),
             )
-            result['member_ids'] = [r['memory_id'] for r in members.fetchall()]
+            result['member_ids'] = [r[0] for r in members]
 
             return result
+        finally:
+            conn.close()
 
     def get_threads_for_memory(self, memory_id: str) -> list[dict]:
         """
@@ -983,9 +1036,8 @@ class MemoryStore:
         Returns:
             List of thread dicts (without member_ids for efficiency).
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-
+        conn = apsw.Connection(str(self.db_path))
+        try:
             cursor = conn.execute(
                 'SELECT nt.* FROM narrative_threads nt '
                 'JOIN thread_members tm ON nt.id = tm.thread_id '
@@ -993,7 +1045,9 @@ class MemoryStore:
                 'ORDER BY nt.updated_at DESC',
                 (memory_id,),
             )
-            return [dict(row) for row in cursor.fetchall()]
+            return [self._row_dict(cursor, row) for row in cursor]
+        finally:
+            conn.close()
 
     def get_threads_for_memories_batch(self, memory_ids: list[str]) -> list[dict]:
         """
@@ -1010,8 +1064,8 @@ class MemoryStore:
         if not memory_ids:
             return []
         placeholders = ",".join("?" * len(memory_ids))
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        conn = apsw.Connection(str(self.db_path))
+        try:
             cursor = conn.execute(
                 f"SELECT DISTINCT nt.* FROM narrative_threads nt "
                 f"JOIN thread_members tm ON nt.id = tm.thread_id "
@@ -1019,20 +1073,23 @@ class MemoryStore:
                 f"ORDER BY nt.updated_at DESC",
                 memory_ids,
             )
-            return [dict(row) for row in cursor.fetchall()]
+            return [self._row_dict(cursor, row) for row in cursor]
+        finally:
+            conn.close()
 
     def update_threads_last_surfaced(self, thread_ids: list[str], timestamp: str) -> None:
         """Update last_surfaced_at for given thread IDs in a single query."""
         if not thread_ids:
             return
         placeholders = ",".join("?" * len(thread_ids))
-        with sqlite3.connect(self.db_path) as conn:
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
             conn.execute(
                 f"UPDATE narrative_threads SET last_surfaced_at = ? "
                 f"WHERE id IN ({placeholders})",
                 [timestamp, *thread_ids],
             )
-            conn.commit()
+        conn.close()
 
     def list_threads(self) -> list[dict]:
         """
@@ -1041,23 +1098,24 @@ class MemoryStore:
         Returns:
             List of thread dicts with member_ids.
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-
+        conn = apsw.Connection(str(self.db_path))
+        try:
             cursor = conn.execute(
                 'SELECT * FROM narrative_threads ORDER BY updated_at DESC'
             )
             threads = []
-            for row in cursor.fetchall():
-                thread = dict(row)
+            for row in cursor:
+                thread = self._row_dict(cursor, row)
                 members = conn.execute(
                     'SELECT memory_id FROM thread_members WHERE thread_id = ? ORDER BY position',
                     (thread['id'],),
                 )
-                thread['member_ids'] = [r['memory_id'] for r in members.fetchall()]
+                thread['member_ids'] = [r[0] for r in members]
                 threads.append(thread)
 
             return threads
+        finally:
+            conn.close()
 
     def delete_thread(self, thread_id: str) -> None:
         """
@@ -1068,16 +1126,17 @@ class MemoryStore:
         Raises:
             ValueError: If thread not found.
         """
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
+        conn = apsw.Connection(str(self.db_path))
+        with conn:
+            row = next(conn.execute(
                 'SELECT id FROM narrative_threads WHERE id = ?', (thread_id,)
-            )
-            if not cursor.fetchone():
+            ), None)
+            if not row:
                 raise ValueError(f"Thread not found: {thread_id}")
 
             conn.execute('DELETE FROM thread_members WHERE thread_id = ?', (thread_id,))
             conn.execute('DELETE FROM narrative_threads WHERE id = ?', (thread_id,))
-            conn.commit()
+        conn.close()
 
     # ------------------------------------------------------------------
     # Vector embedding operations (sqlite-vec)
@@ -1093,7 +1152,7 @@ class MemoryStore:
         """
         if not self._vec_available:
             return
-        conn = self._vec_connect()
+        conn = self._vec_conn()
         if conn is None:
             return
         try:
@@ -1101,7 +1160,6 @@ class MemoryStore:
                 "INSERT OR REPLACE INTO vec_memories(memory_id, embedding) VALUES (?, ?)",
                 (memory_id, embedding),
             )
-            conn.commit()
         finally:
             conn.close()
 
@@ -1114,7 +1172,8 @@ class MemoryStore:
         """
         KNN search against stored embeddings.
 
-        Uses a JOIN against vec_memories and memories in the same index.db.
+        Two-step: KNN query via apsw for nearest IDs + distances,
+        then hydrate full memory dicts via stdlib sqlite3.
 
         Args:
             query_embedding: Raw float32 bytes to search against.
@@ -1126,37 +1185,40 @@ class MemoryStore:
         """
         if not self._vec_available or query_embedding is None:
             return []
-        conn = self._vec_connect()
+        conn = self._vec_conn()
         if conn is None:
             return []
         try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
+            rows = list(conn.execute(
                 """
-                SELECT m.*, knn.distance
-                FROM (
-                    SELECT memory_id, distance
-                    FROM vec_memories
-                    WHERE embedding MATCH ? AND k = ?
-                ) knn
-                JOIN memories m ON m.id = knn.memory_id
-                ORDER BY knn.distance
+                SELECT memory_id, distance
+                FROM vec_memories
+                WHERE embedding MATCH ? AND k = ?
+                ORDER BY distance
                 """,
                 (query_embedding, k),
-            ).fetchall()
-            results = []
-            for row in rows:
-                d = dict(row)
-                if exclude_ids and d.get("id") in exclude_ids:
-                    continue
-                results.append(d)
-            return results
+            ))
         finally:
             conn.close()
 
+        if not rows:
+            return []
+
+        results = []
+        for memory_id, distance in rows:
+            if exclude_ids and memory_id in exclude_ids:
+                continue
+            try:
+                memory = self.get(memory_id)
+                memory["distance"] = distance
+                results.append(memory)
+            except ValueError:
+                continue
+        return results
+
     def get_embedding(self, memory_id: str) -> bytes | None:
         """
-        Get stored embedding for a memory from index.db.
+        Get stored embedding for a memory.
 
         Args:
             memory_id: Memory UUID.
@@ -1166,13 +1228,13 @@ class MemoryStore:
         """
         if not self._vec_available:
             return None
-        conn = self._vec_connect()
+        conn = self._vec_conn()
         if conn is None:
             return None
         try:
-            row = conn.execute(
+            row = next(conn.execute(
                 "SELECT embedding FROM vec_memories WHERE memory_id = ?", (memory_id,)
-            ).fetchone()
+            ), None)
             return row[0] if row else None
         finally:
             conn.close()
