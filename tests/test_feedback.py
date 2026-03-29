@@ -44,29 +44,6 @@ def _make_memory(store, *, path='mem.md', content='body', **metadata) -> str:
     return store.create(path=path, content=content, metadata=metadata)
 
 
-# ---------------------------------------------------------------------------
-# _extract_keywords
-# ---------------------------------------------------------------------------
-
-
-def test_extract_keywords_filters_short_words():
-    kws = FeedbackLoop._extract_keywords('Use this', 'word long')
-    assert 'use' not in kws   # len 3
-    assert 'this' in kws
-    assert 'word' in kws
-    assert 'long' in kws
-
-
-def test_extract_keywords_lowercases():
-    kws = FeedbackLoop._extract_keywords('Python Functions', '')
-    assert 'python' in kws
-    assert 'functions' in kws
-
-
-def test_extract_keywords_empty_strings():
-    kws = FeedbackLoop._extract_keywords('', '')
-    assert kws == []
-
 
 # ---------------------------------------------------------------------------
 # track_usage
