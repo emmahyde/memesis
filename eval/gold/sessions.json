@@ -1,0 +1,124 @@
+{
+  "description": "Hand-labeled gold set for eval storage quality. Each session lists correct observations (extracted by reduce), false reinforcements, and missing observations the system should have captured.",
+  "labeled_by": "emma.hyde",
+  "labeled_at": "2026-03-29",
+  "sessions": [
+    {
+      "session_id": "0e45d6aa",
+      "project": "staging-k8s",
+      "messages": 8,
+      "summary": "User pasted PR URL, asked to verify only indentation changes + a label addition. Claude ran diffs, confirmed.",
+      "correct": [
+        {"id": 7, "title": "Autonomous multi-step investigation without check-ins", "type": "reinforcement"},
+        {"id": 37, "title": "Verify-before-concluding: implementation may already exist", "type": "reinforcement"}
+      ],
+      "false_reinforcements": [],
+      "missing": [
+        "Passes PR URLs as the full problem statement — bare URL + one-line instruction is a complete task"
+      ]
+    },
+    {
+      "session_id": "9b024bfa",
+      "project": "ai-tools",
+      "messages": 17,
+      "summary": "User loaded plugin creation workflow, Claude tried to scaffold from memory, plugin didn't exist on disk. User said 'Delete all your memories.'",
+      "correct": [
+        {"id": 18, "title": "Commands are terse and assume full context", "type": "reinforcement"},
+        {"id": 36, "title": "Nuclear reset: wipes memory state without explanation or ceremony", "type": "created"}
+      ],
+      "false_reinforcements": [],
+      "missing": [
+        "Stale memories that confidently assert false state trigger immediate purge, not correction — the causal link between wrong memory and nuclear reset"
+      ]
+    },
+    {
+      "session_id": "e60765db",
+      "project": "app",
+      "messages": 40,
+      "summary": "User asked which Sidekiq DogStatsD metrics are histograms, worried about cardinality. Claude investigated through gem source code internals.",
+      "correct": [
+        {"id": 7, "title": "Autonomous multi-step investigation without check-ins", "type": "reinforcement"},
+        {"id": 79, "title": "Cardinality is a first-class infrastructure concern", "type": "created"}
+      ],
+      "false_reinforcements": [
+        {"id": 21, "title": "Dependency hygiene is a first-class concern", "reason": "Session was about metrics cardinality, not dependency cleanup"},
+        {"id": 29, "title": "Tests the full pipeline end-to-end before activating anything", "reason": "No pipeline testing occurred in this session"}
+      ],
+      "missing": [
+        "Reads library source code (gem internals, middleware) when docs don't answer the question",
+        "Asks infrastructure cost questions proactively before shipping, not reactively after problems"
+      ]
+    },
+    {
+      "session_id": "a157e123",
+      "project": "app",
+      "messages": 39,
+      "summary": "User said 'resolve [PR URL]'. Claude found 2 approvals, no open comments. User corrected: 'There is a merge conflict.' Claude investigated, rebased in worktree, did semantic merge, force-pushed.",
+      "correct": [
+        {"id": 7, "title": "Autonomous multi-step investigation without check-ins", "type": "reinforcement"},
+        {"id": 11, "title": "Worktree + .minions directory structure for ticket work", "type": "reinforcement"},
+        {"id": 18, "title": "Commands are terse and assume full context", "type": "reinforcement"},
+        {"id": 33, "title": "Rebase over merge — always, even mid-conflict", "type": "created"},
+        {"id": 34, "title": "Conflict resolution requires semantic understanding, not mechanical take-one-side", "type": "created"},
+        {"id": 35, "title": "Force-push is the expected close to a rebase — no confirmation needed", "type": "created"}
+      ],
+      "false_reinforcements": [
+        {"id": 13, "title": "Unattended execution mode: no check-ins, no confirmations", "reason": "She interacted mid-session to correct Claude about the merge conflict — not unattended"}
+      ],
+      "missing": [
+        "Corrects by stating facts, not giving instructions — 'There is a merge conflict' not 'fix the merge conflict'",
+        "Uses abstract verbs that delegate scope determination — 'resolve' means figure out everything needed to merge",
+        "Expects cross-PR awareness when resolving conflicts — Claude needed to understand a parallel PR's rewrite to resolve"
+      ]
+    },
+    {
+      "session_id": "ea578675",
+      "project": "guideline-plugin-marketplace",
+      "messages": 46,
+      "summary": "Fetched Claude Code docs, asked for PR creation script, caught quoting bug in Claude's output, abandoned script ('forget this part'), tried to trigger heredoc hook.",
+      "correct": [
+        {"id": 18, "title": "Commands are terse and assume full context", "type": "reinforcement"},
+        {"id": 42, "title": "Interrupts mid-execution to redirect, then expects seamless continuation", "type": "reinforcement"},
+        {"id": 83, "title": "Cut-and-abandon: drops half-built work without ceremony when it's not worth finishing", "type": "created"},
+        {"id": 84, "title": "Stdin over positional args for multiline content", "type": "created"}
+      ],
+      "false_reinforcements": [
+        {"id": 7, "title": "Autonomous multi-step investigation without check-ins", "reason": "Session was interactive, not an autonomous investigation chain"},
+        {"id": 28, "title": "Kills agents that go off-track rather than waiting them out", "reason": "She abandoned a script, not an agent"}
+      ],
+      "missing": [
+        "Audits Claude's code output in real-time and catches bugs before Claude does — 'will the body not cause the same issue'"
+      ],
+      "labeling_notes": "#83 title 'cut-and-abandon' reads too harsh — better framed as 'decisive about what's not worth finishing'"
+    },
+    {
+      "session_id": "ce238b2a",
+      "project": "ai-tools",
+      "messages": 484,
+      "summary": "Split PR #151 into independently deployable slices. Cherry-picked files, hit test failures, debugged regression from source branch, fixed consumer breakage, got 610 tests green, created draft PRs.",
+      "correct": [
+        {"id": 18, "title": "Commands are terse and assume full context", "type": "reinforcement"},
+        {"id": 42, "title": "Interrupts mid-execution to redirect", "type": "reinforcement"},
+        {"id": 75, "title": "Split PRs by independent deployability, not just logical grouping", "type": "created"},
+        {"id": 76, "title": "Interrupted mid-execution with a factual correction, expects seamless pivot", "type": "created"},
+        {"id": 77, "title": "Self-observation: verify tests pass on origin/main before assuming a failure is mine", "type": "created"},
+        {"id": 78, "title": "Self-observation: cherry-picking files from a branch can silently import regressions", "type": "created"}
+      ],
+      "false_reinforcements": [
+        {"id": 13, "title": "Unattended execution mode", "reason": "She interrupted to correct 'compare to origin/main latest' — interactive, not unattended"}
+      ],
+      "missing": [
+        "When splitting PRs, expect consumer breakage and be prepared to fix callers not in the original diff",
+        "UNDER-EXTRACTED: 9 observations from 484 messages is too few — scan truncation (12K cap) destroyed most of the session before reduce saw it"
+      ],
+      "labeling_notes": "This session exposed a pipeline bug: scan's 12K char cap treats 484-message sessions the same as 8-message sessions. Fixed in b6d1b21."
+    }
+  ],
+  "meta": {
+    "total_correct_extractions": 22,
+    "total_false_reinforcements": 6,
+    "total_missing": 10,
+    "precision": "22 / (22 + 6) = 78.6%",
+    "recall_notes": "10 missing observations across 6 sessions. True recall unmeasurable without exhaustive labeling, but directionally: the system misses causal links, communication patterns, and meta-observations about the user's relationship with Claude's output."
+  }
+}
