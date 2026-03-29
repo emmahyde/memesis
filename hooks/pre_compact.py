@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.consolidator import Consolidator
 from core.crystallizer import Crystallizer
+from core.embeddings import embed_for_memory
 from core.feedback import FeedbackLoop
 from core.lifecycle import LifecycleManager
 from core.manifest import ManifestGenerator
@@ -110,6 +111,20 @@ def main():
             result = consolidator.consolidate_session(str(snapshot_path), session_id)
             feedback.update_importance_scores(session_id)
 
+            # Embed newly kept memories
+            for memory_id in result.get("kept", []):
+                try:
+                    mem = store.get(memory_id)
+                    embedding = embed_for_memory(
+                        mem.get("title", ""),
+                        mem.get("summary", ""),
+                        mem.get("content", ""),
+                    )
+                    if embedding:
+                        store.store_embedding(memory_id, embedding)
+                except Exception as e:
+                    print(f"Embedding error (non-fatal): {e}", file=sys.stderr)
+
             # Crystallization: synthesize promotion candidates into higher-level insights
             crystallized = []
             try:
@@ -117,6 +132,20 @@ def main():
                 crystallized = crystallizer.crystallize_candidates()
             except Exception as e:
                 print(f"Crystallization error (non-fatal): {e}", file=sys.stderr)
+
+            for crystal in crystallized:
+                try:
+                    cid = crystal.get("crystallized_id")
+                    if cid:
+                        mem = store.get(cid)
+                        embedding = embed_for_memory(
+                            mem.get("title", ""),
+                            crystal.get("insight", ""),
+                        )
+                        if embedding:
+                            store.store_embedding(cid, embedding)
+                except Exception as e:
+                    print(f"Crystal embedding error (non-fatal): {e}", file=sys.stderr)
 
             # Narrative threads: detect and synthesize episodic arcs
             threads_built = []
@@ -174,6 +203,7 @@ def main():
             print(summary, file=sys.stderr)
         finally:
             snapshot_path.unlink(missing_ok=True)
+            store.close()
 
         print("", flush=True)  # stdout must be empty for Claude Code
 
