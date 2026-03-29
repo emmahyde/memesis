@@ -1,75 +1,70 @@
 """
-Tests for the crystallization engine — episodic → semantic memory transformation.
+Tests for the crystallization engine — episodic -> semantic memory transformation.
 """
 
 import json
 import struct
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import apsw
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.crystallizer import Crystallizer, CRYSTALLIZATION_PROMPT
+from core.database import init_db, close_db, get_vec_store
 from core.lifecycle import LifecycleManager
-from core.storage import MemoryStore
+from core.models import Memory, ConsolidationLog, db
 
 
 @pytest.fixture
-def store(tmp_path):
-    """Create a temporary MemoryStore."""
-    return MemoryStore(base_dir=str(tmp_path / "memory"))
+def base(tmp_path):
+    base_dir = init_db(base_dir=str(tmp_path / "memory"))
+    yield base_dir
+    close_db()
 
 
 @pytest.fixture
-def lifecycle(store):
-    return LifecycleManager(store)
+def lifecycle(base):
+    return LifecycleManager()
 
 
 @pytest.fixture
-def crystallizer(store, lifecycle):
-    return Crystallizer(store, lifecycle)
+def crystallizer(base, lifecycle):
+    return Crystallizer(lifecycle)
 
 
-def _create_consolidated(store, title, content, tags=None, reinforcement_count=0):
+def _create_consolidated(title, content, tags=None, reinforcement_count=0):
     """Helper to create a consolidated memory with specific reinforcement count."""
-    mem_id = store.create(
-        path=f"test/{title.lower().replace(' ', '_')}.md",
+    now = datetime.now().isoformat()
+    mem = Memory.create(
+        stage="consolidated",
+        title=title,
+        summary=content[:100],
         content=content,
-        metadata={
-            "stage": "consolidated",
-            "title": title,
-            "summary": content[:100],
-            "tags": tags or [],
-            "importance": 0.65,
-        },
+        tags=json.dumps(tags or []),
+        importance=0.65,
+        reinforcement_count=reinforcement_count,
+        created_at=now,
+        updated_at=now,
     )
-    if reinforcement_count > 0:
-        conn = apsw.Connection(str(store.db_path))
-        conn.execute(
-            "UPDATE memories SET reinforcement_count = ? WHERE id = ?",
-            (reinforcement_count, mem_id),
-        )
-        conn.close()
-    return mem_id
+    return mem.id
 
 
 # --- Candidate detection ---
 
 
 def test_no_candidates_returns_empty(crystallizer):
-    """No promotion candidates → no crystallization."""
     results = crystallizer.crystallize_candidates()
     assert results == []
 
 
-def test_candidates_below_threshold_not_crystallized(crystallizer, store):
-    """Memories with < 3 reinforcements are not candidates."""
-    _create_consolidated(store, "Low Reinforcement", "Some content", reinforcement_count=2)
+def test_candidates_below_threshold_not_crystallized(crystallizer, base):
+    _create_consolidated("Low Reinforcement", "Some content", reinforcement_count=2)
     results = crystallizer.crystallize_candidates()
     assert results == []
 
@@ -77,11 +72,23 @@ def test_candidates_below_threshold_not_crystallized(crystallizer, store):
 # --- Grouping ---
 
 
-def test_group_singletons(crystallizer, store):
-    """Single candidates form singleton groups."""
+def _fake_mem(id, tags_json, title):
+    """Create a fake memory-like object with tag_list property for grouping tests."""
+    tags_list = json.loads(tags_json)
+    ns = SimpleNamespace(
+        id=id,
+        tags=tags_json,
+        title=title,
+        content=f"Content for {title}",
+        tag_list=tags_list,
+    )
+    return ns
+
+
+def test_group_singletons(crystallizer, base):
     candidates = [
-        {"id": "a", "tags": '["type:correction"]', "title": "A"},
-        {"id": "b", "tags": '["type:workflow_pattern"]', "title": "B"},
+        _fake_mem("a", '["type:correction"]', "A"),
+        _fake_mem("b", '["type:workflow_pattern"]', "B"),
     ]
     groups = crystallizer._group_candidates(candidates)
     assert len(groups) == 2
@@ -89,60 +96,52 @@ def test_group_singletons(crystallizer, store):
 
 
 def test_group_by_shared_type_and_tag(crystallizer):
-    """Memories with same type AND shared non-type tag group together."""
     candidates = [
-        {"id": "a", "tags": '["type:correction", "bedrock"]', "title": "A"},
-        {"id": "b", "tags": '["type:correction", "bedrock"]', "title": "B"},
-        {"id": "c", "tags": '["type:correction", "testing"]', "title": "C"},
+        _fake_mem("a", '["type:correction", "bedrock"]', "A"),
+        _fake_mem("b", '["type:correction", "bedrock"]', "B"),
+        _fake_mem("c", '["type:correction", "testing"]', "C"),
     ]
     groups = crystallizer._group_candidates(candidates)
-    # a and b share "bedrock" tag → grouped. c is separate.
     assert len(groups) == 2
     sizes = sorted(len(g) for g in groups)
     assert sizes == [1, 2]
 
 
 def test_group_transitive_clustering(crystallizer):
-    """Tags expand transitively — if A-B share tag1 and B-C share tag2, all group."""
     candidates = [
-        {"id": "a", "tags": '["type:correction", "aws"]', "title": "A"},
-        {"id": "b", "tags": '["type:correction", "aws", "sdk"]', "title": "B"},
-        {"id": "c", "tags": '["type:correction", "sdk"]', "title": "C"},
+        _fake_mem("a", '["type:correction", "aws"]', "A"),
+        _fake_mem("b", '["type:correction", "aws", "sdk"]', "B"),
+        _fake_mem("c", '["type:correction", "sdk"]', "C"),
     ]
     groups = crystallizer._group_candidates(candidates)
-    # a→b via "aws", b→c via "sdk" → all one group
     assert len(groups) == 1
     assert len(groups[0]) == 3
 
 
 def test_group_ignores_source_backfill_tag(crystallizer):
-    """The 'source:backfill' tag doesn't count for clustering."""
     candidates = [
-        {"id": "a", "tags": '["type:correction", "source:backfill"]', "title": "A"},
-        {"id": "b", "tags": '["type:correction", "source:backfill"]', "title": "B"},
-        {"id": "c", "tags": '["type:correction", "source:backfill"]', "title": "C"},
+        _fake_mem("a", '["type:correction", "source:backfill"]', "A"),
+        _fake_mem("b", '["type:correction", "source:backfill"]', "B"),
+        _fake_mem("c", '["type:correction", "source:backfill"]', "C"),
     ]
     groups = crystallizer._group_candidates(candidates)
-    # source:backfill is excluded from overlap check → 3 singletons
     assert len(groups) == 3
 
 
 def test_group_no_tags(crystallizer):
-    """Memories without tags form singleton groups."""
     candidates = [
-        {"id": "a", "tags": "[]", "title": "A"},
-        {"id": "b", "tags": "[]", "title": "B"},
-        {"id": "c", "tags": "[]", "title": "C"},
+        _fake_mem("a", "[]", "A"),
+        _fake_mem("b", "[]", "B"),
+        _fake_mem("c", "[]", "C"),
     ]
     groups = crystallizer._group_candidates(candidates)
     assert len(groups) == 3
 
 
 def test_group_two_candidates_always_singletons(crystallizer):
-    """With 2 or fewer candidates, each forms its own group (not enough to cluster)."""
     candidates = [
-        {"id": "a", "tags": '["type:correction", "aws"]', "title": "A"},
-        {"id": "b", "tags": '["type:correction", "aws"]', "title": "B"},
+        _fake_mem("a", '["type:correction", "aws"]', "A"),
+        _fake_mem("b", '["type:correction", "aws"]', "B"),
     ]
     groups = crystallizer._group_candidates(candidates)
     assert len(groups) == 2
@@ -161,12 +160,11 @@ MOCK_LLM_RESPONSE = {
 
 
 @patch("core.crystallizer.call_llm")
-def test_crystallize_single_candidate(mock_llm, crystallizer, store):
-    """Single candidate still gets synthesized (episodic → semantic)."""
+def test_crystallize_single_candidate(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     mem_id = _create_consolidated(
-        store, "Bedrock Client", "Use AnthropicBedrock() not Anthropic()",
+        "Bedrock Client", "Use AnthropicBedrock() not Anthropic()",
         tags=["type:correction", "bedrock"], reinforcement_count=3,
     )
 
@@ -175,24 +173,21 @@ def test_crystallize_single_candidate(mock_llm, crystallizer, store):
     assert results[0]["title"] == "Bedrock SDK diverges at every interface point"
     assert results[0]["group_size"] == 1
 
-    # Source should be archived
-    source = store.get(mem_id)
-    assert source["archived_at"] is not None
+    source = Memory.get_by_id(mem_id)
+    assert source.archived_at is not None
 
-    # Crystallized memory should exist
-    crystal = store.get(results[0]["crystallized_id"])
-    assert crystal["stage"] == "crystallized"
-    assert "diverges at every surface" in crystal["content"]
+    crystal = Memory.get_by_id(results[0]["crystallized_id"])
+    assert crystal.stage == "crystallized"
+    assert "diverges at every surface" in crystal.content
 
 
 @patch("core.crystallizer.call_llm")
-def test_crystallize_group(mock_llm, crystallizer, store):
-    """Multiple related candidates get synthesized into one insight."""
+def test_crystallize_group(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     ids = [
         _create_consolidated(
-            store, f"Bedrock Issue {i}", f"Bedrock problem #{i}",
+            f"Bedrock Issue {i}", f"Bedrock problem #{i}",
             tags=["type:correction", "bedrock"], reinforcement_count=3,
         )
         for i in range(3)
@@ -203,62 +198,43 @@ def test_crystallize_group(mock_llm, crystallizer, store):
     assert results[0]["group_size"] == 3
     assert len(results[0]["source_ids"]) == 3
 
-    # All sources archived
     for mem_id in ids:
-        source = store.get(mem_id)
-        assert source["archived_at"] is not None
+        source = Memory.get_by_id(mem_id)
+        assert source.archived_at is not None
 
 
 @patch("core.crystallizer.call_llm")
-def test_crystallize_preserves_importance(mock_llm, crystallizer, store):
-    """Crystallized memories start at 0.75 importance."""
+def test_crystallize_preserves_importance(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
-
-    _create_consolidated(
-        store, "Test", "Content",
-        tags=["type:correction"], reinforcement_count=3,
-    )
+    _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
 
     results = crystallizer.crystallize_candidates()
-    crystal = store.get(results[0]["crystallized_id"])
-    assert crystal["importance"] == 0.75
+    crystal = Memory.get_by_id(results[0]["crystallized_id"])
+    assert crystal.importance == 0.75
 
 
 @patch("core.crystallizer.call_llm")
-def test_crystallize_tags_include_source_marker(mock_llm, crystallizer, store):
-    """Crystallized memories are tagged with source:crystallization."""
+def test_crystallize_tags_include_source_marker(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
-
-    _create_consolidated(
-        store, "Test", "Content",
-        tags=["type:correction"], reinforcement_count=3,
-    )
+    _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
 
     results = crystallizer.crystallize_candidates()
-    crystal = store.get(results[0]["crystallized_id"])
-    tags = json.loads(crystal["tags"]) if isinstance(crystal["tags"], str) else crystal["tags"]
+    crystal = Memory.get_by_id(results[0]["crystallized_id"])
+    tags = crystal.tag_list
     assert "source:crystallization" in tags
 
 
 @patch("core.crystallizer.call_llm")
-def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, store):
-    """Source memories get a 'subsumed' consolidation log entry."""
+def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
-
-    mem_id = _create_consolidated(
-        store, "Test", "Content",
-        tags=["type:correction"], reinforcement_count=3,
-    )
+    mem_id = _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
 
     crystallizer.crystallize_candidates()
 
-    conn = apsw.Connection(str(store.db_path))
-    rows = list(conn.execute(
-        "SELECT action, rationale FROM consolidation_log WHERE memory_id = ?",
-        (mem_id,),
-    ))
-    conn.close()
-    actions = [r[0] for r in rows]
+    rows = list(
+        ConsolidationLog.select().where(ConsolidationLog.memory_id == mem_id)
+    )
+    actions = [r.action for r in rows]
     assert "subsumed" in actions
 
 
@@ -266,32 +242,25 @@ def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, store):
 
 
 @patch("core.llm.call_llm", side_effect=Exception("LLM unavailable"))
-def test_fallback_on_llm_failure(mock_llm, crystallizer, store):
-    """LLM failure falls back to simple promotion."""
-    mem_id = _create_consolidated(
-        store, "Test", "Content",
-        tags=["type:correction"], reinforcement_count=3,
-    )
+def test_fallback_on_llm_failure(mock_llm, crystallizer, base):
+    mem_id = _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
 
     results = crystallizer.crystallize_candidates()
     assert len(results) == 1
     assert results[0]["insight"] == "(fallback — no synthesis)"
 
-    # Memory should be promoted (not archived)
-    mem = store.get(mem_id)
-    assert mem["stage"] == "crystallized"
+    mem = Memory.get_by_id(mem_id)
+    assert mem.stage == "crystallized"
 
 
 # --- Prompt ---
 
 
 def test_crystallization_prompt_has_required_placeholders():
-    """Prompt template contains the observations placeholder."""
     assert "{observations}" in CRYSTALLIZATION_PROMPT
 
 
 def test_crystallization_prompt_requests_json():
-    """Prompt asks for JSON response."""
     assert "Respond ONLY with valid JSON" in CRYSTALLIZATION_PROMPT
 
 
@@ -299,8 +268,7 @@ def test_crystallization_prompt_requests_json():
 
 
 @patch("core.crystallizer.call_llm")
-def test_mixed_candidates_produce_separate_crystallizations(mock_llm, crystallizer, store):
-    """Candidates from different observation types crystallize separately."""
+def test_mixed_candidates_produce_separate_crystallizations(mock_llm, crystallizer, base):
     mock_llm.side_effect = [
         json.dumps({
             "title": "Correction pattern",
@@ -319,21 +287,19 @@ def test_mixed_candidates_produce_separate_crystallizations(mock_llm, crystalliz
     ]
 
     _create_consolidated(
-        store, "Test Correction", "Correction content",
+        "Test Correction", "Correction content",
         tags=["type:correction", "testing"], reinforcement_count=3,
     )
     _create_consolidated(
-        store, "PR Workflow", "Workflow content",
+        "PR Workflow", "Workflow content",
         tags=["type:workflow_pattern", "pr"], reinforcement_count=3,
     )
-    # Need a third for clustering to kick in
     _create_consolidated(
-        store, "Another Correction", "More correction",
+        "Another Correction", "More correction",
         tags=["type:correction", "testing"], reinforcement_count=3,
     )
 
     results = crystallizer.crystallize_candidates()
-    # Two corrections group together, workflow is separate → 2 crystallizations
     assert len(results) == 2
     titles = {r["title"] for r in results}
     assert "Correction pattern" in titles
@@ -346,7 +312,6 @@ def test_mixed_candidates_produce_separate_crystallizations(mock_llm, crystalliz
 
 
 def _fake_embeddings(n, dim=384, seed=42):
-    """Return n unit-normed random embeddings seeded for determinism."""
     rng = np.random.default_rng(seed)
     raw = rng.standard_normal((n, dim))
     norms = np.linalg.norm(raw, axis=1, keepdims=True)
@@ -354,11 +319,6 @@ def _fake_embeddings(n, dim=384, seed=42):
 
 
 def _cluster_embeddings(n, cluster_size=2):
-    """Return embeddings where the first cluster_size items are highly similar (cosine > 0.9).
-
-    Uses noise scale 0.01 so the cluster pair cosine similarity ~0.97, which comfortably
-    exceeds the crystallizer grouping threshold of 0.75.
-    """
     rng = np.random.default_rng(0)
     base = rng.standard_normal(384)
     base /= np.linalg.norm(base)
@@ -370,7 +330,6 @@ def _cluster_embeddings(n, cluster_size=2):
 
 
 def _make_embedding_bytes(values):
-    """Convert a list of floats to raw float32 bytes (what store.get_embedding returns)."""
     return struct.pack(f"{len(values)}f", *values)
 
 
@@ -380,82 +339,69 @@ def _make_embedding_bytes(values):
 
 
 class TestEmbeddingGrouping:
-    """Tests for embedding-based candidate grouping in _group_candidates."""
 
-    def _make_candidates(self, crystallizer, store, n=3, tags=None):
-        """Create n consolidated memories with reinforcement_count >= 3."""
+    def _make_candidates(self, crystallizer, n=3, tags=None):
         candidates = []
         for i in range(n):
-            mem_tags = tags or [f"type:correction", f"topic{i}"]
+            mem_tags = tags or ["type:correction", f"topic{i}"]
             mem_id = _create_consolidated(
-                store,
                 title=f"Candidate {i}",
                 content=f"Content for candidate {i}",
                 tags=mem_tags,
                 reinforcement_count=3,
             )
-            mem = store.get(mem_id)
+            mem = Memory.get_by_id(mem_id)
             candidates.append(mem)
         return candidates
 
-    def test_similar_candidates_grouped_by_embeddings(self, crystallizer, store):
-        """Two highly similar embeddings are placed in the same group."""
-        candidates = self._make_candidates(crystallizer, store, n=3)
+    def test_similar_candidates_grouped_by_embeddings(self, crystallizer, base):
+        candidates = self._make_candidates(crystallizer, n=3)
         embeddings = _cluster_embeddings(3, cluster_size=2)
 
-        # Build a per-ID lookup so get_embedding returns the right bytes for each candidate.
         id_to_bytes = {
-            c["id"]: _make_embedding_bytes(embeddings[i].tolist())
+            c.id: _make_embedding_bytes(embeddings[i].tolist())
             for i, c in enumerate(candidates)
         }
 
-        with patch.object(store, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
+        vec = get_vec_store()
+        with patch.object(vec, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
             groups = crystallizer._group_candidates(candidates)
 
-        # The first two candidates (high cosine similarity) must share a group.
-        group_sets = [frozenset(c["id"] for c in g) for g in groups]
-        similar_ids = frozenset(c["id"] for c in candidates[:2])
-        assert any(similar_ids <= gs for gs in group_sets), (
-            "The two similar candidates should be in the same group"
-        )
+        group_sets = [frozenset(c.id for c in g) for g in groups]
+        similar_ids = frozenset(c.id for c in candidates[:2])
+        assert any(similar_ids <= gs for gs in group_sets)
 
-    def test_dissimilar_candidates_not_grouped(self, crystallizer, store):
-        """Random (dissimilar) embeddings produce singleton groups."""
-        candidates = self._make_candidates(crystallizer, store, n=3)
+    def test_dissimilar_candidates_not_grouped(self, crystallizer, base):
+        candidates = self._make_candidates(crystallizer, n=3)
         embeddings = _fake_embeddings(3)
 
-        # Build a per-ID lookup so get_embedding returns the right bytes for each candidate.
         id_to_bytes = {
-            c["id"]: _make_embedding_bytes(embeddings[i].tolist())
+            c.id: _make_embedding_bytes(embeddings[i].tolist())
             for i, c in enumerate(candidates)
         }
 
-        with patch.object(store, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
+        vec = get_vec_store()
+        with patch.object(vec, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
             groups = crystallizer._group_candidates(candidates)
 
-        # All pairs should be below the 0.75 threshold for random unit vectors.
         assert len(groups) == 3
         assert all(len(g) == 1 for g in groups)
 
-    def test_embedding_fallback_when_unavailable(self, crystallizer, store):
-        """When get_embedding returns None, grouping falls back to tag overlap."""
-        # Three candidates: two share a tag, one is separate.
+    def test_embedding_fallback_when_unavailable(self, crystallizer, base):
         ids = [
             _create_consolidated(
-                store, f"Tagged {i}", f"Content {i}",
+                f"Tagged {i}", f"Content {i}",
                 tags=["type:correction", "shared-tag"] if i < 2 else ["type:correction", "other-tag"],
                 reinforcement_count=3,
             )
             for i in range(3)
         ]
-        candidates = [store.get(mid) for mid in ids]
+        candidates = [Memory.get_by_id(mid) for mid in ids]
 
-        with patch.object(store, "get_embedding", return_value=None):
+        vec = get_vec_store()
+        with patch.object(vec, "get_embedding", return_value=None):
             groups = crystallizer._group_candidates(candidates)
 
-        # Tag-overlap fallback: ids[0] and ids[1] share "shared-tag" → grouped together.
-        group_sets = [frozenset(c["id"] for c in g) for g in groups]
+        group_sets = [frozenset(c.id for c in g) for g in groups]
         shared_ids = frozenset([ids[0], ids[1]])
-        assert any(shared_ids <= gs for gs in group_sets), (
-            "Tag-overlap fallback should group the two candidates that share a tag"
-        )
+        assert any(shared_ids <= gs for gs in group_sets)

@@ -43,7 +43,11 @@ def _format_entry(memory, base_dir: Path, include_importance: bool = False) -> s
     Pattern: `- [title](relative_path) — summary [importance: X.XX]`
     """
     title = memory.title or Path(memory.file_path or "unknown").stem.replace('_', ' ').title()
-    rel_path = os.path.relpath(memory.file_path or "", base_dir)
+    if memory.file_path:
+        rel_path = os.path.relpath(memory.file_path, base_dir)
+    else:
+        # Memory has no file_path (DB-only) — use stage/id as placeholder
+        rel_path = f"{memory.stage}/{memory.id}.md"
     summary = _truncate(memory.summary or '', 150)
 
     line = f'- [{title}]({rel_path})'
