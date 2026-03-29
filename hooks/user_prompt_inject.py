@@ -127,14 +127,16 @@ def search_and_inject(
     tier2_memories: list = []
     tier2_ids: set = set()
     try:
+        from core.flags import get_flag
         engine = RetrievalEngine()
-        tier2_memories = engine.get_crystallized_for_context(
-            query=fts_query,
-            query_embedding=query_embedding,
-            project_context=project_context,
-            token_limit=TOKEN_BUDGET_CHARS,
-        )
-        tier2_ids = {m.id for m in tier2_memories}
+        if get_flag("prompt_aware_tier2"):
+            tier2_memories = engine.get_crystallized_for_context(
+                query=fts_query,
+                query_embedding=query_embedding,
+                project_context=project_context,
+                token_limit=TOKEN_BUDGET_CHARS,
+            )
+            tier2_ids = {m.id for m in tier2_memories}
     except Exception:
         engine = None
 

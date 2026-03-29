@@ -157,6 +157,26 @@ class RetrievalEngine:
         ranking.  Hydrates Memory objects from the ranked IDs and returns them
         as dicts with progressive-disclosure fields.
         """
+        from .flags import get_flag
+
+        if not get_flag("hybrid_rrf"):
+            # Feature disabled — use plain FTS
+            results = Memory.search_fts(query, limit=limit)
+            disclosed = []
+            for memory in results:
+                disclosed.append({
+                    "id": memory.id,
+                    "title": memory.title,
+                    "summary": memory.summary,
+                    "content": memory.content or "",
+                    "importance": memory.importance or 0.5,
+                    "stage": memory.stage,
+                    "tags": memory.tag_list,
+                    "rank": getattr(memory, '_rank', None),
+                    "project_context": memory.project_context,
+                })
+            return disclosed
+
         # Attempt to get query embedding (lazy import avoids import-time Bedrock dependency)
         query_embedding = None
         try:
@@ -347,7 +367,9 @@ class RetrievalEngine:
         if token_limit is None:
             token_limit = self.token_limit
 
-        if query is not None:
+        from .flags import get_flag
+
+        if query is not None and get_flag("hybrid_rrf"):
             return self._crystallized_hybrid(
                 query=query,
                 query_embedding=query_embedding,
