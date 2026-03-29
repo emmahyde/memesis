@@ -176,9 +176,12 @@ def read_transcript(path: Path) -> list[dict]:
     return messages
 
 
-def summarize(messages: list[dict], max_chars: int = 12000) -> str:
+def summarize(messages: list[dict], max_chars: int = None) -> str:
     if not messages:
         return ""
+    # Scale budget by message count: 12K base + 100 chars per message beyond 40
+    if max_chars is None:
+        max_chars = 12000 + max(0, len(messages) - 40) * 100
     lines, chars = [], 0
     for msg in messages:
         role = "USER" if msg["role"] == "user" else "CLAUDE"
