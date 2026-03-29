@@ -460,17 +460,16 @@ class TestSemanticRehydration:
         """A memory that FTS would miss is found via the semantic path."""
         # "Zymurgical Process" contains no software-related FTS tokens —
         # FTS will not match a query like "software deployment pipeline".
-        # We patch _find_semantic_matches to return this memory directly,
-        # simulating what a real embedding model would do.
+        # We mock embed_text to return fake bytes and store.search_vector to return
+        # the archived memory directly, exercising the real _find_semantic_matches logic.
         mid = _create_memory(tmp_store, "Zymurgical Process", importance=0.6, days_ago=30)
         tmp_store.archive(mid)
         archived_mem = tmp_store.get(mid)
 
-        with patch.object(
-            engine,
-            "_find_semantic_matches",
-            return_value=[archived_mem],
-        ):
+        fake_embedding = b"\x00" * 512  # 128 float32 values — non-None so branch executes
+
+        with patch("core.embeddings.embed_text", return_value=fake_embedding), \
+             patch.object(tmp_store, "search_vector", return_value=[archived_mem]):
             matches = engine.find_rehydration_by_observation("software deployment pipeline")
 
         assert any(m["id"] == mid for m in matches), (
@@ -483,13 +482,12 @@ class TestSemanticRehydration:
         tmp_store.archive(mid)
         archived_mem = tmp_store.get(mid)
 
-        # Patch _find_semantic_matches to return the same memory that FTS will also find.
-        # The FTS query for "payment pipeline" should match the title above.
-        with patch.object(
-            engine,
-            "_find_semantic_matches",
-            return_value=[archived_mem],
-        ):
+        # Mock embed_text and search_vector so the real _find_semantic_matches runs and
+        # returns the same memory that FTS will also find for "payment pipeline".
+        fake_embedding = b"\x00" * 512
+
+        with patch("core.embeddings.embed_text", return_value=fake_embedding), \
+             patch.object(tmp_store, "search_vector", return_value=[archived_mem]):
             matches = engine.find_rehydration_by_observation(
                 "We need to fix the payment pipeline deadlock issue"
             )
@@ -500,11 +498,11 @@ class TestSemanticRehydration:
         )
 
     def test_semantic_rehydration_fallback_when_unavailable(self, engine, tmp_store):
-        """When _find_semantic_matches returns [], FTS results are still returned."""
+        """When embed_text returns None, _find_semantic_matches returns [] and FTS still works."""
         mid = _create_memory(tmp_store, "Payment Pipeline Locking", importance=0.6, days_ago=30)
         tmp_store.archive(mid)
 
-        with patch.object(engine, "_find_semantic_matches", return_value=[]):
+        with patch("core.embeddings.embed_text", return_value=None):
             matches = engine.find_rehydration_by_observation(
                 "We need to fix the payment pipeline deadlock issue"
             )

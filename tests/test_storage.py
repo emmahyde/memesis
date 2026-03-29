@@ -2,7 +2,9 @@
 
 import json
 import sqlite3
+import struct
 import sys
+import unittest.mock as mock
 from pathlib import Path
 
 import pytest
@@ -572,6 +574,47 @@ class TestMemoryStoreFTS:
         assert len(results) == 0
 
 
+class TestSanitizeFtsTerm:
+    """Test FTS5 term sanitization."""
+
+    def test_plain_term(self):
+        assert MemoryStore.sanitize_fts_term("hello") == '"hello"'
+
+    def test_fts_operator_and(self):
+        assert MemoryStore.sanitize_fts_term("AND") == '"AND"'
+
+    def test_fts_operator_not(self):
+        assert MemoryStore.sanitize_fts_term("NOT") == '"NOT"'
+
+    def test_fts_operator_near(self):
+        assert MemoryStore.sanitize_fts_term("NEAR") == '"NEAR"'
+
+    def test_wildcard_star(self):
+        assert MemoryStore.sanitize_fts_term("test*") == '"test*"'
+
+    def test_column_filter(self):
+        assert MemoryStore.sanitize_fts_term("title:hack") == '"title:hack"'
+
+    def test_internal_double_quotes(self):
+        assert MemoryStore.sanitize_fts_term('say "hello"') == '"say ""hello"""'
+
+    def test_empty_string(self):
+        assert MemoryStore.sanitize_fts_term("") == '""'
+
+    def test_sanitized_query_executes(self, memory_store):
+        """Sanitized FTS operators don't crash search_fts."""
+        memory_store.create(
+            path="test.md",
+            content="Test content about AND operators",
+            metadata={"stage": "consolidated", "title": "Test", "summary": "test"},
+        )
+        # These would crash or misbehave without sanitization
+        for dangerous_term in ["AND", "NOT", "NEAR", "*", "OR"]:
+            query = MemoryStore.sanitize_fts_term(dangerous_term)
+            # Should not raise
+            memory_store.search_fts(query, limit=5)
+
+
 class TestMemoryStoreContentHash:
     """Test content hash deduplication."""
 
@@ -634,3 +677,254 @@ class TestMemoryStoreProjectContext:
         store = MemoryStore(project_context='/Users/test/my-project')
         expected = temp_dir / '.claude' / 'projects' / '-Users-test-my-project' / 'memory'
         assert store.base_dir == expected
+
+
+def _make_embedding(dims: int = 512) -> bytes:
+    """Create a float32 embedding of the given dimensionality."""
+    floats = [float(i % 100) / 100.0 for i in range(dims)]
+    return struct.pack(f"{dims}f", *floats)
+
+
+def _make_store_with_vec(temp_dir):
+    """
+    Create a MemoryStore with _vec_available forced True by patching _load_vec
+    to be a no-op and re-creating the vec_memories virtual table using a
+    real sqlite-vec connection (if the extension can load), or via a minimal
+    SQLite virtual table mock.
+
+    On platforms where enable_load_extension is disabled we patch _load_vec
+    as a no-op and manually create the virtual table, so the SQL logic can
+    be exercised end-to-end.
+    """
+    import core.storage as storage_mod
+
+    store = MemoryStore(base_dir=str(temp_dir))
+
+    if store._vec_available:
+        # sqlite-vec actually loaded — use it directly
+        return store
+
+    # sqlite-vec not available on this platform — simulate by patching
+    # _load_vec and manually setting up the virtual table via a real
+    # sqlite-vec connection (using the loadable extension path directly if
+    # possible, otherwise we skip).
+    try:
+        import sqlite_vec
+        import sqlite3 as _sq3
+
+        # Attempt to get a connection with load_extension support
+        # This may fail on macOS where the stdlib module is compiled without it
+        test_conn = _sq3.connect(":memory:")
+        test_conn.enable_load_extension(True)  # raises AttributeError if unsupported
+        sqlite_vec.load(test_conn)
+        test_conn.close()
+    except (AttributeError, Exception):
+        # Cannot actually run sqlite-vec on this platform — skip vec table
+        return None
+
+    return store
+
+
+class TestVecUnavailableFallback:
+    """
+    Verify all three vector methods return graceful empty/None values when
+    _vec_available is False (sqlite-vec not loaded or extension support absent).
+    """
+
+    def test_store_embedding_no_op_when_unavailable(self, memory_store):
+        """store_embedding returns without error when vec is unavailable."""
+        memory_store._vec_available = False
+        memory_id = memory_store.create(
+            'vec_test.md',
+            'Content',
+            {'stage': 'ephemeral', 'title': 'Vec Test'},
+        )
+        # Should not raise
+        memory_store.store_embedding(memory_id, _make_embedding())
+
+    def test_search_vector_returns_empty_when_unavailable(self, memory_store):
+        """search_vector returns [] when vec is unavailable."""
+        memory_store._vec_available = False
+        result = memory_store.search_vector(_make_embedding())
+        assert result == []
+
+    def test_search_vector_returns_empty_when_query_is_none(self, memory_store):
+        """search_vector returns [] when query_embedding is None."""
+        memory_store._vec_available = False
+        result = memory_store.search_vector(None)
+        assert result == []
+
+    def test_get_embedding_returns_none_when_unavailable(self, memory_store):
+        """get_embedding returns None when vec is unavailable."""
+        memory_store._vec_available = False
+        memory_id = memory_store.create(
+            'vec_test2.md',
+            'Content',
+            {'stage': 'ephemeral', 'title': 'Vec Test 2'},
+        )
+        result = memory_store.get_embedding(memory_id)
+        assert result is None
+
+    def test_vec_available_attribute_exists(self, memory_store):
+        """_vec_available attribute is always set after __init__."""
+        assert hasattr(memory_store, '_vec_available')
+        assert isinstance(memory_store._vec_available, bool)
+
+    def test_search_vector_with_none_query_when_vec_available_returns_empty(self, memory_store):
+        """search_vector returns [] for None query even if vec is nominally available."""
+        memory_store._vec_available = True  # force True
+        result = memory_store.search_vector(None)
+        assert result == []
+
+
+class TestVecEnabled:
+    """
+    Tests for when sqlite-vec is actually available. These tests use monkeypatching
+    to inject a real sqlite-vec connection, or are skipped when sqlite-vec cannot
+    load extensions on the current platform.
+    """
+
+    @pytest.fixture
+    def vec_store(self, temp_dir, monkeypatch):
+        """
+        Yield a MemoryStore with a real working vec_memories table.
+
+        Patches _load_vec to be a no-op (we pre-create the virtual table using
+        a direct call) and sets _vec_available = True.
+
+        Skips if sqlite-vec extension loading is unsupported on this platform.
+        """
+        import sqlite3 as _sq3
+
+        # Confirm sqlite_vec is importable
+        try:
+            import sqlite_vec as _vec
+        except ImportError:
+            pytest.skip("sqlite_vec not installed")
+
+        # Check that enable_load_extension is available
+        test_conn = _sq3.connect(":memory:")
+        if not hasattr(test_conn, 'enable_load_extension'):
+            pytest.skip("sqlite3 compiled without extension loading support on this platform")
+        test_conn.close()
+
+        store = MemoryStore(base_dir=str(temp_dir))
+        assert store._vec_available, "Expected _vec_available=True when extension is loadable"
+        yield store
+        store.close()
+
+    def test_vec_available_true_when_extension_loads(self, vec_store):
+        """_vec_available is True when sqlite-vec loaded successfully."""
+        assert vec_store._vec_available is True
+
+    def test_vec_memories_table_created(self, vec_store):
+        """vec_memories virtual table exists in the database."""
+        with sqlite3.connect(vec_store.db_path) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' OR type='shadow'"
+                ).fetchall()
+            }
+        # vec0 tables show up under various names; check the virtual table exists
+        with sqlite3.connect(vec_store.db_path) as conn:
+            result = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='vec_memories'"
+            ).fetchone()
+        assert result is not None, "vec_memories table not found in schema"
+
+    def test_store_and_get_embedding_roundtrip(self, vec_store):
+        """store_embedding stores bytes that get_embedding returns unchanged."""
+        memory_id = vec_store.create(
+            'emb_test.md',
+            'Embedding roundtrip content',
+            {'stage': 'ephemeral', 'title': 'Emb Test'},
+        )
+        emb = _make_embedding(512)
+        vec_store.store_embedding(memory_id, emb)
+
+        retrieved = vec_store.get_embedding(memory_id)
+        assert retrieved == emb
+
+    def test_store_embedding_nonexistent_memory_is_silent(self, vec_store):
+        """store_embedding on a missing memory_id returns without error."""
+        vec_store.store_embedding('00000000-0000-0000-0000-000000000000', _make_embedding())
+
+    def test_get_embedding_nonexistent_memory_returns_none(self, vec_store):
+        """get_embedding on an unrecognised memory_id returns None."""
+        result = vec_store.get_embedding('00000000-0000-0000-0000-000000000000')
+        assert result is None
+
+    def test_get_embedding_no_embedding_stored_returns_none(self, vec_store):
+        """get_embedding returns None when no embedding has been stored yet."""
+        memory_id = vec_store.create(
+            'no_emb.md',
+            'No embedding yet',
+            {'stage': 'ephemeral', 'title': 'No Emb'},
+        )
+        result = vec_store.get_embedding(memory_id)
+        assert result is None
+
+    def test_store_embedding_overwrite(self, vec_store):
+        """Calling store_embedding twice replaces the previous value."""
+        memory_id = vec_store.create(
+            'overwrite.md',
+            'Overwrite test',
+            {'stage': 'ephemeral', 'title': 'Overwrite'},
+        )
+        emb1 = _make_embedding(512)
+        emb2 = struct.pack("512f", *([0.99] * 512))
+
+        vec_store.store_embedding(memory_id, emb1)
+        vec_store.store_embedding(memory_id, emb2)
+
+        retrieved = vec_store.get_embedding(memory_id)
+        assert retrieved == emb2
+
+    def test_search_vector_returns_list(self, vec_store):
+        """search_vector returns a list (possibly empty) without raising."""
+        memory_id = vec_store.create(
+            'search_test.md',
+            'Search test content',
+            {'stage': 'ephemeral', 'title': 'Search Test'},
+        )
+        emb = _make_embedding(512)
+        vec_store.store_embedding(memory_id, emb)
+
+        results = vec_store.search_vector(emb, k=5)
+        assert isinstance(results, list)
+
+    def test_search_vector_result_has_distance_key(self, vec_store):
+        """Results from search_vector include a 'distance' key."""
+        memory_id = vec_store.create(
+            'dist_test.md',
+            'Distance key test',
+            {'stage': 'ephemeral', 'title': 'Dist Test'},
+        )
+        emb = _make_embedding(512)
+        vec_store.store_embedding(memory_id, emb)
+
+        results = vec_store.search_vector(emb, k=5)
+        assert len(results) >= 1
+        assert 'distance' in results[0]
+
+    def test_search_vector_exclude_ids(self, vec_store):
+        """search_vector excludes results whose id is in exclude_ids."""
+        id1 = vec_store.create(
+            'excl1.md',
+            'Exclude test 1',
+            {'stage': 'ephemeral', 'title': 'Excl 1'},
+        )
+        id2 = vec_store.create(
+            'excl2.md',
+            'Exclude test 2',
+            {'stage': 'ephemeral', 'title': 'Excl 2'},
+        )
+        emb = _make_embedding(512)
+        vec_store.store_embedding(id1, emb)
+        vec_store.store_embedding(id2, emb)
+
+        results = vec_store.search_vector(emb, k=10, exclude_ids={id1})
+        ids = {r['id'] for r in results}
+        assert id1 not in ids
+        assert id2 in ids

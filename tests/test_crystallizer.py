@@ -4,6 +4,7 @@ Tests for the crystallization engine — episodic → semantic memory transforma
 
 import json
 import sqlite3
+import struct
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -366,6 +367,11 @@ def _cluster_embeddings(n, cluster_size=2):
     return all_vecs / np.maximum(norms, 1e-9)
 
 
+def _make_embedding_bytes(values):
+    """Convert a list of floats to raw float32 bytes (what store.get_embedding returns)."""
+    return struct.pack(f"{len(values)}f", *values)
+
+
 # ---------------------------------------------------------------------------
 # Embedding-based grouping (D-09, D-10)
 # ---------------------------------------------------------------------------
@@ -395,7 +401,13 @@ class TestEmbeddingGrouping:
         candidates = self._make_candidates(crystallizer, store, n=3)
         embeddings = _cluster_embeddings(3, cluster_size=2)
 
-        with patch("core.crystallizer._get_embeddings", return_value=embeddings):
+        # Build a per-ID lookup so get_embedding returns the right bytes for each candidate.
+        id_to_bytes = {
+            c["id"]: _make_embedding_bytes(embeddings[i].tolist())
+            for i, c in enumerate(candidates)
+        }
+
+        with patch.object(store, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
             groups = crystallizer._group_candidates(candidates)
 
         # The first two candidates (high cosine similarity) must share a group.
@@ -410,7 +422,13 @@ class TestEmbeddingGrouping:
         candidates = self._make_candidates(crystallizer, store, n=3)
         embeddings = _fake_embeddings(3)
 
-        with patch("core.crystallizer._get_embeddings", return_value=embeddings):
+        # Build a per-ID lookup so get_embedding returns the right bytes for each candidate.
+        id_to_bytes = {
+            c["id"]: _make_embedding_bytes(embeddings[i].tolist())
+            for i, c in enumerate(candidates)
+        }
+
+        with patch.object(store, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
             groups = crystallizer._group_candidates(candidates)
 
         # All pairs should be below the 0.75 threshold for random unit vectors.
@@ -418,7 +436,7 @@ class TestEmbeddingGrouping:
         assert all(len(g) == 1 for g in groups)
 
     def test_embedding_fallback_when_unavailable(self, crystallizer, store):
-        """When _get_embeddings returns None, grouping falls back to tag overlap."""
+        """When get_embedding returns None, grouping falls back to tag overlap."""
         # Three candidates: two share a tag, one is separate.
         ids = [
             _create_consolidated(
@@ -430,7 +448,7 @@ class TestEmbeddingGrouping:
         ]
         candidates = [store.get(mid) for mid in ids]
 
-        with patch("core.crystallizer._get_embeddings", return_value=None):
+        with patch.object(store, "get_embedding", return_value=None):
             groups = crystallizer._group_candidates(candidates)
 
         # Tag-overlap fallback: ids[0] and ids[1] share "shared-tag" → grouped together.

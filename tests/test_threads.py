@@ -4,6 +4,7 @@ Tests for narrative thread detection, synthesis, and retrieval integration.
 
 import json
 import sqlite3
+import struct
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -199,7 +200,7 @@ class TestThreadDetector:
 
         detector = ThreadDetector(store)
         # Force tag-overlap path — this test validates tag-based behavior
-        with patch("core.threads._get_embeddings", return_value=None):
+        with patch.object(store, "get_embedding", return_value=None):
             clusters = detector.detect_threads()
         # No cluster should form — tags don't overlap
         assert all(len(c) < 2 for c in clusters) or len(clusters) == 0
@@ -579,6 +580,11 @@ def _cluster_embeddings(n, cluster_size=2):
     return all_vecs / np.maximum(norms, 1e-9)
 
 
+def _make_embedding_bytes(values):
+    """Convert a list of floats to raw float32 bytes (what store.get_embedding returns)."""
+    return struct.pack(f"{len(values)}f", *values)
+
+
 # ---------------------------------------------------------------------------
 # Embedding-based thread clustering (D-09, D-10)
 # ---------------------------------------------------------------------------
@@ -613,7 +619,13 @@ class TestEmbeddingClustering:
         embeddings = _cluster_embeddings(3, cluster_size=3)
         detector = ThreadDetector(store)
 
-        with patch("core.threads._get_embeddings", return_value=embeddings):
+        # Build a per-ID lookup so get_embedding returns the right bytes for each memory.
+        id_to_bytes = {
+            mid: _make_embedding_bytes(embeddings[i].tolist())
+            for i, mid in enumerate(ids)
+        }
+
+        with patch.object(store, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
             clusters = detector.detect_threads()
 
         assert len(clusters) >= 1
@@ -632,14 +644,20 @@ class TestEmbeddingClustering:
         embeddings = _fake_embeddings(3)
         detector = ThreadDetector(store)
 
-        with patch("core.threads._get_embeddings", return_value=embeddings):
+        # Build a per-ID lookup so get_embedding returns the right bytes for each memory.
+        id_to_bytes = {
+            mid: _make_embedding_bytes(embeddings[i].tolist())
+            for i, mid in enumerate(ids)
+        }
+
+        with patch.object(store, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
             clusters = detector.detect_threads()
 
         # Random unit vectors are far below the 0.70 clustering threshold.
         assert all(len(c) < 2 for c in clusters) or len(clusters) == 0
 
     def test_clustering_fallback_when_unavailable(self, store):
-        """When _get_embeddings returns None, tag-overlap fallback still forms clusters."""
+        """When get_embedding returns None, tag-overlap fallback still forms clusters."""
         ids = [
             _create_memory(
                 store, f"Tag Cluster {i}", f"Content {i}",
@@ -651,7 +669,7 @@ class TestEmbeddingClustering:
 
         detector = ThreadDetector(store)
 
-        with patch("core.threads._get_embeddings", return_value=None):
+        with patch.object(store, "get_embedding", return_value=None):
             clusters = detector.detect_threads()
 
         # All three share "fallback-topic" → tag-overlap fallback groups them.
