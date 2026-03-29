@@ -6,12 +6,17 @@ Tier 2 — Crystallized: context-matched, token-budgeted.
 Tier 3 — Active search: agent-initiated FTS with progressive disclosure.
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .database import get_base_dir
 from .models import Memory, NarrativeThread, RetrievalLog, ThreadMember, db
+
+if TYPE_CHECKING:
+    from .vec import VecStore
 
 CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens x 4 chars/token
 THREAD_BUDGET_CHARS = 8_000
@@ -156,6 +161,74 @@ class RetrievalEngine:
             })
 
         return disclosed
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_embedding: bytes | None = None,
+        k: int = 20,
+        rrf_k: int = 60,
+        vec_store: "VecStore | None" = None,
+    ) -> list[tuple[str, float]]:
+        """
+        Reciprocal Rank Fusion over FTS and vector search legs.
+
+        Combines BM25 full-text search with KNN vector search into a single
+        ranked list.  Each leg contributes RRF terms: 1 / (rrf_k + rank).
+        Memories absent from a leg are not penalised — they simply receive
+        fewer RRF terms.
+
+        Args:
+            query: Text query sent to the FTS leg.
+            query_embedding: Serialised embedding bytes for the vector leg.
+                If None, the vector leg is skipped.
+            k: Maximum number of results to return; also the per-leg candidate
+                limit fed to FTS / vector search.
+            rrf_k: RRF smoothing constant (default 60 per research literature).
+            vec_store: Optional VecStore instance.  If None or not available,
+                the method falls back to FTS-only ranking.
+
+        Returns:
+            List of (memory_id, rrf_score) tuples, sorted by score descending,
+            limited to at most ``k`` entries.
+        """
+        # --- FTS leg -------------------------------------------------------
+        fts_results = Memory.search_fts(query, limit=k)
+        # Build {memory_id: 1-based rank} from FTS order
+        fts_ranks: dict[str, int] = {
+            mem.id: rank for rank, mem in enumerate(fts_results, start=1)
+        }
+
+        # --- Vector leg (conditional) ---------------------------------------
+        vec_ranks: dict[str, int] = {}
+        use_vec = (
+            vec_store is not None
+            and vec_store.available
+            and query_embedding is not None
+        )
+        if use_vec:
+            vec_results = vec_store.search_vector(query_embedding, k=k)
+            vec_ranks = {
+                memory_id: rank
+                for rank, (memory_id, _distance) in enumerate(vec_results, start=1)
+            }
+
+        # --- RRF fusion ----------------------------------------------------
+        all_ids = set(fts_ranks) | set(vec_ranks)
+        if not all_ids:
+            return []
+
+        scores: dict[str, float] = {}
+        for memory_id in all_ids:
+            score = 0.0
+            if memory_id in fts_ranks:
+                score += 1.0 / (rrf_k + fts_ranks[memory_id])
+            if memory_id in vec_ranks:
+                score += 1.0 / (rrf_k + vec_ranks[memory_id])
+            scores[memory_id] = score
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return ranked[:k]
 
     def _get_thread_narratives(self, tier2_memories: list) -> list:
         """
