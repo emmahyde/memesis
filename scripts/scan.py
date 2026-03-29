@@ -144,9 +144,16 @@ def read_transcript(path: Path) -> list[dict]:
             role = msg["type"]
 
             if isinstance(content, list):
-                # Extract only text blocks — skip tool_use, tool_result, thinking
-                texts = [b.get("text", "").strip() for b in content if b.get("type") == "text"]
-                text = "\n".join(t for t in texts if t)
+                # Extract text and thinking blocks — skip tool_use, tool_result
+                parts = []
+                for b in content:
+                    if b.get("type") == "text":
+                        parts.append(b.get("text", "").strip())
+                    elif b.get("type") == "thinking":
+                        thinking = b.get("thinking", "").strip()
+                        if thinking:
+                            parts.append(f"[thinking] {thinking}")
+                text = "\n".join(t for t in parts if t)
 
                 # For assistant messages, add a compact tool summary
                 if role == "assistant":

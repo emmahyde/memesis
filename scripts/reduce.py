@@ -16,6 +16,7 @@ Usage:
     python3 scripts/reduce.py --focus "testing"        # Bias toward topic
     python3 scripts/reduce.py --dry-run                # Print prompt, don't call LLM
     python3 scripts/reduce.py --report                 # Print current store state
+    python3 scripts/reduce.py --db eval/eval.db --reset  # Isolated eval dataset
 
 Pipeline:
     scan.py → reduce.py → seed.py
@@ -348,12 +349,9 @@ def print_report(conn: sqlite3.Connection):
 
 
 def main():
-    summary_files = sorted(OUTPUT_DIR.glob("summaries-*.jsonl"))
-    if not summary_files:
-        print("No summaries-*.jsonl found. Run scripts/scan.py first.", file=sys.stderr)
-        sys.exit(1)
 
     limit, focus, dry_run, report_only, reset, project = None, None, False, False, False, None
+    db_path, summaries_dir = None, None
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -363,6 +361,10 @@ def main():
             focus = args[i + 1]; i += 2
         elif args[i] == "--project" and i + 1 < len(args):
             project = args[i + 1]; i += 2
+        elif args[i] == "--db" and i + 1 < len(args):
+            db_path = Path(args[i + 1]); i += 2
+        elif args[i] == "--summaries-dir" and i + 1 < len(args):
+            summaries_dir = Path(args[i + 1]); i += 2
         elif args[i] == "--dry-run":
             dry_run = True; i += 1
         elif args[i] == "--report":
@@ -371,6 +373,17 @@ def main():
             reset = True; i += 1
         else:
             print(f"Unknown: {args[i]}", file=sys.stderr); sys.exit(1)
+
+    # Override globals if custom paths provided
+    if db_path:
+        global DB_PATH
+        DB_PATH = db_path
+    source_dir = summaries_dir or OUTPUT_DIR
+    summary_files = sorted(source_dir.glob("summaries-*.jsonl"))
+
+    if not summary_files:
+        print(f"No summaries-*.jsonl found in {source_dir}. Run scripts/scan.py first.", file=sys.stderr)
+        sys.exit(1)
 
     if project:
         summary_files = [f for f in summary_files if project in f.stem]

@@ -9,6 +9,7 @@ standard *_test.py pattern in pytest.ini.
 """
 
 import json
+import sqlite3
 import sys
 import pytest
 from pathlib import Path
@@ -277,3 +278,84 @@ def seeded_engine(seeded_store):
 def lifecycle(eval_store):
     """LifecycleManager using the eval database."""
     return LifecycleManager()
+
+
+# ---------------------------------------------------------------------------
+# Real observations from reduce pipeline
+# ---------------------------------------------------------------------------
+
+EVAL_OBSERVATIONS_DB = Path(__file__).parent / "eval-observations.db"
+
+
+def seed_from_observations(observations_db: Path = None) -> list[str]:
+    """
+    Load observations from a reduce.py database and create Memory objects.
+
+    Maps observation frequency (count) to importance and stage:
+      count >= 10  → crystallized, importance 0.85+
+      count >= 3   → consolidated, importance 0.70+
+      count >= 1   → consolidated, importance 0.60+
+
+    Requires init_db() to have been called first.
+    Returns list of created memory IDs.
+    """
+    db_path = observations_db or EVAL_OBSERVATIONS_DB
+    if not db_path.exists():
+        raise FileNotFoundError(f"Observations DB not found: {db_path}")
+
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute(
+        "SELECT id, title, content, observation_type, tags, count, created_at "
+        "FROM observations ORDER BY count DESC"
+    ).fetchall()
+    conn.close()
+
+    ids = []
+    for row in rows:
+        obs_id, title, content, obs_type, tags_json, count, created_at = row
+
+        # Map frequency to stage and importance
+        if count >= 10:
+            stage = "crystallized"
+            importance = min(0.85 + (count * 0.005), 0.95)
+        elif count >= 3:
+            stage = "consolidated"
+            importance = min(0.70 + (count * 0.02), 0.85)
+        else:
+            stage = "consolidated"
+            importance = 0.60 + (count * 0.05)
+
+        tags = json.loads(tags_json) if tags_json else []
+        if obs_type:
+            tags.append(f"type:{obs_type}")
+
+        mem = Memory.create(
+            stage=stage,
+            title=title,
+            summary=content[:150],
+            content=content,
+            importance=importance,
+            tags=json.dumps(tags),
+            reinforcement_count=count,
+            created_at=created_at,
+        )
+        ids.append(mem.id)
+
+    return ids
+
+
+@pytest.fixture
+def live_store(tmp_path):
+    """Database seeded with real observations from the reduce pipeline."""
+    if not EVAL_OBSERVATIONS_DB.exists():
+        pytest.skip("eval-observations.db not found — run reduce first")
+    init_db(base_dir=str(tmp_path / "live_eval"))
+    seed_from_observations()
+    yield tmp_path / "live_eval"
+    close_db()
+
+
+@pytest.fixture
+def live_engine(live_store):
+    """RetrievalEngine using the live observation database."""
+    return RetrievalEngine()
