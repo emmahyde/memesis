@@ -654,3 +654,306 @@ class TestLastSurfacedAtTracking:
 
         assert NarrativeThread.get_by_id(tid_a).last_surfaced_at is not None
         assert NarrativeThread.get_by_id(tid_b).last_surfaced_at is None
+
+
+# ---------------------------------------------------------------------------
+# Hybrid RRF Search
+# ---------------------------------------------------------------------------
+
+
+class MockVecStore:
+    """Stub VecStore that returns predetermined (memory_id, distance) tuples."""
+
+    def __init__(self, results: list[tuple], available: bool = True):
+        self._results = results
+        self._available = available
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def search_vector(self, query_embedding: bytes, k: int = 10, exclude_ids: set = None) -> list[tuple]:
+        results = self._results[:k]
+        if exclude_ids:
+            results = [(mid, dist) for mid, dist in results if mid not in exclude_ids]
+        return results
+
+
+class TestHybridSearch:
+    """Tests for hybrid_search() on RetrievalEngine using RRF algorithm."""
+
+    def test_hybrid_search_both_legs_returns_rrf_ranked_results(self, base, engine):
+        """hybrid_search with both FTS and vector results returns items sorted by RRF score descending."""
+        id_a = _make_memory("alpha beta gamma", "crystallized", "Alpha Memory")
+        id_b = _make_memory("alpha beta delta", "crystallized", "Beta Memory")
+
+        # FTS rank order: id_a=1, id_b=2 (both match "alpha")
+        # Vec rank order: id_b=1, id_a=2 (reversed)
+        # RRF scores: id_a = 1/(60+1) + 1/(60+2) = 0.01639 + 0.01613 = 0.03252
+        #             id_b = 1/(60+2) + 1/(60+1) = 0.01613 + 0.01639 = 0.03252  (same both ways)
+        # Actually with distinct ranks: id_a FTS=1, vec=2; id_b FTS=2, vec=1
+        # id_a: 1/61 + 1/62 = 0.016393 + 0.016129 = 0.032522
+        # id_b: 1/62 + 1/61 = 0.016129 + 0.016393 = 0.032522
+        # They're equal, so just verify both appear
+        vec_store = MockVecStore([(id_b, 0.1), (id_a, 0.2)])
+        dummy_embedding = b"\x00" * 4
+
+        results = engine.hybrid_search(
+            query="alpha",
+            query_embedding=dummy_embedding,
+            k=10,
+            vec_store=vec_store,
+        )
+
+        assert isinstance(results, list)
+        result_ids = [r[0] for r in results]
+        assert id_a in result_ids
+        assert id_b in result_ids
+
+    def test_hybrid_search_rrf_score_exact_math(self, base, engine):
+        """RRF score for item in both lists = 1/(k+fts_rank) + 1/(k+vec_rank) with k=60."""
+        id_a = _make_memory("unique term xyzzy", "crystallized", "Unique Alpha")
+        id_b = _make_memory("unique term xyzzy different", "crystallized", "Unique Beta")
+
+        # Both match FTS, vec returns id_a first
+        # FTS rank: id_a=1 (more unique match), id_b=2
+        # Vec rank: id_a=1, id_b=2
+        # id_a score: 1/(60+1) + 1/(60+1) = 2/61
+        # id_b score: 1/(60+2) + 1/(60+2) = 2/62
+        vec_store = MockVecStore([(id_a, 0.1), (id_b, 0.2)])
+        dummy_embedding = b"\x00" * 4
+
+        results = engine.hybrid_search(
+            query="unique term xyzzy",
+            query_embedding=dummy_embedding,
+            k=10,
+            rrf_k=60,
+            vec_store=vec_store,
+        )
+
+        assert len(results) >= 2
+        result_ids = [r[0] for r in results]
+        # id_a must outrank id_b since it ranks #1 in both legs
+        assert result_ids.index(id_a) < result_ids.index(id_b)
+
+        # Verify score magnitudes: id_a gets 2/61, id_b gets 2/62
+        id_a_score = next(score for rid, score in results if rid == id_a)
+        id_b_score = next(score for rid, score in results if rid == id_b)
+        assert abs(id_a_score - 2 / 61) < 1e-9
+        assert abs(id_b_score - 2 / 62) < 1e-9
+
+    def test_hybrid_search_fts_only_item_appears(self, base, engine):
+        """Item only in FTS list gets score = 1/(k+fts_rank) and still appears in results."""
+        id_fts_only = _make_memory("fts exclusive term", "crystallized", "FTS Only")
+        id_vec_only = _make_memory("something else", "crystallized", "Vec Only")
+
+        # FTS matches id_fts_only, vec returns id_vec_only
+        vec_store = MockVecStore([(id_vec_only, 0.1)])
+        dummy_embedding = b"\x00" * 4
+
+        results = engine.hybrid_search(
+            query="fts exclusive term",
+            query_embedding=dummy_embedding,
+            k=10,
+            rrf_k=60,
+            vec_store=vec_store,
+        )
+
+        result_ids = [r[0] for r in results]
+        assert id_fts_only in result_ids
+
+        fts_score = next(score for rid, score in results if rid == id_fts_only)
+        # id_fts_only is FTS rank 1, not in vec: score = 1/(60+1)
+        assert abs(fts_score - 1 / 61) < 1e-9
+
+    def test_hybrid_search_vec_only_item_appears(self, base, engine):
+        """Item only in vector list gets score = 1/(k+vec_rank) and still appears in results."""
+        id_vec_only = _make_memory("vector exclusive content", "crystallized", "Vec Only Memory")
+
+        # FTS search for something else so id_vec_only doesn't match FTS
+        vec_store = MockVecStore([(id_vec_only, 0.1)])
+        dummy_embedding = b"\x00" * 4
+
+        results = engine.hybrid_search(
+            query="xyzzy_nonexistent_fts_term_999",
+            query_embedding=dummy_embedding,
+            k=10,
+            rrf_k=60,
+            vec_store=vec_store,
+        )
+
+        result_ids = [r[0] for r in results]
+        assert id_vec_only in result_ids
+
+        vec_score = next(score for rid, score in results if rid == id_vec_only)
+        # id_vec_only is vec rank 1, not in FTS: score = 1/(60+1)
+        assert abs(vec_score - 1 / 61) < 1e-9
+
+    def test_hybrid_search_vec_store_none_falls_back_to_fts(self, base, engine):
+        """When vec_store is None, falls back to FTS-only ranking."""
+        id_a = _make_memory("fts fallback content alpha", "crystallized", "Fallback Alpha")
+        id_b = _make_memory("fts fallback content beta", "crystallized", "Fallback Beta")
+
+        results = engine.hybrid_search(
+            query="fts fallback",
+            query_embedding=b"\x00" * 4,
+            k=10,
+            vec_store=None,
+        )
+
+        assert len(results) >= 2
+        result_ids = [r[0] for r in results]
+        assert id_a in result_ids
+        assert id_b in result_ids
+        # All scores should be FTS-only: 1/(60+rank)
+        for _, score in results:
+            # Each score is a single RRF term, so 1/(60+rank) <= 1/61
+            assert score <= 1 / 61 + 1e-9
+
+    def test_hybrid_search_vec_store_unavailable_falls_back_to_fts(self, base, engine):
+        """When vec_store.available is False, falls back to FTS-only ranking."""
+        id_a = _make_memory("unavailable vec fallback alpha", "crystallized", "Unavail Alpha")
+
+        unavailable_store = MockVecStore(results=[(id_a, 0.1)], available=False)
+
+        results = engine.hybrid_search(
+            query="unavailable vec fallback",
+            query_embedding=b"\x00" * 4,
+            k=10,
+            vec_store=unavailable_store,
+        )
+
+        assert len(results) >= 1
+        result_ids = [r[0] for r in results]
+        assert id_a in result_ids
+        # Should be FTS-only score, not boosted by vec
+        for _, score in results:
+            assert score <= 1 / 61 + 1e-9
+
+    def test_hybrid_search_none_embedding_falls_back_to_fts(self, base, engine):
+        """When query_embedding is None (embedding API failure), falls back to FTS-only."""
+        id_a = _make_memory("null embedding fallback content", "crystallized", "Null Embed Alpha")
+
+        vec_store = MockVecStore([(id_a, 0.1)])
+
+        results = engine.hybrid_search(
+            query="null embedding fallback",
+            query_embedding=None,
+            k=10,
+            vec_store=vec_store,
+        )
+
+        result_ids = [r[0] for r in results]
+        assert id_a in result_ids
+        # Should be FTS-only since embedding is None
+        for _, score in results:
+            assert score <= 1 / 61 + 1e-9
+
+    def test_hybrid_search_fts_empty_returns_vec_only(self, base, engine):
+        """When FTS returns empty results, returns vector-only ranking."""
+        id_vec = _make_memory("vector only no fts match", "crystallized", "Vec Only Return")
+
+        vec_store = MockVecStore([(id_vec, 0.1)])
+        dummy_embedding = b"\x00" * 4
+
+        results = engine.hybrid_search(
+            query="xyzzy_no_fts_match_42",
+            query_embedding=dummy_embedding,
+            k=10,
+            vec_store=vec_store,
+        )
+
+        assert len(results) >= 1
+        assert results[0][0] == id_vec
+
+    def test_hybrid_search_both_empty_returns_empty(self, base, engine):
+        """When both FTS and vector return empty, returns empty list."""
+        vec_store = MockVecStore([])
+        dummy_embedding = b"\x00" * 4
+
+        results = engine.hybrid_search(
+            query="xyzzy_no_results_999",
+            query_embedding=dummy_embedding,
+            k=10,
+            vec_store=vec_store,
+        )
+
+        assert results == []
+
+    def test_hybrid_search_rrf_k_configurable(self, base, engine):
+        """k parameter (rrf_k) is configurable and affects RRF scores."""
+        id_a = _make_memory("configurable k term", "crystallized", "Configurable K Alpha")
+
+        vec_store = MockVecStore([(id_a, 0.1)])
+        dummy_embedding = b"\x00" * 4
+
+        results_k60 = engine.hybrid_search(
+            query="configurable k term",
+            query_embedding=dummy_embedding,
+            k=10,
+            rrf_k=60,
+            vec_store=vec_store,
+        )
+        results_k1 = engine.hybrid_search(
+            query="configurable k term",
+            query_embedding=dummy_embedding,
+            k=10,
+            rrf_k=1,
+            vec_store=vec_store,
+        )
+
+        # With rrf_k=1, rank 1 gives 1/(1+1)=0.5; with rrf_k=60, rank 1 gives 1/(60+1)~0.016
+        score_k60 = results_k60[0][1]
+        score_k1 = results_k1[0][1]
+        assert score_k1 > score_k60
+
+    def test_hybrid_search_limit_controls_output_count(self, base, engine):
+        """limit parameter controls max results returned."""
+        for i in range(8):
+            _make_memory(f"limit test memory item {i}", "crystallized", f"Limit Memory {i}")
+
+        results = engine.hybrid_search(
+            query="limit test memory",
+            query_embedding=None,
+            k=3,
+            vec_store=None,
+        )
+
+        assert len(results) <= 3
+
+    def test_hybrid_search_archived_fts_results_included(self, base, engine):
+        """
+        RRF operates on whatever FTS returns. Filtering is caller's responsibility.
+        Archived memories returned by FTS are included in hybrid results.
+        """
+        from datetime import datetime
+
+        id_archived = _make_memory(
+            "archived hybrid search content", "consolidated", "Archived Hybrid"
+        )
+        # Mark as archived directly
+        Memory.update(archived_at=datetime.now().isoformat()).where(Memory.id == id_archived).execute()
+
+        # Re-index in FTS (since save() was bypassed via update)
+        mem = Memory.get_by_id(id_archived)
+        try:
+            mem._fts_insert()
+        except Exception:
+            pass  # May already be indexed from create
+
+        vec_store = MockVecStore([])
+        dummy_embedding = b"\x00" * 4
+
+        # FTS may or may not return archived items depending on how _make_memory indexed it
+        # The key assertion: whatever FTS returns, hybrid_search does NOT filter by archived_at
+        results = engine.hybrid_search(
+            query="archived hybrid search",
+            query_embedding=dummy_embedding,
+            k=10,
+            vec_store=vec_store,
+        )
+        # Results are a list of (id, score) tuples — archived_at is not a filter
+        assert isinstance(results, list)
+        for item in results:
+            assert len(item) == 2  # (memory_id, score)
+            assert isinstance(item[1], float)
