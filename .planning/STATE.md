@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 00.5-ai-eval-harness-03-PLAN.md
-last_updated: "2026-03-29T19:51:30.579Z"
-last_activity: 2026-03-29 — Roadmap created, 20 v1 phases + 6 v2 future phases defined
+stopped_at: Completed 07-hybrid-rrf-retrieval-01-PLAN.md
+last_updated: "2026-03-29T22:13:05.522Z"
+last_activity: 2026-03-29 — Phases 1-6 (cleanup) complete, gold set eval wired into report
 progress:
   total_phases: 27
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 2
+  completed_plans: 1
   percent: 33
 ---
 
@@ -53,6 +53,7 @@ Progress: [███░░░░░░░] 33%
 | Phase 00.5-ai-eval-harness P01 | 5 | 2 tasks | 8 files |
 | Phase 00.5-ai-eval-harness P02 | 2 | 1 tasks | 2 files |
 | Phase 00.5-ai-eval-harness P03 | 2 | 2 tasks | 3 files |
+| Phase 07-hybrid-rrf-retrieval P01 | 15 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -71,6 +72,9 @@ Recent decisions affecting current work:
 - [Phase 00.5-ai-eval-harness]: Baseline captured with all-zero metrics (captured_without_core_storage: true) - correct starting point before Phase 1 ORM migration
 - [Phase 00.5-ai-eval-harness]: verify_phase.py uses tempfile for current snapshot to avoid overwriting stored baseline during verification runs
 - [Phase 00.5-ai-eval-harness]: Regression threshold 0.05 - minor drops tolerated, meaningful regressions caught
+- [Phase 07-hybrid-rrf-retrieval]: RRF uses position-based rank, not raw BM25/distance scores
+- [Phase 07-hybrid-rrf-retrieval]: VecStore accepted as parameter to avoid circular imports - keeps hybrid_search independently testable
+- [Phase 07-hybrid-rrf-retrieval]: Fallback to FTS-only when vec_store is None, unavailable, or query_embedding is None
 
 ### Pending Todos
 
@@ -84,6 +88,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T19:47:59.766Z
-Stopped at: Completed 00.5-ai-eval-harness-03-PLAN.md
+Last session: 2026-03-29T22:13:05.519Z
+Stopped at: Completed 07-hybrid-rrf-retrieval-01-PLAN.md
 Resume file: None
