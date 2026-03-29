@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Hourly cron consolidation — runs headless outside any Claude Code session.
+Hourly cron — full memory lifecycle outside any Claude Code session.
 
 Scans all project memory directories for ephemeral buffers with observations,
-runs LLM-based consolidation via Bedrock, and writes consolidated memories.
+runs LLM-based consolidation via Bedrock, then runs the full lifecycle:
+crystallization, thread building, relevance maintenance, and periodic
+self-reflection.
 
 Usage:
     python3 /path/to/consolidate_cron.py
@@ -13,6 +15,7 @@ Install as cron:
     7 * * * * /usr/local/bin/python3 /path/to/consolidate_cron.py >> /tmp/memory-consolidation.log 2>&1
 """
 import fcntl
+import json
 import logging
 import os
 import sys
@@ -22,10 +25,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.consolidator import Consolidator
+from core.crystallizer import Crystallizer
+from core.embeddings import embed_for_memory
 from core.feedback import FeedbackLoop
 from core.lifecycle import LifecycleManager
 from core.manifest import ManifestGenerator
+from core.relevance import RelevanceEngine
+from core.self_reflection import SelfReflector
 from core.storage import MemoryStore
+from core.threads import build_threads
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +45,9 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("AWS_PROFILE", "bedrock-users")
 os.environ.setdefault("AWS_REGION", "us-west-2")
 os.environ.setdefault("CLAUDE_CODE_USE_BEDROCK", "true")
+
+# Run self-reflection every N consolidations.
+REFLECTION_INTERVAL = 5
 
 
 def find_ephemeral_buffers() -> list[Path]:
@@ -69,12 +80,38 @@ def find_ephemeral_buffers() -> list[Path]:
     return buffers
 
 
-def consolidate_buffer(ephemeral_path: Path) -> dict | None:
-    """Run consolidation on a single ephemeral buffer.
+def _get_consolidation_count(store: MemoryStore) -> int:
+    """Read the consolidation counter from meta/consolidation-count.json."""
+    counter_path = store.base_dir / "meta" / "consolidation-count.json"
+    if counter_path.exists():
+        try:
+            data = json.loads(counter_path.read_text())
+            return data.get("count", 0)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return 0
 
-    Uses file locking to coordinate with the Stop hook's append_observation.py.
-    The lock is held only during read+clear (fast), then released before the
-    slow Bedrock call so the Stop hook isn't blocked.
+
+def _increment_consolidation_count(store: MemoryStore) -> int:
+    """Increment and persist the consolidation counter. Returns new count."""
+    counter_path = store.base_dir / "meta" / "consolidation-count.json"
+    counter_path.parent.mkdir(parents=True, exist_ok=True)
+    count = _get_consolidation_count(store) + 1
+    counter_path.write_text(json.dumps({"count": count}))
+    return count
+
+
+def process_buffer(ephemeral_path: Path) -> dict | None:
+    """Run full lifecycle on a single ephemeral buffer.
+
+    1. Lock, snapshot, clear the buffer
+    2. Consolidate (LLM call via Bedrock)
+    3. Crystallize promotion candidates
+    4. Build narrative threads
+    5. Promote crystallized → instinctive if eligible
+    6. Relevance maintenance (archive stale, rehydrate relevant)
+    7. Periodic self-reflection
+    8. Write manifest
     """
     memory_dir = ephemeral_path.parent.parent  # up from ephemeral/ to memory/
     lock_path = ephemeral_path.parent / ".lock"
@@ -86,17 +123,14 @@ def consolidate_buffer(ephemeral_path: Path) -> dict | None:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
             content = ephemeral_path.read_text(encoding="utf-8")
-            # Check if there's anything beyond the header
             lines = [l for l in content.splitlines() if l.strip() and not l.startswith("# Session")]
             if not lines:
                 return None
-            # Clear the buffer so new observations go to a fresh file
             ephemeral_path.write_text(header, encoding="utf-8")
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
-    # --- Unlocked: process the snapshot (slow Bedrock call) ---
-    # Write snapshot to a temp file for the consolidator to read
+    # --- Unlocked: process the snapshot ---
     snapshot_path = ephemeral_path.parent / f".processing-{ephemeral_path.name}"
     snapshot_path.write_text(content, encoding="utf-8")
 
@@ -106,26 +140,116 @@ def consolidate_buffer(ephemeral_path: Path) -> dict | None:
         consolidator = Consolidator(store, lifecycle)
         manifest = ManifestGenerator(store)
         feedback = FeedbackLoop(store, lifecycle)
+        reflector = SelfReflector(store)
 
         session_id = f"cron-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
+        # Derive project context from memory_dir path
+        project_context = str(memory_dir.parent)
+
+        # --- Consolidation ---
         result = consolidator.consolidate_session(str(snapshot_path), session_id)
         feedback.update_importance_scores(session_id)
 
-        for mem in lifecycle.get_promotion_candidates():
+        # Embed newly kept memories
+        for memory_id in result.get("kept", []):
             try:
-                lifecycle.promote(mem["id"], "Auto-promoted: meets reinforcement threshold")
-            except ValueError:
-                pass
+                mem = store.get(memory_id)
+                embedding = embed_for_memory(
+                    mem.get("title", ""),
+                    mem.get("summary", ""),
+                    mem.get("content", ""),
+                )
+                if embedding:
+                    store.store_embedding(memory_id, embedding)
+            except Exception as e:
+                logger.warning("Embedding error (non-fatal): %s", e)
 
+        summary_parts = [
+            f"Consolidation: {len(result['kept'])} kept, {len(result['pruned'])} pruned"
+        ]
+
+        # --- Crystallization ---
+        crystallized = []
+        try:
+            crystallizer = Crystallizer(store, lifecycle)
+            crystallized = crystallizer.crystallize_candidates()
+        except Exception as e:
+            logger.warning("Crystallization error (non-fatal): %s", e)
+
+        for crystal in crystallized:
+            try:
+                cid = crystal.get("crystallized_id")
+                if cid:
+                    mem = store.get(cid)
+                    embedding = embed_for_memory(
+                        mem.get("title", ""),
+                        crystal.get("insight", ""),
+                    )
+                    if embedding:
+                        store.store_embedding(cid, embedding)
+            except Exception as e:
+                logger.warning("Crystal embedding error (non-fatal): %s", e)
+
+        if crystallized:
+            summary_parts.append(f"{len(crystallized)} crystallized")
+
+        # --- Narrative threads ---
+        threads_built = []
+        try:
+            threads_built = build_threads(store)
+        except Exception as e:
+            logger.warning("Thread building error (non-fatal): %s", e)
+
+        if threads_built:
+            summary_parts.append(f"{len(threads_built)} threads")
+
+        # --- Instinctive promotion ---
+        instinctive_promoted = 0
+        for mem in store.list_by_stage("crystallized"):
+            can, reason = lifecycle.can_promote(mem["id"])
+            if can:
+                try:
+                    lifecycle.promote(mem["id"], f"Auto-promoted to instinctive: {reason}")
+                    instinctive_promoted += 1
+                except ValueError:
+                    pass
+
+        if instinctive_promoted:
+            summary_parts.append(f"{instinctive_promoted} → instinctive")
+
+        # --- Relevance maintenance ---
+        relevance = RelevanceEngine(store)
+        maint = relevance.run_maintenance(project_context)
+
+        if maint["archived"]:
+            summary_parts.append(f"{len(maint['archived'])} archived")
+        if maint["rehydrated"]:
+            summary_parts.append(f"{len(maint['rehydrated'])} rehydrated")
+
+        # --- Periodic self-reflection ---
+        count = _increment_consolidation_count(store)
+        if count % REFLECTION_INTERVAL == 0:
+            try:
+                reflection = reflector.reflect()
+                if reflection.get("observations") or reflection.get("deprecated"):
+                    reflector.apply_reflection(reflection)
+                    summary_parts.append("self-model updated")
+            except Exception as e:
+                logger.warning("Self-reflection error (non-fatal): %s", e)
+
+        # --- Manifest ---
         manifest.write_manifest()
+        store.close()
+
+        logger.info("  %s", ", ".join(summary_parts))
         return result
     finally:
         snapshot_path.unlink(missing_ok=True)
 
 
 def main():
-    logger.info("Starting hourly consolidation run")
+    logger.info("Starting hourly lifecycle run")
 
     buffers = sorted(find_ephemeral_buffers())
     if not buffers:
@@ -136,21 +260,15 @@ def main():
 
     for buf in buffers:
         project_hash = buf.parent.parent.parent.name
-        logger.info("Consolidating %s (project: %s)", buf.name, project_hash)
+        logger.info("Processing %s (project: %s)", buf.name, project_hash)
         try:
-            result = consolidate_buffer(buf)
-            if result:
-                logger.info(
-                    "  Result: %d kept, %d pruned, %d promoted, %d conflicts",
-                    len(result["kept"]),
-                    len(result["pruned"]),
-                    len(result["promoted"]),
-                    len(result["conflicts"]),
-                )
+            result = process_buffer(buf)
+            if result is None:
+                logger.info("  (empty after lock — skipped)")
         except Exception:
-            logger.exception("  Failed to consolidate %s", buf)
+            logger.exception("  Failed to process %s", buf)
 
-    logger.info("Consolidation run complete")
+    logger.info("Lifecycle run complete")
 
 
 if __name__ == "__main__":
