@@ -162,7 +162,10 @@ Plans:
   1. The UserPromptSubmit hook extracts the prompt text and passes it to the Tier 2 retrieval path
   2. A query about "sqlite-vec" surfaces memories tagged with vector/embedding content that project-only matching would miss
   3. The 500ms latency budget is still met with prompt text in the retrieval path
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [ ] 08-01-PLAN.md — Wire Tier 2 crystallized retrieval into UserPromptSubmit hook + tests
 
 ### Phase 9: Thompson Sampling Selection
 **Goal**: Memory selection from ranked candidates uses Thompson sampling (Beta distribution over usage/non-usage counts) from Python stdlib — no external ML library needed
@@ -353,7 +356,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 5. NarrativeThread Timestamps | - | Complete | 2026-03-29 |
 | 6. Remove Unused Imports | - | Complete | 2026-03-29 |
 | 7. Hybrid RRF Retrieval | 2/2 | Complete   | 2026-03-29 |
-| 8. Prompt-Aware Tier 2 Injection | 0/? | Not started | - |
+| 8. Prompt-Aware Tier 2 Injection | 0/1 | Not started | - |
 | 9. Thompson Sampling Selection | 0/? | Not started | - |
 | 10. Provenance Signals | 0/? | Not started | - |
 | 11. OrientingDetector | 0/? | Not started | - |
