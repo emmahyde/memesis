@@ -12,6 +12,7 @@ dependencies = [
     "nltk>=3.8",
     "scikit-learn>=1.4",
     "sqlite-vec>=0.1.6",
+    "apsw>=3.46",
     "boto3>=1.34",
 ]
 
