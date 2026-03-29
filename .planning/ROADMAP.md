@@ -216,7 +216,10 @@ Plans:
   2. Novel events (first occurrence in project) have habituation_factor = 1.0
   3. The frequency model is persisted per-project and survives session restarts
   4. Suppressed observations are filtered out before the consolidation LLM call (reducing token waste)
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [ ] 12-01-PLAN.md — TDD HabituationModel with event frequency tracking, persistence, and consolidation wiring
 
 ### Phase 13: Somatic Markers
 **Goal**: Each observation is tagged with emotional valence (neutral / friction / surprise / delight) at write time, and non-neutral valence bumps the importance score
@@ -369,7 +372,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 9. Thompson Sampling Selection | 1/1 | Complete   | 2026-03-29 |
 | 10. Provenance Signals | 1/1 | Complete    | 2026-03-29 |
 | 11. OrientingDetector | 1/1 | Complete    | 2026-03-29 |
-| 12. Habituation Baseline | 0/? | Not started | - |
+| 12. Habituation Baseline | 0/1 | Planning | - |
 | 13. Somatic Markers | 0/? | Not started | - |
 | 14. Replay Priority | 0/? | Not started | - |
 | 15. SM-2 Spaced Injection | 0/? | Not started | - |
