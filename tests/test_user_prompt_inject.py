@@ -240,3 +240,113 @@ class TestHybridPerformanceUserPrompt:
 
         assert elapsed_ms < 500, f"hybrid_search took {elapsed_ms:.1f}ms, expected < 500ms"
         assert len(results) > 0
+
+
+class TestTier2PromptInjection:
+    """Tests proving Tier 2 crystallized retrieval is called with prompt text."""
+
+    def test_search_and_inject_calls_get_crystallized_for_context(self, base, monkeypatch):
+        """search_and_inject calls get_crystallized_for_context with query and query_embedding."""
+        from core.retrieval import RetrievalEngine
+
+        _make_memory(stage='crystallized', title='Crystallized Vector Memory',
+                     content='sqlite-vec vector embedding storage integration test',
+                     summary='Notes on sqlite-vec integration.')
+
+        tier2_calls = []
+        original = RetrievalEngine.get_crystallized_for_context
+
+        def spy_tier2(self, project_context=None, token_limit=None, query=None, query_embedding=None):
+            tier2_calls.append({'query': query, 'query_embedding': query_embedding})
+            return original(self, project_context=project_context, token_limit=token_limit,
+                            query=query, query_embedding=query_embedding)
+
+        monkeypatch.setattr(RetrievalEngine, 'get_crystallized_for_context', spy_tier2)
+
+        search_and_inject("Tell me about sqlite-vec embedding storage", "sess-tier2-001")
+
+        assert len(tier2_calls) > 0, "get_crystallized_for_context was not called"
+        assert tier2_calls[0]['query'] is not None, "query arg was None (must be prompt-derived)"
+        assert "sqlite" in tier2_calls[0]['query'].lower() or "vec" in tier2_calls[0]['query'].lower()
+
+    def test_crystallized_memories_surface_via_tier2_path(self, base, monkeypatch):
+        """Crystallized memories matching the prompt surface through the Tier 2 path."""
+        from core.retrieval import RetrievalEngine
+
+        # Memory with crystallized stage — should be returned via Tier 2
+        _make_memory(stage='crystallized', title='SQLite-Vec Embedding Guide',
+                     content='sqlite-vec enables vector similarity search in sqlite databases.',
+                     summary='How to use sqlite-vec for vector storage.')
+
+        # Patch embed_text to return None so test is deterministic (FTS-only)
+        import core.embeddings as embeddings_module
+        monkeypatch.setattr(embeddings_module, 'embed_text', lambda text, **kw: None)
+
+        result = search_and_inject("How does sqlite-vec embedding work", "sess-tier2-002")
+        assert "SQLite-Vec Embedding Guide" in result, (
+            "Expected Tier 2 crystallized memory to surface in injection result"
+        )
+
+    def test_already_injected_crystallized_memories_not_reinjected(self, base, monkeypatch):
+        """Memories already injected at SessionStart are not re-injected via Tier 2."""
+        import core.embeddings as embeddings_module
+        monkeypatch.setattr(embeddings_module, 'embed_text', lambda text, **kw: None)
+
+        mem = _make_memory(stage='crystallized', title='Already Loaded Crystallized',
+                           content='crystallized content already loaded at session start.',
+                           summary='Pre-loaded at session start.')
+        _record_injection(mem.id, "sess-tier2-003")
+
+        result = search_and_inject("crystallized content already loaded at session start", "sess-tier2-003")
+        assert "Already Loaded Crystallized" not in result, (
+            "Already-injected crystallized memory should be deduplicated"
+        )
+
+    def test_tier2_receives_fts_query_when_embedding_fails(self, base, monkeypatch):
+        """When embedding API fails, Tier 2 still receives the FTS query (query_embedding=None fallback)."""
+        from core.retrieval import RetrievalEngine
+
+        _make_memory(stage='crystallized', title='Fallback FTS Memory',
+                     content='fallback fts search query crystallized content.',
+                     summary='Should be found via FTS.')
+
+        tier2_calls = []
+        original = RetrievalEngine.get_crystallized_for_context
+
+        def spy_tier2(self, project_context=None, token_limit=None, query=None, query_embedding=None):
+            tier2_calls.append({'query': query, 'query_embedding': query_embedding})
+            return original(self, project_context=project_context, token_limit=token_limit,
+                            query=query, query_embedding=query_embedding)
+
+        monkeypatch.setattr(RetrievalEngine, 'get_crystallized_for_context', spy_tier2)
+
+        # Simulate embedding failure
+        import core.embeddings as embeddings_module
+        monkeypatch.setattr(embeddings_module, 'embed_text', lambda text, **kw: (_ for _ in ()).throw(RuntimeError("API unavailable")))
+
+        search_and_inject("fallback fts search query crystallized content", "sess-tier2-004")
+
+        assert len(tier2_calls) > 0, "get_crystallized_for_context was not called even on embedding failure"
+        assert tier2_calls[0]['query'] is not None, "FTS query should still be passed even when embedding fails"
+        assert tier2_calls[0]['query_embedding'] is None, "query_embedding should be None when embedding fails"
+
+    def test_tier2_latency_under_500ms_with_1000_memories(self, base, monkeypatch):
+        """500ms latency budget is met with 1000 memories including Tier 2 crystallized call."""
+        import time
+        import core.embeddings as embeddings_module
+        monkeypatch.setattr(embeddings_module, 'embed_text', lambda text, **kw: None)
+
+        for i in range(1000):
+            _make_memory(
+                stage='crystallized',
+                title=f'Perf Crystallized Memory {i}',
+                content=f'performance tier2 crystallized memory item number {i} with searchable content',
+            )
+
+        start = time.perf_counter()
+        search_and_inject("performance tier2 crystallized memory search", "sess-tier2-perf")
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        assert elapsed_ms < 500, (
+            f"search_and_inject with Tier 2 call took {elapsed_ms:.1f}ms, expected < 500ms"
+        )
