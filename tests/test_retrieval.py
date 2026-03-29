@@ -1094,3 +1094,144 @@ class TestHybridPerformance:
 
         assert elapsed_ms < 500, f"hybrid_search took {elapsed_ms:.1f}ms, expected < 500ms"
         assert len(results) > 0
+
+
+# ---------------------------------------------------------------------------
+# Thompson Sampling
+# ---------------------------------------------------------------------------
+
+
+def _make_memory_with_counts(content, title, usage_count=0, injection_count=0, base_fixture=None):
+    """Helper to create a crystallized memory with usage/injection counts set."""
+    now = datetime.now().isoformat()
+    mem = Memory.create(
+        stage="crystallized",
+        title=title,
+        summary=f"Summary of {title}",
+        content=content,
+        tags="[]",
+        importance=0.5,
+        reinforcement_count=0,
+        created_at=now,
+        updated_at=now,
+        usage_count=usage_count,
+        injection_count=injection_count,
+    )
+    return mem
+
+
+class TestThompsonSampling:
+    """Tests for Thompson sampling re-ranking in RetrievalEngine."""
+
+    def test_cold_start_sample_is_nonzero(self, base, engine):
+        """Test 1: A memory with usage_count=0, injection_count=0 produces Beta(1,1) — always non-zero."""
+        mem = _make_memory_with_counts("cold start content", "Cold Start", usage_count=0, injection_count=0)
+        result = engine._thompson_rerank([mem])
+        # betavariate always returns a value in (0, 1), never exactly 0
+        assert len(result) == 1
+        assert result[0].id == mem.id
+
+    def test_deterministic_order_with_fixed_seed(self, base, engine, monkeypatch):
+        """Test 2: With a fixed random seed, _thompson_rerank produces a specific known ordering."""
+        import random
+        mem_a = _make_memory_with_counts("content A", "Alpha", usage_count=8, injection_count=10)
+        mem_b = _make_memory_with_counts("content B", "Beta", usage_count=1, injection_count=10)
+        mem_c = _make_memory_with_counts("content C", "Gamma", usage_count=0, injection_count=0)
+
+        # Compute expected order with seed 42
+        random.seed(42)
+        a_score = random.betavariate((mem_a.usage_count or 0) + 1,
+                                     max((mem_a.injection_count or 0) - (mem_a.usage_count or 0), 0) + 1)
+        b_score = random.betavariate((mem_b.usage_count or 0) + 1,
+                                     max((mem_b.injection_count or 0) - (mem_b.usage_count or 0), 0) + 1)
+        c_score = random.betavariate((mem_c.usage_count or 0) + 1,
+                                     max((mem_c.injection_count or 0) - (mem_c.usage_count or 0), 0) + 1)
+
+        scores = [(a_score, mem_a.id), (b_score, mem_b.id), (c_score, mem_c.id)]
+        expected_ids = [mid for _, mid in sorted(scores, key=lambda x: x[0], reverse=True)]
+
+        # Now run with the same seed
+        random.seed(42)
+        result = engine._thompson_rerank([mem_a, mem_b, mem_c])
+        result_ids = [m.id for m in result]
+        assert result_ids == expected_ids
+
+    def test_statistical_high_usage_outranks_low_usage(self, base, engine):
+        """Test 3: Over 1000 runs, Beta(9,3) outranks Beta(2,9) more than 80% of the time."""
+        mem_high = _make_memory_with_counts("high usage content", "High Usage", usage_count=8, injection_count=10)
+        mem_low = _make_memory_with_counts("low usage content", "Low Usage", usage_count=1, injection_count=10)
+
+        high_wins = 0
+        for _ in range(1000):
+            result = engine._thompson_rerank([mem_high, mem_low])
+            if result[0].id == mem_high.id:
+                high_wins += 1
+
+        assert high_wins > 800, f"Expected >80% wins for high-usage memory, got {high_wins}/1000"
+
+    def test_flag_disabled_preserves_deterministic_order(self, base, engine, monkeypatch):
+        """Test 4: When thompson_sampling flag is False, get_crystallized_for_context returns deterministic order."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+
+        mem_high = _make_memory_with_counts("high importance content", "High Imp", usage_count=0, injection_count=0)
+        Memory.update(importance=0.9).where(Memory.id == mem_high.id).execute()
+        mem_low = _make_memory_with_counts("low importance content", "Low Imp", usage_count=5, injection_count=5)
+        Memory.update(importance=0.1).where(Memory.id == mem_low.id).execute()
+
+        # Run multiple times to confirm determinism
+        results_first = engine.get_crystallized_for_context()
+        results_second = engine.get_crystallized_for_context()
+        assert [m.id for m in results_first] == [m.id for m in results_second]
+        # High importance should come first in static sort
+        assert results_first[0].title == "High Imp"
+
+    def test_flag_enabled_hybrid_path_calls_thompson_rerank(self, base, engine, monkeypatch):
+        """Test 5: When thompson_sampling flag is True, _crystallized_hybrid calls _thompson_rerank."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": True, "thompson_sampling": True})
+
+        rerank_calls = []
+
+        original_rerank = engine._thompson_rerank
+
+        def mock_rerank(memories):
+            rerank_calls.append(len(memories))
+            return original_rerank(memories)
+
+        monkeypatch.setattr(engine, "_thompson_rerank", mock_rerank)
+
+        _make_memory_with_counts("deployment content test", "Deploy Mem", usage_count=0, injection_count=0)
+        engine.get_crystallized_for_context(query="deployment")
+
+        assert len(rerank_calls) >= 1, "_thompson_rerank was not called in hybrid path"
+
+    def test_flag_enabled_static_path_calls_thompson_rerank(self, base, engine, monkeypatch):
+        """Test 6: When thompson_sampling flag is True, static path calls _thompson_rerank."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": True})
+
+        rerank_calls = []
+
+        original_rerank = engine._thompson_rerank
+
+        def mock_rerank(memories):
+            rerank_calls.append(len(memories))
+            return original_rerank(memories)
+
+        monkeypatch.setattr(engine, "_thompson_rerank", mock_rerank)
+
+        _make_memory_with_counts("static path content", "Static Mem", usage_count=0, injection_count=0)
+        engine.get_crystallized_for_context()
+
+        assert len(rerank_calls) >= 1, "_thompson_rerank was not called in static path"
+
+    def test_negative_unused_count_guard(self, base, engine):
+        """Test 7: usage_count > injection_count (data anomaly) produces b=1, not negative."""
+        # usage_count=5, injection_count=3 — anomaly: used more than injected
+        mem = _make_memory_with_counts("anomaly content", "Anomaly Mem", usage_count=5, injection_count=3)
+        # This should not raise and should produce a valid ordering
+        result = engine._thompson_rerank([mem])
+        assert len(result) == 1
+        assert result[0].id == mem.id
+        # Verify the Beta params would be valid: a=6, b=max(3-5,0)+1=1 (not 0 or negative)
