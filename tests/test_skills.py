@@ -14,7 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
-SKILL_NAMES = ["learn", "memory", "forget"]
+SKILL_NAMES = [
+    "backfill", "connect", "dashboard", "forget", "health",
+    "ideate", "learn", "recall", "reflect", "stats", "teach",
+    "threads", "usage",
+]
 
 INVOCATION_PREFIX = "/memesis:"
 
@@ -158,11 +162,11 @@ class TestLearnSkill:
         assert "consolidated" in body.lower(), \
             "learn.md should mention the 'consolidated' memory stage"
 
-    def test_learn_body_mentions_crystallized_stage(self):
+    def test_learn_body_mentions_ephemeral_stage(self):
         content = (SKILLS_DIR / "learn" / "SKILL.md").read_text(encoding="utf-8")
         _, body = _parse_frontmatter(content)
-        assert "crystallized" in body.lower(), \
-            "learn.md should mention the 'crystallized' memory stage"
+        assert "ephemeral" in body.lower(), \
+            "learn.md should mention the 'ephemeral' memory stage"
 
     def test_learn_body_has_examples_section(self):
         content = (SKILLS_DIR / "learn" / "SKILL.md").read_text(encoding="utf-8")
@@ -171,27 +175,22 @@ class TestLearnSkill:
             "learn.md should have an Examples section"
 
 
-class TestMemorySkill:
-    def test_memory_body_mentions_stats_subcommand(self):
-        content = (SKILLS_DIR / "memory" / "SKILL.md").read_text(encoding="utf-8")
+class TestDashboardSkill:
+    def _read_body(self):
+        content = (SKILLS_DIR / "dashboard" / "SKILL.md").read_text(encoding="utf-8")
         _, body = _parse_frontmatter(content)
-        assert "stats" in body, "memory.md should document the 'stats' subcommand"
+        return body
 
-    def test_memory_body_mentions_browse_subcommand(self):
-        content = (SKILLS_DIR / "memory" / "SKILL.md").read_text(encoding="utf-8")
-        _, body = _parse_frontmatter(content)
-        assert "browse" in body, "memory.md should document the 'browse' subcommand"
+    def test_dashboard_body_mentions_stats(self):
+        assert "stats" in self._read_body(), "dashboard.md should mention stats"
 
-    def test_memory_body_mentions_search_subcommand(self):
-        content = (SKILLS_DIR / "memory" / "SKILL.md").read_text(encoding="utf-8")
-        _, body = _parse_frontmatter(content)
-        assert "search" in body, "memory.md should document the 'search' subcommand"
+    def test_dashboard_body_mentions_health(self):
+        assert "health" in self._read_body(), "dashboard.md should mention health"
 
-    def test_memory_body_mentions_stages(self):
-        content = (SKILLS_DIR / "memory" / "SKILL.md").read_text(encoding="utf-8")
-        _, body = _parse_frontmatter(content)
+    def test_dashboard_body_mentions_stages(self):
+        body = self._read_body()
         for stage in ("instinctive", "crystallized", "consolidated"):
-            assert stage in body, f"memory.md should mention the '{stage}' stage"
+            assert stage in body, f"dashboard.md should mention the '{stage}' stage"
 
 
 class TestForgetSkill:
