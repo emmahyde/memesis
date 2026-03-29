@@ -1,5 +1,6 @@
 anthropic>=0.40.0
 nltk>=3.8
+peewee>=3.17
 scikit-learn>=1.4
 sqlite-vec>=0.1.6
 apsw>=3.46
