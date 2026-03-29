@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-29)
 
 **Core value:** When a memory is injected, it should feel like recognition — not lookup.
-**Current focus:** Phase 1 — Commit ORM Migration
+**Current focus:** Phase 7 — Hybrid RRF Retrieval
 
 ## Current Position
 
-Phase: 1 of 20 (Commit ORM Migration)
+Phase: 7 of 20 (Hybrid RRF Retrieval)
 Plan: 0 of ? in current phase
 Status: Ready to plan
-Last activity: 2026-03-29 — Roadmap created, 20 v1 phases + 6 v2 future phases defined
+Last activity: 2026-03-29 — Phases 1-6 (cleanup) complete, gold set eval wired into report
 
 Progress: [███░░░░░░░] 33%
 

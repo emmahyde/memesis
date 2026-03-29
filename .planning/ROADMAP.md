@@ -18,12 +18,12 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 ### v1 — Cleanup
 
-- [ ] **Phase 1: Commit ORM Migration** - Commit Peewee migration with atomic commits and research files on disk
-- [ ] **Phase 2: Write Research Files** - Write all 5 research files to disk from agent output transcripts
-- [ ] **Phase 3: Remove file_path Field** - Remove `file_path` from Memory model (no migration needed)
-- [ ] **Phase 4: Stop Creating Stage Directories** - Stop creating stale consolidated/crystallized/instinctive dirs in database.py
-- [ ] **Phase 5: NarrativeThread Timestamps** - Add timestamp defaults to NarrativeThread model
-- [ ] **Phase 6: Remove Unused Imports** - Remove BooleanField, CharField, ForeignKeyField from models.py
+- [x] **Phase 1: Commit ORM Migration** - Commit Peewee migration with atomic commits and research files on disk (completed pre-roadmap)
+- [x] **Phase 2: Write Research Files** - Write all 5 research files to disk from agent output transcripts (completed pre-roadmap)
+- [x] **Phase 3: Remove file_path Field** - Remove `file_path` from Memory model (no migration needed) (completed 2026-03-29)
+- [x] **Phase 4: Stop Creating Stage Directories** - Stop creating stale consolidated/crystallized/instinctive dirs in database.py (completed 2026-03-29)
+- [x] **Phase 5: NarrativeThread Timestamps** - Add timestamp defaults to NarrativeThread model (completed 2026-03-29)
+- [x] **Phase 6: Remove Unused Imports** - Remove BooleanField, CharField, ForeignKeyField from models.py (completed 2026-03-29)
 
 ### v1 — Foundation
 
@@ -342,12 +342,12 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 0.5. AI Eval Harness (INSERTED) | 0/3 | Complete    | 2026-03-29 |
-| 1. Commit ORM Migration | 0/? | Not started | - |
-| 2. Write Research Files | 0/? | Not started | - |
-| 3. Remove file_path Field | 0/? | Not started | - |
-| 4. Stop Creating Stage Directories | 0/? | Not started | - |
-| 5. NarrativeThread Timestamps | 0/? | Not started | - |
-| 6. Remove Unused Imports | 0/? | Not started | - |
+| 1. Commit ORM Migration | - | Complete | pre-roadmap |
+| 2. Write Research Files | - | Complete | pre-roadmap |
+| 3. Remove file_path Field | - | Complete | 2026-03-29 |
+| 4. Stop Creating Stage Directories | - | Complete | 2026-03-29 |
+| 5. NarrativeThread Timestamps | - | Complete | 2026-03-29 |
+| 6. Remove Unused Imports | - | Complete | 2026-03-29 |
 | 7. Hybrid RRF Retrieval | 0/? | Not started | - |
 | 8. Prompt-Aware Tier 2 Injection | 0/? | Not started | - |
 | 9. Thompson Sampling Selection | 0/? | Not started | - |
