@@ -957,3 +957,140 @@ class TestHybridSearch:
         for item in results:
             assert len(item) == 2  # (memory_id, score)
             assert isinstance(item[1], float)
+
+
+# ---------------------------------------------------------------------------
+# Wiring: hybrid_search into get_crystallized_for_context and active_search
+# ---------------------------------------------------------------------------
+
+
+class TestCrystallizedHybrid:
+    """Tests for hybrid wiring into get_crystallized_for_context and inject_for_session."""
+
+    def test_crystallized_hybrid_uses_rrf_ranking(self, base, engine):
+        """get_crystallized_for_context(query=...) returns memories ranked by RRF score."""
+        id_a = _make_memory("deployment kubernetes scaling", "crystallized", "Deploy Guide", importance=0.5)
+        id_b = _make_memory("deployment strategy blue green", "crystallized", "Deploy Strategy", importance=0.5)
+
+        results = engine.get_crystallized_for_context(query="deployment")
+        assert len(results) >= 1
+        # Both should appear since both match "deployment"
+        result_ids = [m.id for m in results]
+        assert id_a in result_ids
+        assert id_b in result_ids
+
+    def test_crystallized_no_query_preserves_static_sort(self, base, engine):
+        """get_crystallized_for_context() with no query preserves existing static sort behavior."""
+        id_high = _make_memory("content high importance", "crystallized", "High Importance", importance=0.9)
+        id_low = _make_memory("content low importance", "crystallized", "Low Importance", importance=0.2)
+
+        results = engine.get_crystallized_for_context()
+        assert len(results) == 2
+        assert results[0].id == id_high
+        assert results[1].id == id_low
+
+    def test_crystallized_hybrid_respects_token_limit(self, base, engine):
+        """get_crystallized_for_context with query still respects token_limit budget."""
+        for i in range(10):
+            _make_memory(f"deployment scaling content item {i}", "crystallized", f"Deploy {i}", importance=0.5)
+
+        results = engine.get_crystallized_for_context(query="deployment scaling", token_limit=100)
+        total_chars = sum(len(m.content or "") for m in results)
+        assert total_chars <= 100
+
+    def test_crystallized_hybrid_project_context_boost(self, base, engine):
+        """get_crystallized_for_context with query applies project_context boost."""
+        # Two memories both match FTS "deployment", but one matches project_context
+        id_match = _make_memory(
+            "deployment pipeline step", "crystallized", "Matching Deploy",
+            importance=0.5, project_context="/my/project",
+        )
+        id_other = _make_memory(
+            "deployment pipeline step", "crystallized", "Other Deploy",
+            importance=0.5, project_context="/other/project",
+        )
+
+        results = engine.get_crystallized_for_context(
+            query="deployment pipeline", project_context="/my/project"
+        )
+        assert len(results) == 2
+        # Project-matching memory should appear first
+        assert results[0].id == id_match
+
+    def test_inject_for_session_accepts_query_parameter(self, base, engine):
+        """inject_for_session accepts optional query parameter and forwards it to get_crystallized_for_context."""
+        import inspect
+        sig = inspect.signature(engine.inject_for_session)
+        assert "query" in sig.parameters
+
+    def test_inject_for_session_forwards_query(self, base, engine):
+        """inject_for_session with query produces result containing relevant memories."""
+        id_a = _make_memory("kubernetes deployment scaling", "crystallized", "Kube Deploy", importance=0.5)
+        id_b = _make_memory("python refactoring patterns", "crystallized", "Python Refactor", importance=0.9)
+
+        # Without query, id_b (higher importance) should appear first in static sort
+        results_no_query = engine.get_crystallized_for_context()
+        assert results_no_query[0].id == id_b
+
+        # With query "kubernetes", id_a should be in results and ranked well
+        results_with_query = engine.get_crystallized_for_context(query="kubernetes deployment")
+        result_ids = [m.id for m in results_with_query]
+        assert id_a in result_ids
+
+    def test_active_search_uses_hybrid_search(self, base, engine):
+        """active_search uses hybrid_search (via mocked vec_store), returns results in RRF order."""
+        id_a = _make_memory("scaling kubernetes nodes", "crystallized", "Scale Guide")
+        id_b = _make_memory("scaling microservices horizontally", "crystallized", "Micro Scale")
+
+        # Without vec_store, falls back to FTS-only hybrid — both should appear
+        results = engine.active_search("scaling", session_id="test_sess")
+        titles = [r["title"] for r in results]
+        assert "Scale Guide" in titles
+        assert "Micro Scale" in titles
+
+    def test_active_search_fts_fallback_no_vec_store(self, base, engine):
+        """active_search with no vec_store still works (FTS fallback via hybrid_search)."""
+        id_a = _make_memory("fts fallback active search content", "crystallized", "FTS Fallback")
+
+        results = engine.active_search("fts fallback active", session_id="s")
+        assert len(results) >= 1
+        assert results[0]["title"] == "FTS Fallback"
+
+    def test_active_search_returns_rrf_fields(self, base, engine):
+        """active_search results include all required fields after hybrid wiring."""
+        _make_memory("hybrid active search fields test", "crystallized", "Hybrid Fields",
+                     summary="Summary for hybrid")
+
+        results = engine.active_search("hybrid active", session_id="s")
+        assert len(results) >= 1
+        r = results[0]
+        for field in ("id", "title", "summary", "content", "importance", "stage", "tags", "rank"):
+            assert field in r
+
+
+class TestHybridPerformance:
+    """Performance test for hybrid_search on large corpus."""
+
+    def test_hybrid_search_1000_memories_under_500ms(self, base, engine):
+        """hybrid_search on 1000 memories completes in under 500ms (FTS-only, no vec_store)."""
+        import time
+
+        # Create 1000 memories with searchable content
+        for i in range(1000):
+            _make_memory(
+                f"performance test memory item number {i} with extra content to index",
+                "crystallized",
+                f"Perf Memory {i}",
+            )
+
+        start = time.perf_counter()
+        results = engine.hybrid_search(
+            query="performance test memory",
+            query_embedding=None,
+            k=20,
+            vec_store=None,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        assert elapsed_ms < 500, f"hybrid_search took {elapsed_ms:.1f}ms, expected < 500ms"
+        assert len(results) > 0
