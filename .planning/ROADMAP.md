@@ -175,7 +175,10 @@ Plans:
   1. Each candidate memory has Beta(usage_count+1, unused_count+1) sampled to determine final selection order
   2. A memory with zero usage_count still has a non-zero chance of selection (cold-start handled by Beta(1,1) prior)
   3. Over 100 injections, memories with higher usage_count are selected more frequently (probabilistic, not deterministic)
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [ ] 09-01-PLAN.md — Thompson sampling _thompson_rerank method + TDD tests in both retrieval paths
 
 ### Phase 10: Provenance Signals
 **Goal**: Injected memories include human-readable provenance metadata — "established across N sessions over M weeks" — computed from session and timestamp data at injection time
@@ -357,7 +360,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 6. Remove Unused Imports | - | Complete | 2026-03-29 |
 | 7. Hybrid RRF Retrieval | 2/2 | Complete   | 2026-03-29 |
 | 8. Prompt-Aware Tier 2 Injection | 1/1 | Complete   | 2026-03-29 |
-| 9. Thompson Sampling Selection | 0/? | Not started | - |
+| 9. Thompson Sampling Selection | 0/1 | Not started | - |
 | 10. Provenance Signals | 0/? | Not started | - |
 | 11. OrientingDetector | 0/? | Not started | - |
 | 12. Habituation Baseline | 0/? | Not started | - |
