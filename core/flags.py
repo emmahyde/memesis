@@ -26,6 +26,7 @@ DEFAULTS = {
     "thompson_sampling": True,
     "provenance_signals": True,
     "orienting_detector": True,
+    "habituation_baseline": True,
 }
 
 _cache: dict | None = None
