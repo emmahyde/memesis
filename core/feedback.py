@@ -12,8 +12,41 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+
 from .lifecycle import LifecycleManager
 from .storage import MemoryStore
+
+
+def _ensure_nltk_data():
+    """Download NLTK stopwords corpus on first use if not present."""
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        try:
+            nltk.download('stopwords', quiet=True)
+        except Exception:
+            pass  # Network unavailable — fall back to no stopword filtering
+
+
+_STOPWORDS: set | None = None
+_STEMMER: PorterStemmer | None = None
+
+
+def _get_nltk_tools() -> tuple:
+    """Return (stopwords_set, stemmer), initializing lazily."""
+    global _STOPWORDS, _STEMMER
+    if _STOPWORDS is None:
+        _ensure_nltk_data()
+        try:
+            _STOPWORDS = set(stopwords.words('english'))
+            _STEMMER = PorterStemmer()
+        except Exception:
+            _STOPWORDS = set()
+            _STEMMER = None
+    return _STOPWORDS, _STEMMER
 
 
 class FeedbackLoop:
@@ -135,6 +168,15 @@ class FeedbackLoop:
         """
         score = 0.0
 
+        # Pre-stem all response tokens once so we can do O(S + R) stem
+        # lookups rather than O(S × R) individual stem comparisons.
+        stop_words, stemmer = _get_nltk_tools()
+        if stemmer:
+            response_words = re.findall(r'\b[a-z]{4,}\b', response_lower)
+            stemmed_response = {stemmer.stem(w) for w in response_words if w not in stop_words}
+        else:
+            stemmed_response = None
+
         # Content is noisier than title/summary — require longer (5+ char)
         # keywords to avoid false positives from common short words like
         # "code", "file", "data", "list", "uses".
@@ -148,7 +190,13 @@ class FeedbackLoop:
             for w in words:
                 if len(w) >= min_len and w not in seen:
                     seen.add(w)
-                    if re.search(rf'\b{re.escape(w)}\b', response_lower):
+                    # Primary match: word-boundary regex (exact form match)
+                    matched = bool(re.search(rf'\b{re.escape(w)}\b', response_lower))
+                    # Fallback: stem match — catches inflected forms like
+                    # "authentication" matching "authenticating"
+                    if not matched and stemmer and w not in stop_words and stemmed_response is not None:
+                        matched = stemmer.stem(w) in stemmed_response
+                    if matched:
                         score += source_weight * cls._term_specificity(w)
 
         return score

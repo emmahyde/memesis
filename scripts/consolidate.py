@@ -95,6 +95,50 @@ Respond ONLY with valid JSON:
 }}"""
 
 
+def _cluster_by_tfidf(observations: list, threshold: float = 0.70) -> dict:
+    """
+    Cluster observations by TF-IDF cosine similarity.
+
+    Returns {obs_id: cluster_id}. Observations below threshold form singleton
+    clusters. Returns {} if sklearn is unavailable or fewer than 2 observations.
+    """
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+    except ImportError:
+        return {}
+
+    if len(observations) < 2:
+        return {}
+
+    texts = [f"{o['title']} {o['content']}" for o in observations]
+    vectorizer = TfidfVectorizer(min_df=1, stop_words='english')
+    try:
+        tfidf = vectorizer.fit_transform(texts)
+    except ValueError:
+        return {}
+
+    sims = cosine_similarity(tfidf)
+
+    # Simple union-find clustering
+    parent = list(range(len(observations)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(observations)):
+        for j in range(i + 1, len(observations)):
+            if sims[i, j] >= threshold:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    return {observations[i]['id']: find(i) for i in range(len(observations))}
+
+
 def load_observations(conn: sqlite3.Connection) -> list[dict]:
     """Load all observations from the store."""
     conn.row_factory = sqlite3.Row
@@ -104,26 +148,38 @@ def load_observations(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def format_observations(observations: list[dict]) -> str:
-    """Format observations for the LLM prompt."""
+def format_observations(observations: list, clusters: dict = None) -> str:
+    """Format observations for the LLM prompt.
+
+    Args:
+        observations: List of observation dicts from the store.
+        clusters: Optional {obs_id: cluster_id} mapping from _cluster_by_tfidf.
+            When provided, appends [cluster:N] hint to observations that share
+            a cluster with at least one other observation.
+    """
     lines = []
     for obs in observations:
         count_str = f" (x{obs['count']})" if obs['count'] > 1 else ""
         sources = json.loads(obs['sources'])
         type_str = f"[{obs['observation_type']}]" if obs['observation_type'] else ""
+        cluster_hint = ""
+        if clusters and obs['id'] in clusters:
+            cid = clusters[obs['id']]
+            cluster_hint = f" [cluster:{cid}]"
         lines.append(
-            f"  #{obs['id']} {type_str} {obs['title']}{count_str} ({len(sources)} sessions)\n"
+            f"  #{obs['id']} {type_str} {obs['title']}{count_str} ({len(sources)} sessions){cluster_hint}\n"
             f"    {obs['content']}"
         )
     return "\n\n".join(lines)
 
 
-def consolidate(observations: list[dict], focus: str = None) -> dict:
+def consolidate(observations: list, focus: str = None) -> dict:
     """Run all observations through the consolidation gate."""
     import anthropic
 
     total_sightings = sum(o["count"] for o in observations)
-    obs_text = format_observations(observations)
+    clusters = _cluster_by_tfidf(observations)
+    obs_text = format_observations(observations, clusters=clusters)
 
     focus_block = ""
     if focus:

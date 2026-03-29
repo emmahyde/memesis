@@ -16,8 +16,12 @@ import pytest
 # scripts/ is not a package; insert the repo root so we can import from it.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts.reduce import apply_operations, init_db
-from scripts.consolidate import CONSOLIDATION_GATE_PROMPT
+from scripts.reduce import apply_operations, init_db, _find_near_duplicates
+from scripts.consolidate import (
+    CONSOLIDATION_GATE_PROMPT,
+    _cluster_by_tfidf,
+    format_observations,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -306,3 +310,306 @@ class TestConsolidateGatePrompt:
         assert signal_pos != -1, "FREQUENCY SIGNAL section missing from prompt"
         assert floor_pos != -1, "FREQUENCY FLOOR section missing from prompt"
         assert signal_pos < floor_pos
+
+
+# ---------------------------------------------------------------------------
+# TestTFIDFDedup
+# ---------------------------------------------------------------------------
+
+
+class TestTFIDFDedup:
+    """Tests for TF-IDF near-duplicate detection in reduce.py and
+    TF-IDF pre-clustering in consolidate.py.
+    """
+
+    # ------------------------------------------------------------------
+    # _find_near_duplicates
+    # ------------------------------------------------------------------
+
+    def test_near_duplicate_create_becomes_reinforce(self, tmp_path):
+        """A CREATE whose content is nearly identical to an existing observation
+        must increment that observation's count (REINFORCE) rather than
+        inserting a new row.
+
+        Uses nearly identical vocabulary to reliably exceed the 0.85 cosine
+        similarity threshold under TF-IDF with a two-document corpus.
+        A second unrelated seed observation is included so the store has >= 2
+        rows (required for TF-IDF to run).
+        """
+        conn = _make_conn(tmp_path)
+        # Primary observation to test dedup against — vocabulary dense enough
+        # that a near-copy exceeds the 0.85 threshold.
+        conn.execute(
+            "INSERT INTO observations (title, content, observation_type, tags, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "regex boundary keyword scoring feedback computation",
+                "regex boundary keyword scoring feedback computation "
+                "word boundaries false positives prevent matching",
+                "correction",
+                "[]",
+                json.dumps(["sess-1"]),
+            ),
+        )
+        # Second unrelated observation — needed so len(rows) >= 2 for TF-IDF
+        conn.execute(
+            "INSERT INTO observations (title, content, observation_type, tags, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "Mock external API calls tests",
+                "Never hit real external API endpoints in tests always mock import boundary.",
+                "workflow_pattern",
+                "[]",
+                json.dumps(["sess-1"]),
+            ),
+        )
+        conn.commit()
+
+        obs_id = conn.execute(
+            "SELECT id FROM observations WHERE title LIKE '%regex%'"
+        ).fetchone()[0]
+
+        # Near-duplicate: same vocabulary, one added token — should exceed 0.85 threshold
+        result = {
+            "create": [
+                {
+                    "title": "regex boundary keyword scoring feedback computation",
+                    "content": "regex boundary keyword scoring feedback computation "
+                    "word boundaries false positives prevent matching scorer",
+                    "observation_type": "correction",
+                    "tags": ["regex", "scoring"],
+                }
+            ],
+            "reinforce": [],
+        }
+        apply_operations(conn, result, session_id="sess-2")
+
+        row = conn.execute(
+            "SELECT count FROM observations WHERE id = ?", (obs_id,)
+        ).fetchone()
+        new_rows = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+
+        # The existing observation should have been reinforced (count >= 2)
+        assert row[0] >= 2, "Near-duplicate should have reinforced the existing observation"
+        # No new observation should have been inserted (still 2 rows total)
+        assert new_rows == 2, "Near-duplicate CREATE must not insert a third row"
+
+    def test_dissimilar_content_is_not_deduplicated(self, tmp_path):
+        """A CREATE about an unrelated topic must be inserted as a new observation,
+        not silently converted to a reinforce of an existing one.
+        """
+        conn = _make_conn(tmp_path)
+        # Seed observations about Python testing
+        conn.execute(
+            "INSERT INTO observations (title, content, observation_type, tags, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "Prefer pytest tmp_path over tempfile",
+                "Use pytest's built-in tmp_path fixture instead of tempfile.mkdtemp "
+                "for cleaner test isolation and automatic cleanup.",
+                "workflow_pattern",
+                "[]",
+                json.dumps(["sess-1"]),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO observations (title, content, observation_type, tags, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "Mock Anthropic API in all tests",
+                "Never hit the real Anthropic API in tests; always mock the client "
+                "using unittest.mock.patch on the module import path.",
+                "workflow_pattern",
+                "[]",
+                json.dumps(["sess-1"]),
+            ),
+        )
+        conn.commit()
+
+        result = {
+            "create": [
+                {
+                    "title": "AWS Bedrock client initialization pattern",
+                    "content": "Set CLAUDE_CODE_USE_BEDROCK env var to route the Anthropic "
+                    "client to AWS Bedrock with AnthropicBedrock() constructor.",
+                    "observation_type": "workflow_pattern",
+                    "tags": ["aws", "bedrock"],
+                }
+            ],
+            "reinforce": [],
+        }
+        apply_operations(conn, result, session_id="sess-2")
+
+        new_rows = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        assert new_rows == 3, "Dissimilar content must be inserted as a new observation"
+
+    def test_dedup_graceful_when_sklearn_absent(self, tmp_path):
+        """_find_near_duplicates must return [] without raising when sklearn
+        is not importable, so the script degrades gracefully.
+        """
+        conn = _make_conn(tmp_path)
+        # Seed some rows so we don't hit the < 2 short-circuit check
+        conn.execute(
+            "INSERT INTO observations (title, content, observation_type, tags, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("Obs A", "Content about topic A.", "correction", "[]", json.dumps(["sess-1"])),
+        )
+        conn.execute(
+            "INSERT INTO observations (title, content, observation_type, tags, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("Obs B", "Content about topic B.", "correction", "[]", json.dumps(["sess-1"])),
+        )
+        conn.commit()
+
+        # Patch builtins.__import__ to raise ImportError for sklearn imports.
+        # _find_near_duplicates uses call-site imports (not module-level), so
+        # intercepting __import__ is the correct simulation of sklearn absence.
+        import builtins
+        real_import = builtins.__import__
+
+        def _blocked_import(name, *args, **kwargs):
+            if name.startswith("sklearn"):
+                raise ImportError(f"blocked: {name}")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_blocked_import):
+            result = _find_near_duplicates(conn, "some new observation text")
+
+        assert result == [], "_find_near_duplicates must return [] when sklearn is unavailable"
+
+    def test_find_near_duplicates_returns_empty_for_small_store(self, tmp_path):
+        """_find_near_duplicates returns [] when the store has < 2 observations
+        (TF-IDF is degenerate on a single document).
+        """
+        conn = _make_conn(tmp_path)
+        conn.execute(
+            "INSERT INTO observations (title, content, observation_type, tags, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("Only observation", "Content.", "correction", "[]", json.dumps(["sess-1"])),
+        )
+        conn.commit()
+
+        result = _find_near_duplicates(conn, "Content about the same thing.")
+        assert result == [], "_find_near_duplicates must return [] for stores with < 2 rows"
+
+    # ------------------------------------------------------------------
+    # _cluster_by_tfidf
+    # ------------------------------------------------------------------
+
+    def test_cluster_by_tfidf_returns_empty_for_single_observation(self):
+        """_cluster_by_tfidf returns {} when given fewer than 2 observations."""
+        obs = [{"id": 1, "title": "Only obs", "content": "Some content here."}]
+        result = _cluster_by_tfidf(obs)
+        assert result == {}
+
+    def test_cluster_by_tfidf_graceful_when_sklearn_absent(self):
+        """_cluster_by_tfidf returns {} without raising when sklearn is not importable."""
+        obs = [
+            {"id": 1, "title": "Obs A", "content": "Content about python testing."},
+            {"id": 2, "title": "Obs B", "content": "Content about python debugging."},
+        ]
+        import builtins
+        real_import = builtins.__import__
+
+        def _blocked_import(name, *args, **kwargs):
+            if name.startswith("sklearn"):
+                raise ImportError(f"blocked: {name}")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_blocked_import):
+            result = _cluster_by_tfidf(obs)
+
+        assert result == {}, "_cluster_by_tfidf must return {} when sklearn is unavailable"
+
+    def test_cluster_by_tfidf_similar_observations_share_cluster(self):
+        """Two observations on highly similar topics should land in the same cluster.
+
+        Uses vocabulary-rich texts with enough shared rare tokens to exceed the
+        cosine similarity threshold. Observations 10 and 11 use identical vocabulary
+        with one token difference (verified: cosine similarity > 0.90 under TF-IDF).
+        Observation 12 uses entirely different vocabulary (verified: similarity ≈ 0.0).
+        """
+        obs = [
+            {
+                "id": 10,
+                "title": "regex boundary keyword scoring feedback computation",
+                "content": "regex boundary keyword scoring feedback computation "
+                "word boundaries false positives prevent matching",
+            },
+            {
+                "id": 11,
+                "title": "regex boundary keyword scoring feedback computation",
+                "content": "regex boundary keyword scoring feedback computation "
+                "word boundaries false positives prevent matching scorer",
+            },
+            {
+                "id": 12,
+                "title": "AWS Bedrock deployment routing environment",
+                "content": "BEDROCK deployment routing Anthropic environment variable "
+                "production configuration setup client initialization",
+            },
+        ]
+        # Use threshold=0.85 — the first two observations share almost identical
+        # vocabulary and consistently exceed this threshold under TF-IDF.
+        result = _cluster_by_tfidf(obs, threshold=0.85)
+        # Result must map obs ids to cluster ids
+        assert set(result.keys()) == {10, 11, 12}
+        # The two nearly-identical observations (10, 11) must share the same cluster
+        assert result[10] == result[11], (
+            "Observations 10 and 11 share nearly identical vocabulary and should cluster"
+        )
+        # The unrelated observation (12) must be in a different cluster
+        assert result[12] != result[10], (
+            "Observation 12 (AWS Bedrock) should not be clustered with the regex observations"
+        )
+
+    # ------------------------------------------------------------------
+    # format_observations cluster hints
+    # ------------------------------------------------------------------
+
+    def test_format_observations_includes_cluster_hints(self):
+        """format_observations must append [cluster:N] to observations when
+        a clusters dict is provided.
+        """
+        obs = [
+            {
+                "id": 1,
+                "title": "Obs A",
+                "content": "Content A.",
+                "count": 2,
+                "observation_type": "correction",
+                "sources": json.dumps(["sess-1", "sess-2"]),
+            },
+            {
+                "id": 2,
+                "title": "Obs B",
+                "content": "Content B.",
+                "count": 1,
+                "observation_type": "workflow_pattern",
+                "sources": json.dumps(["sess-1"]),
+            },
+        ]
+        clusters = {1: 0, 2: 1}
+        formatted = format_observations(obs, clusters=clusters)
+
+        assert "[cluster:0]" in formatted, "Cluster hint for obs 1 must appear in output"
+        assert "[cluster:1]" in formatted, "Cluster hint for obs 2 must appear in output"
+
+    def test_format_observations_without_clusters_is_unchanged(self):
+        """format_observations called without clusters must produce the same
+        output as before the clustering feature was added.
+        """
+        obs = [
+            {
+                "id": 1,
+                "title": "Obs A",
+                "content": "Content A.",
+                "count": 1,
+                "observation_type": "correction",
+                "sources": json.dumps(["sess-1"]),
+            }
+        ]
+        formatted = format_observations(obs)
+        assert "[cluster:" not in formatted, "No cluster hints when clusters arg is omitted"
+        assert "#1" in formatted
+        assert "Obs A" in formatted

@@ -25,6 +25,10 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 
+import nltk
+from nltk.corpus import stopwords as nltk_stopwords
+from nltk.stem import PorterStemmer as NltkStemmer
+
 from .storage import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -276,13 +280,23 @@ class RelevanceEngine:
         Returns:
             List of archived memory dicts that match, with 'relevance' key.
         """
-        # Extract significant words (4+ chars) for FTS query
-        words = [w for w in observation.split() if len(w) >= 4 and w.isalpha()]
+        # Extract significant words (4+ chars) for FTS query.
+        # Use NLTK stopword filtering and PorterStemmer to reduce query terms
+        # to stems, improving recall for inflected forms (e.g., "payments" → "payment").
+        try:
+            nltk.data.find('corpora/stopwords')
+            stop = set(nltk_stopwords.words('english'))
+            stemmer = NltkStemmer()
+            raw_words = [w.lower() for w in observation.split() if len(w) >= 4 and w.isalpha()]
+            words = list({stemmer.stem(w) for w in raw_words if w not in stop})
+        except Exception:
+            # NLTK unavailable — fall back to original extraction
+            words = [w.lower() for w in observation.split() if len(w) >= 4 and w.isalpha()]
         if not words:
             return []
 
-        # Build OR query for FTS
-        query = " OR ".join(words[:10])  # cap at 10 terms
+        # Build OR query for FTS — sanitize each term to prevent operator injection
+        query = " OR ".join(self.store.sanitize_fts_term(w) for w in words[:10])
 
         try:
             fts_results = self.store.search_fts(query, limit=REHYDRATION_FTS_LIMIT)

@@ -9,6 +9,8 @@ description = "Self-driven memory lifecycle with autonomous curation for Claude 
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.40.0",
+    "nltk>=3.8",
+    "scikit-learn>=1.4",
 ]
 
 [project.optional-dependencies]

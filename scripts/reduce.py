@@ -83,12 +83,69 @@ def get_store_manifest(conn: sqlite3.Connection, limit: int = 50) -> str:
     return "\n".join(lines)
 
 
+def _find_near_duplicates(
+    conn: sqlite3.Connection,
+    new_content: str,
+    threshold: float = 0.85,
+) -> list:
+    """
+    Return observation IDs with cosine similarity >= threshold to new_content.
+
+    Uses TF-IDF on title + content. Returns [] if sklearn unavailable or
+    the store has < 2 observations (degenerate case for TF-IDF).
+    """
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+    except ImportError:
+        return []
+
+    rows = conn.execute("SELECT id, title, content FROM observations").fetchall()
+    if len(rows) < 2:
+        return []
+
+    existing_texts = [f"{r[1]} {r[2]}" for r in rows]
+    all_texts = existing_texts + [new_content]
+
+    vectorizer = TfidfVectorizer(min_df=1, stop_words='english')
+    try:
+        tfidf = vectorizer.fit_transform(all_texts)
+    except ValueError:
+        return []  # Empty vocabulary (e.g., all stop words)
+
+    new_vec = tfidf[-1]
+    existing_vecs = tfidf[:-1]
+    sims = cosine_similarity(new_vec, existing_vecs).flatten()
+
+    return [rows[i][0] for i, sim in enumerate(sims) if sim >= threshold]
+
+
 def apply_operations(conn: sqlite3.Connection, result: dict, session_id: str):
     """Apply CREATE and REINFORCE operations from LLM response."""
     creates = result.get("create", [])
     reinforcements = result.get("reinforce", [])
 
     for obs in creates:
+        text = f"{obs.get('title', '')} {obs.get('content', '')}"
+        dupes = _find_near_duplicates(conn, text)
+        if dupes:
+            print(
+                f"  [tfidf] near-duplicate detected, reinforcing #{dupes[0]} instead",
+                file=sys.stderr,
+            )
+            # Treat as reinforcement of the closest match instead of creating
+            oid = dupes[0]
+            row = conn.execute("SELECT sources FROM observations WHERE id = ?", (oid,)).fetchone()
+            if row:
+                sources = json.loads(row[0])
+                if session_id not in sources:
+                    sources.append(session_id)
+                conn.execute(
+                    "UPDATE observations SET count = count + 1, sources = ? WHERE id = ?",
+                    (json.dumps(sources), oid),
+                )
+            continue  # Skip the INSERT
+
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) VALUES (?, ?, ?, ?, ?)",
             (
