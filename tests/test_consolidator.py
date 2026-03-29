@@ -890,3 +890,124 @@ class TestContradictionResolution:
         assert result["resolved"] == []
         # Only one LLM call (consolidation), no resolution call
         assert mock_cls.return_value.messages.create.call_count == 1
+
+    def test_superseded_archives_old_memory(self, consolidator, tmp_store, ephemeral_file):
+        """When resolution_type is superseded, the old memory is archived."""
+        memory_id = tmp_store.create(
+            path="prefs/pr_style.md",
+            content="Always use single PRs.",
+            metadata={
+                "stage": "consolidated",
+                "title": "PR style",
+                "summary": "Single PRs preferred.",
+            },
+        )
+
+        decisions = [
+            {
+                "observation": "Split PRs are better for cross-cutting changes.",
+                "action": "keep",
+                "rationale": "Updated PR preference.",
+                "title": "PR splitting",
+                "summary": "Split PRs for cross-cutting.",
+                "tags": ["workflow"],
+                "target_path": "prefs/pr_split.md",
+                "reinforces": None,
+                "contradicts": memory_id,
+            }
+        ]
+
+        superseded_resolution = {
+            "refined_title": "PR style (old)",
+            "refined_content": "Split PRs are now preferred for cross-cutting changes.",
+            "resolution_type": "superseded",
+            "confidence": 0.9,
+        }
+
+        consolidation_response = _llm_response(decisions)
+        resolution_response = _resolution_response(superseded_resolution)
+
+        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value.messages.create.side_effect = [
+                consolidation_response,
+                resolution_response,
+            ]
+            result = consolidator.consolidate_session(ephemeral_file, "sess-030")
+
+        assert len(result["resolved"]) == 1
+        assert result["resolved"][0]["resolution_type"] == "superseded"
+
+        # Memory should be archived
+        updated = tmp_store.get(memory_id)
+        assert updated.get("archived_at") is not None
+        assert "[Superseded]" in updated["title"]
+
+        # Consolidation log should show "archived" action
+        import sqlite3
+        with sqlite3.connect(tmp_store.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT action, rationale FROM consolidation_log WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchall()
+        deprecated_logs = [r for r in rows if r["action"] == "deprecated"]
+        assert len(deprecated_logs) == 1
+        assert "superseded" in deprecated_logs[0]["rationale"].lower()
+
+    def test_scoped_adds_scope_tag(self, consolidator, tmp_store, ephemeral_file):
+        """When resolution_type is scoped, the memory gets a scope: tag."""
+        memory_id = tmp_store.create(
+            path="style/imports.md",
+            content="Always use absolute imports.",
+            metadata={
+                "stage": "consolidated",
+                "title": "Import style",
+                "summary": "Absolute imports only.",
+                "tags": ["python"],
+            },
+        )
+
+        decisions = [
+            {
+                "observation": "Relative imports within packages.",
+                "action": "keep",
+                "rationale": "Scoped preference.",
+                "title": "Import update",
+                "summary": "Relative imports within packages.",
+                "tags": ["python"],
+                "target_path": "style/imports_v2.md",
+                "reinforces": None,
+                "contradicts": memory_id,
+            }
+        ]
+
+        scoped_resolution = {
+            "refined_title": "Import style: absolute for cross-package",
+            "refined_content": "Use absolute imports for cross-package. Relative within packages.",
+            "resolution_type": "scoped",
+            "confidence": 0.85,
+        }
+
+        consolidation_response = _llm_response(decisions)
+        resolution_response = _resolution_response(scoped_resolution)
+
+        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value.messages.create.side_effect = [
+                consolidation_response,
+                resolution_response,
+            ]
+            result = consolidator.consolidate_session(ephemeral_file, "sess-031")
+
+        assert len(result["resolved"]) == 1
+        assert result["resolved"][0]["resolution_type"] == "scoped"
+
+        # Memory should have scope tag added
+        updated = tmp_store.get(memory_id)
+        tags = updated.get("tags", [])
+        if isinstance(tags, str):
+            import json as _json
+            tags = _json.loads(tags)
+        assert any(t.startswith("scope:") for t in tags)
+        assert "relative" in updated["content"].lower()
+        # Should NOT be archived
+        assert updated.get("archived_at") is None
