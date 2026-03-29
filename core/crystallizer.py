@@ -17,12 +17,16 @@ A single promotion candidate still gets transformed — stripped of episodic
 detail, generalized into a reusable pattern.
 """
 
+import hashlib
 import json
+import re
+from datetime import datetime
 from typing import Optional
 
+from .database import get_base_dir, get_vec_store
 from .lifecycle import LifecycleManager
 from .llm import call_llm
-from .storage import MemoryStore
+from .models import ConsolidationLog, Memory
 
 # ---------------------------------------------------------------------------
 # Crystallization prompt
@@ -68,7 +72,7 @@ Respond ONLY with valid JSON:
 
 
 
-def _get_embeddings(store, candidates: list[dict]):
+def _get_embeddings(candidates: list):
     """
     Retrieve stored embeddings for candidates from vec_memories.
 
@@ -81,9 +85,14 @@ def _get_embeddings(store, candidates: list[dict]):
     except ImportError:
         return None
 
+    vec_store = get_vec_store()
+    if vec_store is None or not vec_store.available:
+        return None
+
     embeddings = []
     for c in candidates:
-        raw = store.get_embedding(c["id"])
+        cid = c.id if hasattr(c, 'id') and not isinstance(c, dict) else c["id"]
+        raw = vec_store.get_embedding(cid)
         if raw is None:
             return None  # Missing embedding — fall back to tag-overlap
         vec = struct.unpack(f"{len(raw)//4}f", raw)
@@ -101,8 +110,7 @@ class Crystallizer:
     into denser, pattern-level knowledge.
     """
 
-    def __init__(self, store: MemoryStore, lifecycle: LifecycleManager):
-        self.store = store
+    def __init__(self, lifecycle: LifecycleManager):
         self.lifecycle = lifecycle
 
     def crystallize_candidates(self) -> list[dict]:
@@ -120,9 +128,9 @@ class Crystallizer:
         full_candidates = []
         for c in candidates:
             try:
-                mem = self.store.get(c["id"])
+                mem = Memory.get_by_id(c["id"])
                 full_candidates.append(mem)
-            except (KeyError, ValueError):
+            except (KeyError, Memory.DoesNotExist):
                 continue
 
         if not full_candidates:
@@ -139,7 +147,7 @@ class Crystallizer:
 
         return results
 
-    def _group_candidates(self, candidates: list[dict]) -> list[list[dict]]:
+    def _group_candidates(self, candidates: list) -> list[list]:
         """
         Group related candidates by theme.
 
@@ -153,10 +161,9 @@ class Crystallizer:
 
         # Phase 1: Try embedding-based clustering
         # Skip if texts are too short to produce meaningful embeddings
-        # (degenerate inputs like single-character titles would cluster incorrectly)
-        texts = [f"{c.get('title', '')} {c.get('content', '')[:200]}" for c in candidates]
+        texts = [f"{c.title or ''} {(c.content or '')[:200]}" for c in candidates]
         min_text_len = min(len(t.strip()) for t in texts)
-        embeddings = _get_embeddings(self.store, candidates) if min_text_len >= 10 else None
+        embeddings = _get_embeddings(candidates) if min_text_len >= 10 else None
 
         if embeddings is not None:
             return self._group_by_embeddings(candidates, embeddings, threshold=0.75)
@@ -164,7 +171,7 @@ class Crystallizer:
         # Phase 2: Fall back to tag-overlap (original logic)
         return self._group_by_tags(candidates)
 
-    def _group_by_tags(self, candidates: list[dict]) -> list[list[dict]]:
+    def _group_by_tags(self, candidates: list) -> list[list]:
         """
         Group related candidates by observation type and tag overlap.
 
@@ -173,13 +180,8 @@ class Crystallizer:
         """
         # Extract tags from metadata
         def get_tags(mem):
-            tags = mem.get("tags", "")
-            if isinstance(tags, str):
-                try:
-                    tags = json.loads(tags)
-                except (json.JSONDecodeError, TypeError):
-                    tags = [t.strip() for t in tags.split(",") if t.strip()]
-            return set(tags) if isinstance(tags, list) else set()
+            tag_list = mem.tag_list if hasattr(mem, 'tag_list') else []
+            return set(tag_list)
 
         def get_obs_type(mem):
             tags = get_tags(mem)
@@ -189,7 +191,7 @@ class Crystallizer:
             return None
 
         # Group by observation type first
-        by_type: dict[str, list[dict]] = {}
+        by_type: dict[str, list] = {}
         ungrouped = []
         for mem in candidates:
             obs_type = get_obs_type(mem)
@@ -237,10 +239,10 @@ class Crystallizer:
 
     def _group_by_embeddings(
         self,
-        candidates: list[dict],
+        candidates: list,
         embeddings,  # numpy array (N, 512)
         threshold: float,
-    ) -> list[list[dict]]:
+    ) -> list[list]:
         """
         Group candidates by embedding cosine similarity using union-find.
 
@@ -267,12 +269,12 @@ class Crystallizer:
                     if ri != rj:
                         parent[ri] = rj
 
-        groups: dict[int, list[dict]] = {}
+        groups: dict[int, list] = {}
         for i in range(n):
             groups.setdefault(find(i), []).append(candidates[i])
         return list(groups.values())
 
-    def _crystallize_group(self, group: list[dict]) -> Optional[dict]:
+    def _crystallize_group(self, group: list) -> Optional[dict]:
         """
         Synthesize a group of related memories into one crystallized insight.
 
@@ -282,8 +284,8 @@ class Crystallizer:
         # Format observations for the prompt
         obs_parts = []
         for i, mem in enumerate(group, 1):
-            title = mem.get("title", "Untitled")
-            content = mem.get("content", "")
+            title = mem.title or "Untitled"
+            content = mem.content or ""
             obs_parts.append(f"[{i}] **{title}**\n{content}")
 
         observations_text = "\n\n".join(obs_parts)
@@ -297,8 +299,8 @@ class Crystallizer:
             return self._fallback_promote(group)
 
         # Create the crystallized memory
-        source_ids = [m["id"] for m in group]
-        source_titles = [m.get("title", "?") for m in group]
+        source_ids = [m.id for m in group]
+        source_titles = [m.title or "?" for m in group]
 
         tags = list(result.get("tags", []))
         obs_type = result.get("observation_type", "")
@@ -312,40 +314,64 @@ class Crystallizer:
             content += f"\n\n**Source pattern:** {source_pattern}"
         content += f"\n\n**Synthesized from:** {', '.join(source_titles)}"
 
-        import re
         safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', result["title"].lower())[:60]
 
-        crystallized_id = self.store.create(
-            path=f"crystallized/{safe_name}.md",
-            content=content,
-            metadata={
-                "stage": "crystallized",
-                "title": result["title"],
-                "summary": result["insight"][:150],
-                "tags": tags,
-                "importance": 0.75,  # Crystallized memories start higher
-            },
+        base_dir = get_base_dir()
+        file_path = base_dir / "crystallized" / f"{safe_name}.md"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build full content with frontmatter
+        frontmatter_lines = [
+            '---',
+            f'name: {result["title"]}',
+            f'description: {result["insight"][:150]}',
+            'type: memory',
+            '---',
+            '',
+            content,
+        ]
+        full_content = '\n'.join(frontmatter_lines)
+        content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+
+        # Dedup check
+        if Memory.select().where(Memory.content_hash == content_hash).exists():
+            return self._fallback_promote(group)
+
+        now = datetime.now().isoformat()
+        crystal_mem = Memory.create(
+            file_path=str(file_path),
+            stage="crystallized",
+            title=result["title"],
+            summary=result["insight"][:150],
+            content=full_content,
+            tags=json.dumps(tags),
+            importance=0.75,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+            content_hash=content_hash,
         )
+        crystallized_id = crystal_mem.id
+
+        # Write file
+        file_path.write_text(full_content, encoding="utf-8")
 
         # Archive source memories — they've been subsumed.
-        # Mark with subsumed_by so the relevance engine inhibits them
-        # during rehydration (retrieval-induced forgetting: strengthening
-        # the crystallized insight suppresses the source episodes).
         for mem in group:
             try:
-                self.store.update(mem["id"], metadata={
-                    "reinforcement_count": 0,
-                    "subsumed_by": crystallized_id,
-                })
-                self.store.archive(mem["id"])
-                self.store.log_consolidation(
+                mem.reinforcement_count = 0
+                mem.subsumed_by = crystallized_id
+                mem.save()
+                Memory.update(archived_at=datetime.now().isoformat()).where(Memory.id == mem.id).execute()
+                ConsolidationLog.create(
+                    timestamp=datetime.now().isoformat(),
                     action="subsumed",
-                    memory_id=mem["id"],
+                    memory_id=mem.id,
                     from_stage="consolidated",
                     to_stage="archived",
                     rationale=f"Subsumed into crystallized memory: {result['title']}",
                 )
-            except (ValueError, KeyError):
+            except Exception:
                 pass
 
         return {
@@ -356,22 +382,22 @@ class Crystallizer:
             "group_size": len(group),
         }
 
-    def _fallback_promote(self, group: list[dict]) -> Optional[dict]:
+    def _fallback_promote(self, group: list) -> Optional[dict]:
         """Simple promotion without synthesis — used when LLM call fails."""
         promoted = []
         for mem in group:
             try:
                 self.lifecycle.promote(
-                    mem["id"], "Auto-promoted: meets reinforcement threshold"
+                    mem.id, "Auto-promoted: meets reinforcement threshold"
                 )
-                promoted.append(mem["id"])
+                promoted.append(mem.id)
             except ValueError:
                 pass
         if promoted:
             return {
                 "crystallized_id": promoted[0],
                 "source_ids": promoted,
-                "title": group[0].get("title", "?"),
+                "title": group[0].title or "?",
                 "insight": "(fallback — no synthesis)",
                 "group_size": len(group),
             }

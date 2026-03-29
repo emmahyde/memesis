@@ -6,18 +6,18 @@ maintains the instinctive/self-model.md memory — the agent's awareness
 of its own tendencies, failure modes, and corrective strategies.
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
-
+from .database import get_base_dir
+from .llm import call_llm as _call_llm_transport
+from .models import ConsolidationLog, Memory, db
 from .prompts import SELF_REFLECTION_PROMPT
-from .storage import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +193,7 @@ class SelfReflector:
     for behavioral patterns, and proposes updates to the self-model.
     """
 
-    def __init__(self, store: MemoryStore, model: str = "claude-sonnet-4-6"):
-        self.store = store
+    def __init__(self, model: str = "claude-sonnet-4-6"):
         self.model = model
 
     # ------------------------------------------------------------------
@@ -223,7 +222,7 @@ class SelfReflector:
         """
         existing = self._find_self_model()
         if existing:
-            return existing["id"]
+            return existing.id
         return self._seed_self_model()
 
     def ensure_observation_habit(self) -> str:
@@ -235,7 +234,7 @@ class SelfReflector:
         """
         existing = self._find_by_title(OBSERVATION_HABIT_TITLE)
         if existing:
-            return existing["id"]
+            return existing.id
         return self._seed_observation_habit()
 
     def ensure_compaction_guidance(self) -> str:
@@ -247,7 +246,7 @@ class SelfReflector:
         """
         existing = self._find_by_title(COMPACTION_GUIDANCE_TITLE)
         if existing:
-            return existing["id"]
+            return existing.id
         return self._seed_compaction_guidance()
 
     def reflect(self, session_count: int = 10) -> dict:
@@ -265,8 +264,8 @@ class SelfReflector:
             'deprecated' (tendencies no longer accurate).
         """
         model_id = self.ensure_self_model()
-        model_memory = self.store.get(model_id)
-        current_model = model_memory.get("content", "")
+        model_memory = Memory.get_by_id(model_id)
+        current_model = model_memory.content or ""
 
         history = self._get_consolidation_history(session_count)
         if not history:
@@ -293,13 +292,16 @@ class SelfReflector:
             Updated memory ID.
         """
         model_id = self.ensure_self_model()
-        model_memory = self.store.get(model_id)
-        current_content = model_memory.get("content", "")
+        model_memory = Memory.get_by_id(model_id)
+        current_content = model_memory.content or ""
 
         new_content = self._merge_reflection(current_content, reflection)
 
-        self.store.update(model_id, content=new_content)
-        self.store.log_consolidation(
+        model_memory.content = new_content
+        model_memory.save()
+
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
             action="merged",
             memory_id=model_id,
             from_stage="instinctive",
@@ -314,124 +316,123 @@ class SelfReflector:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _find_by_title(self, title: str) -> dict | None:
-        """Find an instinctive memory by title."""
-        instinctive = self.store.list_by_stage("instinctive")
+    def _find_by_title(self, title: str):
+        """Find an instinctive memory by title. Returns Memory instance or None."""
+        instinctive = list(Memory.by_stage("instinctive"))
         for memory in instinctive:
-            if memory.get("title") == title:
+            if memory.title == title:
                 return memory
         return None
 
-    def _find_self_model(self) -> dict | None:
+    def _find_self_model(self):
         """Find the self-model memory in the store."""
         return self._find_by_title(SELF_MODEL_TITLE)
 
     def _seed_self_model(self) -> str:
         """Create the initial self-model memory."""
         content = SELF_MODEL_SEED.format(date=datetime.now().strftime("%Y-%m-%d"))
-
-        memory_id = self.store.create(
+        return self._create_instinctive_memory(
             path="self-model.md",
             content=content,
-            metadata={
-                "stage": "instinctive",
-                "title": SELF_MODEL_TITLE,
-                "summary": SELF_MODEL_SUMMARY,
-                "tags": ["self-awareness", "meta-cognition", "type:self_observation"],
-                "importance": 0.90,
-            },
+            title=SELF_MODEL_TITLE,
+            summary=SELF_MODEL_SUMMARY,
+            tags=["self-awareness", "meta-cognition", "type:self_observation"],
+            importance=0.90,
         )
-        logger.info("Seeded self-model memory: %s", memory_id)
-        return memory_id
 
     def _seed_observation_habit(self) -> str:
         """Create the observation habit instinctive memory."""
-        memory_id = self.store.create(
+        return self._create_instinctive_memory(
             path="observation-habit.md",
             content=OBSERVATION_HABIT_CONTENT,
-            metadata={
-                "stage": "instinctive",
-                "title": OBSERVATION_HABIT_TITLE,
-                "summary": OBSERVATION_HABIT_SUMMARY,
-                "tags": ["meta-cognition", "workflow", "type:workflow_pattern"],
-                "importance": 0.85,
-            },
+            title=OBSERVATION_HABIT_TITLE,
+            summary=OBSERVATION_HABIT_SUMMARY,
+            tags=["meta-cognition", "workflow", "type:workflow_pattern"],
+            importance=0.85,
         )
-        logger.info("Seeded observation habit memory: %s", memory_id)
-        return memory_id
 
     def _seed_compaction_guidance(self) -> str:
         """Create the compaction guidance instinctive memory."""
-        memory_id = self.store.create(
+        return self._create_instinctive_memory(
             path="compaction-guidance.md",
             content=COMPACTION_GUIDANCE_CONTENT,
-            metadata={
-                "stage": "instinctive",
-                "title": COMPACTION_GUIDANCE_TITLE,
-                "summary": COMPACTION_GUIDANCE_SUMMARY,
-                "tags": ["meta-cognition", "compaction", "type:workflow_pattern"],
-                "importance": 0.80,
-            },
+            title=COMPACTION_GUIDANCE_TITLE,
+            summary=COMPACTION_GUIDANCE_SUMMARY,
+            tags=["meta-cognition", "compaction", "type:workflow_pattern"],
+            importance=0.80,
         )
-        logger.info("Seeded compaction guidance memory: %s", memory_id)
-        return memory_id
+
+    def _create_instinctive_memory(
+        self, path: str, content: str, title: str, summary: str,
+        tags: list, importance: float,
+    ) -> str:
+        """Create an instinctive memory with file and DB entry."""
+        base_dir = get_base_dir()
+        file_path = base_dir / "instinctive" / path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build full content with frontmatter
+        frontmatter_lines = [
+            '---',
+            f'name: {title}',
+            f'description: {summary}',
+            'type: memory',
+            '---',
+            '',
+            content,
+        ]
+        full_content = '\n'.join(frontmatter_lines)
+        content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+
+        # Dedup check
+        if Memory.select().where(Memory.content_hash == content_hash).exists():
+            existing = Memory.select().where(Memory.content_hash == content_hash).first()
+            return existing.id
+
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            file_path=str(file_path),
+            stage="instinctive",
+            title=title,
+            summary=summary,
+            content=full_content,
+            tags=json.dumps(tags),
+            importance=importance,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+            content_hash=content_hash,
+        )
+
+        # Write file
+        file_path.write_text(full_content, encoding="utf-8")
+
+        logger.info("Seeded instinctive memory: %s (%s)", title, mem.id)
+        return mem.id
 
     def _get_consolidation_history(self, session_count: int = 10) -> str:
         """
         Fetch recent consolidation log entries as formatted text.
-
-        Args:
-            session_count: Number of recent sessions to include.
-
-        Returns:
-            Formatted consolidation history string.
         """
-        with sqlite3.connect(self.store.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                """
-                SELECT action, memory_id, from_stage, to_stage, rationale, session_id, timestamp
-                FROM consolidation_log
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (session_count * 10,),  # ~10 decisions per session
-            )
-            rows = cursor.fetchall()
-
-        if not rows:
-            return ""
+        rows = (
+            ConsolidationLog.select()
+            .order_by(ConsolidationLog.timestamp.desc())
+            .limit(session_count * 10)
+        )
 
         lines = []
         for row in rows:
             lines.append(
-                f"[{row['timestamp']}] {row['action'].upper()}: "
-                f"{row['rationale'] or '(no rationale)'} "
-                f"(memory: {row['memory_id']}, {row['from_stage']} → {row['to_stage']})"
+                f"[{row.timestamp}] {(row.action or '').upper()}: "
+                f"{row.rationale or '(no rationale)'} "
+                f"(memory: {row.memory_id}, {row.from_stage} -> {row.to_stage})"
             )
+
         return "\n".join(lines)
 
     def _call_llm(self, prompt: str) -> dict:
-        """
-        Call the Anthropic API for self-reflection.
-
-        Returns:
-            Parsed reflection dict with 'observations' and 'deprecated' keys.
-        """
-        if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-            client = anthropic.AnthropicBedrock()
-            model = "us.anthropic.claude-sonnet-4-6"
-        else:
-            client = anthropic.Anthropic()
-            model = self.model
-
-        response = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.content[0].text
+        """Call the Anthropic API for self-reflection."""
+        raw = _call_llm_transport(prompt, max_tokens=2048, temperature=0)
 
         try:
             return self._parse_response(raw)
@@ -456,18 +457,7 @@ class SelfReflector:
         }
 
     def _merge_reflection(self, current_content: str, reflection: dict) -> str:
-        """
-        Merge reflection results into the current self-model content.
-
-        Appends new observations as new sections and marks deprecated ones.
-
-        Args:
-            current_content: Current self-model markdown.
-            reflection: Dict with 'observations' and 'deprecated'.
-
-        Returns:
-            Updated self-model markdown.
-        """
+        """Merge reflection results into the current self-model content."""
         lines = current_content.splitlines()
 
         # Update the "Last updated" line
@@ -480,7 +470,6 @@ class SelfReflector:
 
         # Mark deprecated tendencies
         for deprecated in reflection.get("deprecated", []):
-            # Find the section header and add a deprecation note
             pattern = re.compile(
                 rf"^### {re.escape(deprecated)}$",
                 re.MULTILINE,

@@ -10,11 +10,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .storage import MemoryStore
+from .database import get_base_dir
+from .models import Memory, NarrativeThread, RetrievalLog, ThreadMember, db
 
-CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens × 4 chars/token
+CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens x 4 chars/token
 THREAD_BUDGET_CHARS = 8_000
 _THREAD_NARRATIVE_CAP = 1_000
+
+
+def _record_injection(memory_id: str, session_id: str, project_context: str = None) -> None:
+    """Record that a memory was injected into a session."""
+    now = datetime.now().isoformat()
+    Memory.update(
+        last_injected_at=now,
+        injection_count=Memory.injection_count + 1,
+    ).where(Memory.id == memory_id).execute()
+
+    RetrievalLog.create(
+        timestamp=now,
+        session_id=session_id,
+        memory_id=memory_id,
+        retrieval_type='injected',
+        project_context=project_context,
+    )
 
 
 class RetrievalEngine:
@@ -25,10 +43,9 @@ class RetrievalEngine:
     (approximated at 4 chars per token).  Default 8% yields ~16 000 tokens.
     """
 
-    def __init__(self, store: MemoryStore, token_budget_pct: float = 0.08):
+    def __init__(self, token_budget_pct: float = 0.08):
         """
         Args:
-            store: MemoryStore instance.
             token_budget_pct: Fraction of context window reserved for Tier-2
                 crystallized memories.  Must be in (0, 1].
         """
@@ -37,7 +54,6 @@ class RetrievalEngine:
                 f"token_budget_pct must be between 0 (exclusive) and 1 "
                 f"(inclusive), got {token_budget_pct}"
             )
-        self.store = store
         self.token_budget_pct = token_budget_pct
         # token_limit is in *characters* (chars/4 is the token estimate)
         self.token_limit = int(token_budget_pct * 200_000) * 4  # chars
@@ -53,16 +69,6 @@ class RetrievalEngine:
     ) -> str:
         """
         Build the full memory context string for injection into a session.
-
-        Logs every injected memory via store.record_injection().
-
-        Args:
-            session_id: Unique identifier for the current session.
-            project_context: Optional project path for Tier-2 boosting.
-
-        Returns:
-            Formatted memory context block.  Empty string when no memories
-            exist in either tier.
         """
         tier1 = self.get_instinctive_memories()
         tier2 = self.get_crystallized_for_context(
@@ -70,9 +76,9 @@ class RetrievalEngine:
             token_limit=self.token_limit,
         )
 
-        # Log injections for every memory surfaced, including project_context for D-08 tracking
+        # Log injections for every memory surfaced
         for memory in tier1 + tier2:
-            self.store.record_injection(memory["id"], session_id, project_context=project_context)
+            _record_injection(memory.id, session_id, project_context=project_context)
 
         if not tier1 and not tier2:
             return ""
@@ -84,9 +90,9 @@ class RetrievalEngine:
             sections.append("## Your Behavioral Guidelines (always active)")
             for memory in tier1:
                 sections.append("")
-                title = memory.get("title") or "Guideline"
+                title = memory.title or "Guideline"
                 sections.append(f"### {title}")
-                content = memory.get("content", "").strip()
+                content = (memory.content or "").strip()
                 if content:
                     sections.append(content)
 
@@ -96,13 +102,13 @@ class RetrievalEngine:
             sections.append("## Context-Relevant Knowledge")
             for memory in tier2:
                 sections.append("")
-                title = memory.get("title") or "Memory"
-                importance = memory.get("importance", 0.5)
+                title = memory.title or "Memory"
+                importance = memory.importance or 0.5
                 sections.append(f"### {title} (importance: {importance:.2f})")
-                summary = memory.get("summary", "").strip()
+                summary = (memory.summary or "").strip()
                 if summary:
                     sections.append(f"*{summary}*")
-                content = memory.get("content", "").strip()
+                content = (memory.content or "").strip()
                 if content:
                     sections.append(content)
 
@@ -113,9 +119,9 @@ class RetrievalEngine:
             sections.append("## Narrative Threads (how understanding evolved)")
             for thread in thread_narratives:
                 sections.append("")
-                title = thread.get("title", "Thread")
+                title = thread.title or "Thread"
                 sections.append(f"### {title}")
-                narrative = thread.get("narrative", "").strip()
+                narrative = (thread.narrative or "").strip()
                 if narrative:
                     sections.append(narrative)
 
@@ -132,67 +138,61 @@ class RetrievalEngine:
     ) -> list[dict]:
         """
         Agent-initiated FTS search (Tier 3) with progressive disclosure.
-
-        Results include a ``summary`` field prominently alongside full content.
-        Does NOT log injections — active search results are surfaced on demand,
-        not pre-injected.
-
-        Args:
-            query: FTS5 query string.
-            session_id: Current session identifier (reserved for future logging).
-            limit: Maximum number of results.
-
-        Returns:
-            List of memory dicts ordered by FTS relevance, each with:
-            ``id``, ``title``, ``summary``, ``content``, ``importance``,
-            ``stage``, ``tags``, ``rank``.
         """
-        results = self.store.search_fts(query, limit=limit)
+        results = Memory.search_fts(query, limit=limit)
 
         disclosed = []
         for memory in results:
             disclosed.append({
-                "id": memory["id"],
-                "title": memory.get("title"),
-                "summary": memory.get("summary"),  # prominently available
-                "content": memory.get("content", ""),
-                "importance": memory.get("importance", 0.5),
-                "stage": memory.get("stage"),
-                "tags": memory.get("tags", []),
-                "rank": memory.get("rank"),
-                "project_context": memory.get("project_context"),
+                "id": memory.id,
+                "title": memory.title,
+                "summary": memory.summary,
+                "content": memory.content or "",
+                "importance": memory.importance or 0.5,
+                "stage": memory.stage,
+                "tags": memory.tag_list,
+                "rank": getattr(memory, '_rank', None),
+                "project_context": memory.project_context,
             })
 
         return disclosed
 
-    def _get_thread_narratives(self, tier2_memories: list[dict]) -> list[dict]:
+    def _get_thread_narratives(self, tier2_memories: list) -> list:
         """
         Find narrative threads whose members appear in tier2_memories.
-        Uses batch query. Applies per-narrative cap and total budget (shortest-first).
-        Updates last_surfaced_at lazily.
         """
         if not tier2_memories:
             return []
 
-        memory_ids = [m["id"] for m in tier2_memories]
-        candidates = self.store.get_threads_for_memories_batch(memory_ids)
+        memory_ids = [m.id for m in tier2_memories]
+        if not memory_ids:
+            return []
+
+        # Batch query for threads containing any of the tier2 memory IDs
+        candidates = list(
+            NarrativeThread.select()
+            .join(ThreadMember, on=(NarrativeThread.id == ThreadMember.thread_id))
+            .where(ThreadMember.memory_id.in_(memory_ids))
+            .distinct()
+            .order_by(NarrativeThread.updated_at.desc())
+        )
 
         # Per-narrative cap: truncate at sentence boundary
         for t in candidates:
-            narrative = t.get("narrative") or ""
+            narrative = t.narrative or ""
             if len(narrative) > _THREAD_NARRATIVE_CAP:
                 truncated = narrative[:_THREAD_NARRATIVE_CAP]
                 last_period = truncated.rfind(".")
                 if last_period > _THREAD_NARRATIVE_CAP // 2:
                     truncated = truncated[:last_period + 1]
-                t["narrative"] = truncated
+                t.narrative = truncated
 
         # Greedy budget: shortest first maximises arc count
-        candidates_sorted = sorted(candidates, key=lambda t: len(t.get("narrative") or ""))
+        candidates_sorted = sorted(candidates, key=lambda t: len(t.narrative or ""))
         budget_remaining = THREAD_BUDGET_CHARS
         selected = []
         for thread in candidates_sorted:
-            cost = len(thread.get("narrative") or "")
+            cost = len(thread.narrative or "")
             if cost <= budget_remaining:
                 selected.append(thread)
                 budget_remaining -= cost
@@ -200,65 +200,43 @@ class RetrievalEngine:
         # Lazy update: record surfacing timestamp
         if selected:
             now = datetime.now(timezone.utc).isoformat()
-            self.store.update_threads_last_surfaced([t["id"] for t in selected], now)
+            thread_ids = [t.id for t in selected]
+            NarrativeThread.update(last_surfaced_at=now).where(
+                NarrativeThread.id.in_(thread_ids)
+            ).execute()
 
         return selected
 
-    def get_instinctive_memories(self) -> list[dict]:
+    def get_instinctive_memories(self) -> list:
         """
-        Return all instinctive memories with their file content loaded.
-
-        Tier 1 — no filtering, no budget limits.  Every instinctive memory is
-        always returned.
+        Return all instinctive memories with their content loaded.
+        Tier 1 — no filtering, no budget limits.
         """
-        records = self.store.list_by_stage("instinctive")
-        result = []
-        for record in records:
-            full = self.store.get(record["id"])
-            result.append(full)
-        return result
+        return list(Memory.by_stage("instinctive"))
 
     def get_crystallized_for_context(
         self,
         project_context: str = None,
         token_limit: int = None,
-    ) -> list[dict]:
+    ) -> list:
         """
         Return token-budgeted crystallized memories, optionally boosted by
         project context.
-
-        Sort order:
-            1. Project-matching memories (when project_context provided) first.
-            2. importance DESC.
-            3. last_used_at DESC (None sorts last).
-
-        Args:
-            project_context: If provided, memories whose ``project_context``
-                matches are placed before non-matching ones.
-            token_limit: Character budget (chars ≈ tokens × 4).  Defaults to
-                ``self.token_limit``.
-
-        Returns:
-            List of memory dicts (with content) that fit within the budget.
         """
         if token_limit is None:
             token_limit = self.token_limit
 
-        records = self.store.list_by_stage("crystallized")
+        records = list(Memory.by_stage("crystallized"))
 
-        # Three-pass stable sort: last_used_at DESC, then importance DESC,
-        # then project-match first.
-        # 1. Sort by last_used_at DESC (stable)
-        # 2. Then by importance DESC (stable)
-        # 3. Then project-match first (stable)
+        # Three-pass stable sort
         records_sorted = sorted(
             records,
-            key=lambda m: m.get("last_used_at") or "",
+            key=lambda m: m.last_used_at or "",
             reverse=True,
         )
         records_sorted = sorted(
             records_sorted,
-            key=lambda m: m.get("importance") or 0.0,
+            key=lambda m: m.importance or 0.0,
             reverse=True,
         )
         records_sorted = sorted(
@@ -267,7 +245,7 @@ class RetrievalEngine:
                 0
                 if (
                     project_context is not None
-                    and m.get("project_context") == project_context
+                    and m.project_context == project_context
                 )
                 else 1
             ),
@@ -278,15 +256,11 @@ class RetrievalEngine:
         selected = []
 
         for record in records_sorted:
-            full = self.store.get(record["id"])
-            content = full.get("content", "") or ""
+            content = record.content or ""
             cost = len(content)
 
             if cost <= budget_remaining:
-                selected.append(full)
+                selected.append(record)
                 budget_remaining -= cost
-            # If a single memory exceeds the remaining budget we skip it and
-            # keep trying — a smaller memory later in the list may still fit.
-            # (This is a best-effort packing approach, not strict first-fit.)
 
         return selected

@@ -13,6 +13,7 @@ Usage:
     python3 scripts/seed.py --report                           # Print quality report only
 """
 
+import hashlib
 import json
 import re
 import sys
@@ -21,17 +22,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.storage import MemoryStore
+from core.database import close_db, get_base_dir, init_db
+from core.models import Memory
 
 OUTPUT_DIR = Path(__file__).parent.parent / "backfill-output"
 
 
 def load_results(results_path: Path, project_filter: str = None) -> list[dict]:
-    """Load kept decisions from consolidation results.
-
-    If project_filter is set, only include sessions whose project field
-    contains the filter string (case-insensitive substring match).
-    """
+    """Load kept decisions from consolidation results."""
     kept = []
     with open(results_path) as f:
         for line in f:
@@ -73,7 +71,6 @@ def print_report(kept: list[dict], project_filter: str = None):
     print(f"  Kept:   {len(kept):4d} ({len(kept)/max(total_results,1):.0%})")
     print(f"  Pruned: {total_pruned:4d} ({total_pruned/max(total_results,1):.0%})")
 
-    # Type distribution
     types = {}
     for d in kept:
         t = d.get("observation_type") or "(untyped)"
@@ -81,7 +78,7 @@ def print_report(kept: list[dict], project_filter: str = None):
 
     print(f"\n  Observation types:")
     for t, count in sorted(types.items(), key=lambda x: x[1], reverse=True):
-        bar = "█" * (count * 2)
+        bar = "\u2588" * (count * 2)
         print(f"    {t:25s} {count:3d}  {bar}")
 
     print(f"\n  Observations:")
@@ -124,11 +121,7 @@ def _load_session_date_range() -> tuple[str, str] | None:
 
 
 def _distribute_timestamps(count: int, date_range: tuple[str, str] | None) -> list[str]:
-    """Generate evenly distributed timestamps across the session date range.
-
-    Returns a list of ISO timestamps, one per observation to seed.
-    If no date range is available, returns empty list (caller uses now()).
-    """
+    """Generate evenly distributed timestamps across the session date range."""
     if not date_range or count == 0:
         return []
     try:
@@ -143,16 +136,7 @@ def _distribute_timestamps(count: int, date_range: tuple[str, str] | None) -> li
 
 
 def seed(kept: list[dict], project_context: str = None, dry_run: bool = False):
-    """Seed kept decisions into the store.
-
-    Reads reinforcement counts from the consolidation sidecar — observations
-    that were independently reinforced across sessions start with a higher
-    reinforcement_count, making them eligible for crystallization sooner.
-
-    Uses original session dates from summaries.jsonl to set created_at,
-    distributing memories evenly across the date range so that thread
-    detection, relevance decay, and temporal ordering work correctly.
-    """
+    """Seed kept decisions into the store."""
     reinforcements = _load_reinforcements()
     date_range = _load_session_date_range()
     timestamps = _distribute_timestamps(len(kept), date_range)
@@ -166,7 +150,7 @@ def seed(kept: list[dict], project_context: str = None, dry_run: bool = False):
             print(f"  [{d.get('observation_type', '?'):20s}] {title}{r_str}")
         return
 
-    store = MemoryStore(project_context=project_context)
+    base_dir = init_db(project_context=project_context)
     seeded, skipped = 0, 0
 
     for idx, d in enumerate(kept):
@@ -192,34 +176,54 @@ def seed(kept: list[dict], project_context: str = None, dry_run: bool = False):
 
         safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', title.lower())[:60]
 
-        created_at = timestamps[idx] if idx < len(timestamps) else None
-        meta = {
-            "stage": "consolidated",
-            "title": title,
-            "summary": summary,
-            "tags": tags,
-            "importance": importance,
-            "reinforcement_count": reinforcement_count,
-            "source_session": d.get("_session", ""),
-        }
-        if created_at:
-            meta["created_at"] = created_at
+        created_at = timestamps[idx] if idx < len(timestamps) else datetime.now().isoformat()
+
+        # Build full content with frontmatter
+        frontmatter_lines = [
+            '---',
+            f'name: {title}',
+            f'description: {summary}',
+            'type: memory',
+            '---',
+            '',
+            content,
+        ]
+        full_content = '\n'.join(frontmatter_lines)
+        content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+
+        # Dedup check
+        if Memory.select().where(Memory.content_hash == content_hash).exists():
+            skipped += 1
+            continue
+
+        file_path = base_dir / "consolidated" / "backfill" / f"{safe_name}.md"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            store.create(
-                path=f"backfill/{safe_name}.md",
-                content=content,
-                metadata=meta,
+            Memory.create(
+                file_path=str(file_path),
+                stage="consolidated",
+                title=title,
+                summary=summary,
+                content=full_content,
+                tags=json.dumps(tags),
+                importance=importance,
+                reinforcement_count=reinforcement_count,
+                created_at=created_at,
+                updated_at=created_at,
+                source_session=d.get("_session", ""),
+                content_hash=content_hash,
             )
+            file_path.write_text(full_content, encoding="utf-8")
             seeded += 1
             r_str = f" (reinforced x{reinforcement_count})" if reinforcement_count > 0 else ""
             print(f"  + [{obs_type or '?':20s}] {title}{r_str}")
-        except ValueError:
+        except Exception:
             skipped += 1
 
     print(f"\nSeeded: {seeded}, Skipped (duplicate): {skipped}")
-    print(f"Store: {store.base_dir}")
-    store.close()
+    print(f"Store: {base_dir}")
+    close_db()
 
 
 def main():

@@ -26,13 +26,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.consolidator import Consolidator
 from core.crystallizer import Crystallizer
+from core.database import close_db, get_base_dir, get_vec_store, init_db
 from core.embeddings import embed_for_memory
 from core.feedback import FeedbackLoop
 from core.lifecycle import LifecycleManager
 from core.manifest import ManifestGenerator
+from core.models import Memory
 from core.relevance import RelevanceEngine
 from core.self_reflection import SelfReflector
-from core.storage import MemoryStore
 from core.threads import build_threads
 
 logging.basicConfig(
@@ -51,20 +52,13 @@ REFLECTION_INTERVAL = 5
 
 
 def find_ephemeral_buffers() -> list[Path]:
-    """Find all ephemeral session files with actual observations.
-
-    Only scans directories that match Claude Code's naming convention
-    (leading dash from path hashing). Directories without a leading dash
-    are rogue stores created by bugs and are skipped.
-    """
+    """Find all ephemeral session files with actual observations."""
     projects_dir = Path.home() / ".claude" / "projects"
     if not projects_dir.exists():
         return []
 
     buffers = []
     for memory_dir in projects_dir.glob("*/memory/ephemeral"):
-        # Claude Code project dirs always start with '-' (from leading '/' in paths).
-        # Skip rogue directories that lack this prefix.
         project_dir_name = memory_dir.parent.parent.name
         if not project_dir_name.startswith("-"):
             logger.warning("Skipping rogue project directory (no leading dash): %s", project_dir_name)
@@ -72,7 +66,6 @@ def find_ephemeral_buffers() -> list[Path]:
 
         for session_file in memory_dir.glob("session-*.md"):
             content = session_file.read_text(encoding="utf-8").strip()
-            # Skip empty buffers (just the header line)
             lines = [l for l in content.splitlines() if l.strip() and not l.startswith("# Session")]
             if lines:
                 buffers.append(session_file)
@@ -80,9 +73,9 @@ def find_ephemeral_buffers() -> list[Path]:
     return buffers
 
 
-def _get_consolidation_count(store: MemoryStore) -> int:
+def _get_consolidation_count(base_dir: Path) -> int:
     """Read the consolidation counter from meta/consolidation-count.json."""
-    counter_path = store.base_dir / "meta" / "consolidation-count.json"
+    counter_path = base_dir / "meta" / "consolidation-count.json"
     if counter_path.exists():
         try:
             data = json.loads(counter_path.read_text())
@@ -92,27 +85,17 @@ def _get_consolidation_count(store: MemoryStore) -> int:
     return 0
 
 
-def _increment_consolidation_count(store: MemoryStore) -> int:
+def _increment_consolidation_count(base_dir: Path) -> int:
     """Increment and persist the consolidation counter. Returns new count."""
-    counter_path = store.base_dir / "meta" / "consolidation-count.json"
+    counter_path = base_dir / "meta" / "consolidation-count.json"
     counter_path.parent.mkdir(parents=True, exist_ok=True)
-    count = _get_consolidation_count(store) + 1
+    count = _get_consolidation_count(base_dir) + 1
     counter_path.write_text(json.dumps({"count": count}))
     return count
 
 
 def process_buffer(ephemeral_path: Path) -> dict | None:
-    """Run full lifecycle on a single ephemeral buffer.
-
-    1. Lock, snapshot, clear the buffer
-    2. Consolidate (LLM call via Bedrock)
-    3. Crystallize promotion candidates
-    4. Build narrative threads
-    5. Promote crystallized → instinctive if eligible
-    6. Relevance maintenance (archive stale, rehydrate relevant)
-    7. Periodic self-reflection
-    8. Write manifest
-    """
+    """Run full lifecycle on a single ephemeral buffer."""
     memory_dir = ephemeral_path.parent.parent  # up from ephemeral/ to memory/
     lock_path = ephemeral_path.parent / ".lock"
     date_str = ephemeral_path.stem.replace("session-", "")
@@ -135,12 +118,12 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
     snapshot_path.write_text(content, encoding="utf-8")
 
     try:
-        store = MemoryStore(base_dir=str(memory_dir))
-        lifecycle = LifecycleManager(store)
-        consolidator = Consolidator(store, lifecycle)
-        manifest = ManifestGenerator(store)
-        feedback = FeedbackLoop(store, lifecycle)
-        reflector = SelfReflector(store)
+        base_dir = init_db(base_dir=str(memory_dir))
+        lifecycle = LifecycleManager()
+        consolidator = Consolidator(lifecycle)
+        manifest = ManifestGenerator()
+        feedback = FeedbackLoop(lifecycle)
+        reflector = SelfReflector()
 
         session_id = f"cron-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
@@ -151,17 +134,19 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         result = consolidator.consolidate_session(str(snapshot_path), session_id)
         feedback.update_importance_scores(session_id)
 
+        vec_store = get_vec_store()
+
         # Embed newly kept memories
         for memory_id in result.get("kept", []):
             try:
-                mem = store.get(memory_id)
+                mem = Memory.get_by_id(memory_id)
                 embedding = embed_for_memory(
-                    mem.get("title", ""),
-                    mem.get("summary", ""),
-                    mem.get("content", ""),
+                    mem.title or "",
+                    mem.summary or "",
+                    mem.content or "",
                 )
-                if embedding:
-                    store.store_embedding(memory_id, embedding)
+                if embedding and vec_store:
+                    vec_store.store_embedding(memory_id, embedding)
             except Exception as e:
                 logger.warning("Embedding error (non-fatal): %s", e)
 
@@ -172,7 +157,7 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         # --- Crystallization ---
         crystallized = []
         try:
-            crystallizer = Crystallizer(store, lifecycle)
+            crystallizer = Crystallizer(lifecycle)
             crystallized = crystallizer.crystallize_candidates()
         except Exception as e:
             logger.warning("Crystallization error (non-fatal): %s", e)
@@ -181,13 +166,13 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
             try:
                 cid = crystal.get("crystallized_id")
                 if cid:
-                    mem = store.get(cid)
+                    mem = Memory.get_by_id(cid)
                     embedding = embed_for_memory(
-                        mem.get("title", ""),
+                        mem.title or "",
                         crystal.get("insight", ""),
                     )
-                    if embedding:
-                        store.store_embedding(cid, embedding)
+                    if embedding and vec_store:
+                        vec_store.store_embedding(cid, embedding)
             except Exception as e:
                 logger.warning("Crystal embedding error (non-fatal): %s", e)
 
@@ -197,7 +182,7 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         # --- Narrative threads ---
         threads_built = []
         try:
-            threads_built = build_threads(store)
+            threads_built = build_threads()
         except Exception as e:
             logger.warning("Thread building error (non-fatal): %s", e)
 
@@ -206,20 +191,20 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
 
         # --- Instinctive promotion ---
         instinctive_promoted = 0
-        for mem in store.list_by_stage("crystallized"):
-            can, reason = lifecycle.can_promote(mem["id"])
+        for mem in Memory.by_stage("crystallized"):
+            can, reason = lifecycle.can_promote(mem.id)
             if can:
                 try:
-                    lifecycle.promote(mem["id"], f"Auto-promoted to instinctive: {reason}")
+                    lifecycle.promote(mem.id, f"Auto-promoted to instinctive: {reason}")
                     instinctive_promoted += 1
                 except ValueError:
                     pass
 
         if instinctive_promoted:
-            summary_parts.append(f"{instinctive_promoted} → instinctive")
+            summary_parts.append(f"{instinctive_promoted} -> instinctive")
 
         # --- Relevance maintenance ---
-        relevance = RelevanceEngine(store)
+        relevance = RelevanceEngine()
         maint = relevance.run_maintenance(project_context)
 
         if maint["archived"]:
@@ -228,7 +213,7 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
             summary_parts.append(f"{len(maint['rehydrated'])} rehydrated")
 
         # --- Periodic self-reflection ---
-        count = _increment_consolidation_count(store)
+        count = _increment_consolidation_count(base_dir)
         if count % REFLECTION_INTERVAL == 0:
             try:
                 reflection = reflector.reflect()
@@ -240,7 +225,7 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
 
         # --- Manifest ---
         manifest.write_manifest()
-        store.close()
+        close_db()
 
         logger.info("  %s", ", ".join(summary_parts))
         return result

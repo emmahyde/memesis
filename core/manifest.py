@@ -10,7 +10,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from core.storage import MemoryStore
+from .database import get_base_dir
+from .models import Memory
 
 # 200K token context window used for budget estimation
 _CONTEXT_WINDOW = 200_000
@@ -35,22 +36,22 @@ def _truncate(text: str, max_len: int = 150) -> str:
     return text[:max_len - 1].rstrip() + '\u2026'
 
 
-def _format_entry(memory: dict, base_dir: Path, include_importance: bool = False) -> str:
+def _format_entry(memory, base_dir: Path, include_importance: bool = False) -> str:
     """
     Format a single memory as a MEMORY.md list item.
 
     Pattern: `- [title](relative_path) — summary [importance: X.XX]`
     """
-    title = memory.get('title') or Path(memory['file_path']).stem.replace('_', ' ').title()
-    rel_path = os.path.relpath(memory['file_path'], base_dir)
-    summary = _truncate(memory.get('summary') or '', 150)
+    title = memory.title or Path(memory.file_path or "unknown").stem.replace('_', ' ').title()
+    rel_path = os.path.relpath(memory.file_path or "", base_dir)
+    summary = _truncate(memory.summary or '', 150)
 
     line = f'- [{title}]({rel_path})'
     if summary:
         line += f' \u2014 {summary}'
 
     if include_importance:
-        importance = memory.get('importance', 0.5)
+        importance = memory.importance or 0.5
         line += f' [importance: {importance:.2f}]'
 
     return line
@@ -59,38 +60,24 @@ def _format_entry(memory: dict, base_dir: Path, include_importance: bool = False
 class ManifestGenerator:
     """
     Generates a MEMORY.md index from SQLite metadata.
-
-    Reads stage lists from MemoryStore and produces a markdown document
-    following the established frontmatter-links + summary format (D-02).
     """
 
-    def __init__(self, store: MemoryStore):
-        self._store = store
+    def __init__(self):
+        pass
 
     def generate(self, project_context: str = None) -> str:
         """
         Generate MEMORY.md content as a string.
-
-        Stages are rendered in this order: instinctive, crystallized,
-        consolidated.  Ephemeral memories are excluded.  Empty stages
-        produce no section header.
-
-        Args:
-            project_context: Ignored at generation time (reserved for future
-                             per-project filtering).
-
-        Returns:
-            Complete MEMORY.md content.
         """
-        instinctive = self._store.list_by_stage('instinctive')
+        instinctive = list(Memory.by_stage('instinctive'))
         crystallized = sorted(
-            self._store.list_by_stage('crystallized'),
-            key=lambda m: m.get('importance', 0.5),
+            list(Memory.by_stage('crystallized')),
+            key=lambda m: m.importance or 0.5,
             reverse=True,
         )
         consolidated = sorted(
-            self._store.list_by_stage('consolidated'),
-            key=lambda m: m.get('updated_at') or '',
+            list(Memory.by_stage('consolidated')),
+            key=lambda m: m.updated_at or '',
             reverse=True,
         )
 
@@ -104,7 +91,7 @@ class ManifestGenerator:
             f'<!-- Total: {total} | Token budget: {token_pct * 100:.1f}% -->',
         ]
 
-        base_dir = self._store.base_dir
+        base_dir = get_base_dir()
 
         # Instinctive
         if instinctive:
@@ -142,31 +129,24 @@ class ManifestGenerator:
     def estimate_token_budget(self) -> tuple[int, float]:
         """
         Estimate the token budget consumed by always-loaded memories.
-
-        Counts characters in all instinctive file contents plus the top-10
-        crystallized files (by importance), then divides by 4 for a rough
-        token estimate.
-
-        Returns:
-            (token_count, fraction_of_200k_window)
         """
         char_count = 0
 
         # All instinctive
-        for memory in self._store.list_by_stage('instinctive'):
-            fp = Path(memory['file_path'])
-            if fp.exists():
+        for memory in Memory.by_stage('instinctive'):
+            fp = Path(memory.file_path) if memory.file_path else None
+            if fp and fp.exists():
                 char_count += len(fp.read_text(encoding='utf-8'))
 
         # Top-10 crystallized by importance
         crystallized = sorted(
-            self._store.list_by_stage('crystallized'),
-            key=lambda m: m.get('importance', 0.5),
+            list(Memory.by_stage('crystallized')),
+            key=lambda m: m.importance or 0.5,
             reverse=True,
         )
         for memory in crystallized[:10]:
-            fp = Path(memory['file_path'])
-            if fp.exists():
+            fp = Path(memory.file_path) if memory.file_path else None
+            if fp and fp.exists():
                 char_count += len(fp.read_text(encoding='utf-8'))
 
         token_count = char_count // 4
@@ -174,13 +154,11 @@ class ManifestGenerator:
 
     def write_manifest(self, project_context: str = None) -> None:
         """
-        Write the generated MEMORY.md to {store.base_dir}/MEMORY.md.
-
-        Args:
-            project_context: Passed through to generate().
+        Write the generated MEMORY.md to {base_dir}/MEMORY.md.
         """
         content = self.generate(project_context=project_context)
-        manifest_path = self._store.base_dir / 'MEMORY.md'
+        base_dir = get_base_dir()
+        manifest_path = base_dir / 'MEMORY.md'
         tmp_fd, tmp_path = tempfile.mkstemp(dir=manifest_path.parent, suffix='.tmp')
         try:
             os.write(tmp_fd, content.encode('utf-8'))

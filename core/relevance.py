@@ -21,7 +21,6 @@ This produces a smooth decay curve — memories fade gradually, never cliff-edge
 
 import logging
 import math
-import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -29,7 +28,8 @@ import nltk
 from nltk.corpus import stopwords as nltk_stopwords
 from nltk.stem import PorterStemmer as NltkStemmer
 
-from .storage import MemoryStore
+from .database import get_vec_store
+from .models import ConsolidationLog, Memory, db
 
 logger = logging.getLogger(__name__)
 
@@ -51,18 +51,15 @@ class RelevanceEngine:
     """
     Computes relevance scores and manages archival/rehydration lifecycle.
 
-    The engine does not own persistence — it reads from and writes to
-    MemoryStore, making archival decisions based on computed scores.
+    The engine reads from and writes to Peewee models directly.
     """
 
     def __init__(
         self,
-        store: MemoryStore,
         archive_threshold: float = ARCHIVE_THRESHOLD,
         rehydrate_threshold: float = REHYDRATE_THRESHOLD,
         half_life_days: float = RECENCY_HALF_LIFE,
     ):
-        self.store = store
         self.archive_threshold = archive_threshold
         self.rehydrate_threshold = rehydrate_threshold
         self.half_life_days = half_life_days
@@ -73,7 +70,7 @@ class RelevanceEngine:
 
     def compute_relevance(
         self,
-        memory: dict,
+        memory,
         project_context: str = None,
         now: datetime = None,
     ) -> float:
@@ -81,7 +78,7 @@ class RelevanceEngine:
         Compute a relevance score in [0, 1] for a memory.
 
         Args:
-            memory: Memory dict from MemoryStore (must include metadata fields).
+            memory: Memory model instance or dict with metadata fields.
             project_context: Current project path for context matching.
             now: Override current time (for testing).
 
@@ -91,21 +88,27 @@ class RelevanceEngine:
         if now is None:
             now = datetime.now()
 
-        importance = memory.get("importance", 0.5)
+        # Support both model instances and dicts
+        def _get(field, default=None):
+            if isinstance(memory, dict):
+                return memory.get(field, default)
+            return getattr(memory, field, default)
+
+        importance = _get("importance", 0.5) or 0.5
 
         # Recency: exponential decay from last activity
         days_since = self._days_since_last_activity(memory, now)
         recency = 0.5 ** (days_since / self.half_life_days) if self.half_life_days > 0 else 1.0
 
         # Usage signal: memories that are actually used (not just injected) get boosted
-        usage_count = memory.get("usage_count", 0)
-        injection_count = max(memory.get("injection_count", 0), 1)
+        usage_count = _get("usage_count", 0) or 0
+        injection_count = max(_get("injection_count", 0) or 0, 1)
         usage_ratio = usage_count / injection_count
         usage_signal = min(1.0, 0.3 + 0.7 * usage_ratio)
 
         # Context boost: memories from the same project are more relevant
         context_boost = 1.0
-        if project_context and memory.get("project_context") == project_context:
+        if project_context and _get("project_context") == project_context:
             context_boost = 1.5
 
         # Weighted geometric mean
@@ -122,67 +125,57 @@ class RelevanceEngine:
     # Archival
     # ------------------------------------------------------------------
 
-    def get_archival_candidates(self, project_context: str = None) -> list[dict]:
+    def get_archival_candidates(self, project_context: str = None) -> list:
         """
         Find active memories whose relevance has decayed below the archive threshold.
 
         Returns memories sorted by relevance ascending (least relevant first),
-        each annotated with a 'relevance' key.
-
-        Args:
-            project_context: Current project path for context scoring.
-
-        Returns:
-            List of memory dicts with 'relevance' key added.
+        each annotated with a 'relevance' attribute.
         """
         candidates = []
 
         for stage in ("consolidated", "crystallized"):
-            memories = self.store.list_by_stage(stage, include_archived=False)
+            memories = list(Memory.by_stage(stage, include_archived=False))
             for memory in memories:
                 relevance = self.compute_relevance(memory, project_context)
                 if relevance < self.archive_threshold:
-                    memory["relevance"] = relevance
+                    memory._relevance = relevance
                     candidates.append(memory)
 
-        candidates.sort(key=lambda m: m["relevance"])
+        candidates.sort(key=lambda m: m._relevance)
         return candidates
 
-    def archive_stale(self, project_context: str = None) -> list[dict]:
+    def archive_stale(self, project_context: str = None) -> list:
         """
         Archive memories that have decayed below the relevance threshold.
 
-        Logs each archival decision to the consolidation log.
-
-        Args:
-            project_context: Current project path for context scoring.
-
         Returns:
-            List of archived memory dicts.
+            List of archived Memory instances.
         """
         candidates = self.get_archival_candidates(project_context)
         archived = []
 
         for memory in candidates:
             try:
-                self.store.archive(memory["id"])
-                self.store.log_consolidation(
+                Memory.update(archived_at=datetime.now().isoformat()).where(Memory.id == memory.id).execute()
+                ConsolidationLog.create(
+                    timestamp=datetime.now().isoformat(),
                     action="deprecated",
-                    memory_id=memory["id"],
-                    from_stage=memory["stage"],
+                    memory_id=memory.id,
+                    from_stage=memory.stage,
                     to_stage="archived",
-                    rationale=f"Relevance decayed to {memory['relevance']:.3f} "
+                    rationale=f"Relevance decayed to {memory._relevance:.3f} "
                               f"(threshold: {self.archive_threshold})",
                 )
                 archived.append(memory)
                 logger.info(
                     "Archived %s (%s) — relevance %.3f",
-                    memory.get("title", "untitled"),
-                    memory["id"],
-                    memory["relevance"],
+                    memory.title or "untitled",
+                    memory.id,
+                    memory._relevance,
                 )
-            except ValueError as e:
-                logger.warning("Failed to archive %s: %s", memory["id"], e)
+            except Exception as e:
+                logger.warning("Failed to archive %s: %s", memory.id, e)
 
         return archived
 
@@ -193,98 +186,74 @@ class RelevanceEngine:
     def get_rehydration_candidates(
         self,
         project_context: str = None,
-    ) -> list[dict]:
+    ) -> list:
         """
         Find archived memories that are relevant to the current context.
-
-        Scores all archived memories against the current project context.
-        Those above the rehydration threshold are candidates.
-
-        Args:
-            project_context: Current project path for context scoring.
-
-        Returns:
-            List of archived memory dicts with 'relevance' key, sorted by
-            relevance descending.
         """
-        archived = self.store.list_archived()
+        archived = list(
+            Memory.select()
+            .where(Memory.archived_at.is_null(False))
+            .order_by(Memory.archived_at.desc())
+        )
         candidates = []
 
         for memory in archived:
             # Inhibition: memories subsumed into a crystallized insight
-            # should not be rehydrated — they would compete with their
-            # parent (retrieval-induced forgetting).
-            if memory.get("subsumed_by"):
+            # should not be rehydrated
+            if memory.subsumed_by:
                 continue
 
             relevance = self.compute_relevance(memory, project_context)
             if relevance >= self.rehydrate_threshold:
-                memory["relevance"] = relevance
+                memory._relevance = relevance
                 candidates.append(memory)
 
-        candidates.sort(key=lambda m: m["relevance"], reverse=True)
+        candidates.sort(key=lambda m: m._relevance, reverse=True)
         return candidates
 
-    def rehydrate_for_context(self, project_context: str = None) -> list[dict]:
+    def rehydrate_for_context(self, project_context: str = None) -> list:
         """
         Unarchive memories that are relevant to the current context.
-
-        Logs each rehydration to the consolidation log.
-
-        Args:
-            project_context: Current project path.
-
-        Returns:
-            List of rehydrated memory dicts.
         """
         candidates = self.get_rehydration_candidates(project_context)
         rehydrated = []
 
         for memory in candidates:
             try:
-                self.store.unarchive(memory["id"])
-                self.store.log_consolidation(
+                Memory.update(
+                    archived_at=None,
+                    updated_at=datetime.now().isoformat(),
+                ).where(Memory.id == memory.id).execute()
+                ConsolidationLog.create(
+                    timestamp=datetime.now().isoformat(),
                     action="promoted",
-                    memory_id=memory["id"],
+                    memory_id=memory.id,
                     from_stage="archived",
-                    to_stage=memory["stage"],
-                    rationale=f"Rehydrated — relevance {memory['relevance']:.3f} "
+                    to_stage=memory.stage,
+                    rationale=f"Rehydrated — relevance {memory._relevance:.3f} "
                               f"exceeds threshold {self.rehydrate_threshold} "
                               f"in context {project_context or 'global'}",
                 )
                 rehydrated.append(memory)
                 logger.info(
                     "Rehydrated %s (%s) — relevance %.3f",
-                    memory.get("title", "untitled"),
-                    memory["id"],
-                    memory["relevance"],
+                    memory.title or "untitled",
+                    memory.id,
+                    memory._relevance,
                 )
-            except ValueError as e:
-                logger.warning("Failed to rehydrate %s: %s", memory["id"], e)
+            except Exception as e:
+                logger.warning("Failed to rehydrate %s: %s", memory.id, e)
 
         return rehydrated
 
-    def find_rehydration_by_observation(self, observation: str) -> list[dict]:
+    def find_rehydration_by_observation(self, observation: str) -> list:
         """
         Check if a new observation matches any archived memories.
 
-        Called during consolidation after a KEEP decision — if the new
-        observation is about a topic that has archived memories, those
-        memories should be rehydrated.
-
         Uses FTS search against archived memories first, then supplements with
-        semantic similarity matching via stored vector search (D-09). The
-        semantic path is additive — FTS results are preserved and deduplicated.
-
-        Args:
-            observation: The text of the new observation.
-
-        Returns:
-            List of archived memory dicts that match, with 'relevance' key.
+        semantic similarity matching via stored vector search.
         """
-        # Extract significant words (4+ chars) for FTS query.
-        # Use NLTK stopword filtering and PorterStemmer to reduce query terms
-        # to stems, improving recall for inflected forms (e.g., "payments" → "payment").
+        # Extract significant words for FTS query
         try:
             nltk.data.find('corpora/stopwords')
             stop = set(nltk_stopwords.words('english'))
@@ -292,49 +261,49 @@ class RelevanceEngine:
             raw_words = [w.lower() for w in observation.split() if len(w) >= 4 and w.isalpha()]
             words = list({stemmer.stem(w) for w in raw_words if w not in stop})
         except Exception:
-            # NLTK unavailable — fall back to original extraction
             words = [w.lower() for w in observation.split() if len(w) >= 4 and w.isalpha()]
         if not words:
             return []
 
-        # Build OR query for FTS — sanitize each term to prevent operator injection
-        query = " OR ".join(self.store.sanitize_fts_term(w) for w in words[:10])
+        # Build OR query for FTS
+        query = " OR ".join(Memory.sanitize_fts_term(w) for w in words[:10])
 
         try:
-            fts_results = self.store.search_fts(query, limit=REHYDRATION_FTS_LIMIT)
+            fts_results = Memory.search_fts(query, limit=REHYDRATION_FTS_LIMIT)
         except Exception:
             fts_results = []
 
-        # Filter to archived only, excluding subsumed memories (inhibition)
+        # Filter to archived only, excluding subsumed memories
         matches = []
         for memory in fts_results:
-            if memory.get("archived_at") and not memory.get("subsumed_by"):
-                relevance = self.compute_relevance(memory)
-                memory["relevance"] = relevance
+            if memory.archived_at and not memory.subsumed_by:
+                memory._relevance = self.compute_relevance(memory)
                 matches.append(memory)
 
-        # Supplement with semantic matches — find archived memories not already
-        # returned by FTS that are semantically similar to the observation.
-        seen_ids = {m["id"] for m in matches}
-        archived_pool = [
-            m for m in self.store.list_archived()
-            if not m.get("subsumed_by") and m["id"] not in seen_ids
-        ]
+        # Supplement with semantic matches
+        seen_ids = {m.id for m in matches}
+        archived_pool = list(
+            Memory.select()
+            .where(
+                Memory.archived_at.is_null(False),
+                Memory.subsumed_by.is_null(),
+                ~Memory.id.in_(list(seen_ids)) if seen_ids else True,
+            )
+        )
         semantic = self._find_semantic_matches(observation, archived_pool)
         for m in semantic:
-            if m["id"] not in seen_ids:
-                relevance = self.compute_relevance(m)
-                m["relevance"] = relevance
+            if m.id not in seen_ids:
+                m._relevance = self.compute_relevance(m)
                 matches.append(m)
-                seen_ids.add(m["id"])
+                seen_ids.add(m.id)
 
         return matches
 
     def _find_semantic_matches(
         self,
         observation: str,
-        archived_memories: list[dict],
-    ) -> list[dict]:
+        archived_memories: list,
+    ) -> list:
         """Find archived memories semantically similar to the observation using stored vectors."""
         from .embeddings import embed_text
 
@@ -342,12 +311,25 @@ class RelevanceEngine:
         if query_embedding is None:
             return []
 
-        # Use KNN search — gets nearest from ALL stored vectors
-        results = self.store.search_vector(query_embedding, k=20)
+        vec_store = get_vec_store()
+        if vec_store is None or not vec_store.available:
+            return []
+
+        # Use KNN search
+        results = vec_store.search_vector(query_embedding, k=20)
 
         # Filter to only archived + not subsumed
-        archived_ids = {m["id"] for m in archived_memories}
-        return [r for r in results if r.get("id") in archived_ids]
+        archived_ids = {m.id for m in archived_memories}
+        matched = []
+        for memory_id, distance in results:
+            if memory_id in archived_ids:
+                try:
+                    mem = Memory.get_by_id(memory_id)
+                    mem.distance = distance
+                    matched.append(mem)
+                except Memory.DoesNotExist:
+                    continue
+        return matched
 
     # ------------------------------------------------------------------
     # Batch operations
@@ -356,15 +338,6 @@ class RelevanceEngine:
     def run_maintenance(self, project_context: str = None) -> dict:
         """
         Run a full maintenance cycle: archive stale, rehydrate relevant.
-
-        Intended to be called periodically (e.g., during PreCompact or
-        on a cron schedule).
-
-        Args:
-            project_context: Current project path.
-
-        Returns:
-            Summary dict with 'archived' and 'rehydrated' lists.
         """
         archived = self.archive_stale(project_context)
         rehydrated = self.rehydrate_for_context(project_context)
@@ -377,26 +350,17 @@ class RelevanceEngine:
     def score_all(self, project_context: str = None) -> list[dict]:
         """
         Score all active (non-ephemeral, non-archived) memories.
-
-        Useful for diagnostics and the observability dashboard.
-
-        Args:
-            project_context: Current project path.
-
-        Returns:
-            List of (memory_id, title, stage, relevance) dicts,
-            sorted by relevance descending.
         """
         scored = []
         for stage in ("consolidated", "crystallized", "instinctive"):
-            memories = self.store.list_by_stage(stage, include_archived=False)
+            memories = list(Memory.by_stage(stage, include_archived=False))
             for memory in memories:
                 relevance = self.compute_relevance(memory, project_context)
                 scored.append({
-                    "id": memory["id"],
-                    "title": memory.get("title"),
+                    "id": memory.id,
+                    "title": memory.title,
                     "stage": stage,
-                    "importance": memory.get("importance", 0.5),
+                    "importance": memory.importance or 0.5,
                     "relevance": relevance,
                     "days_since_activity": self._days_since_last_activity(memory),
                 })
@@ -409,19 +373,19 @@ class RelevanceEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _days_since_last_activity(memory: dict, now: datetime = None) -> float:
-        """
-        Calculate days since the memory was last injected or used.
-
-        Uses the most recent of last_injected_at, last_used_at, updated_at,
-        and created_at as the activity timestamp.
-        """
+    def _days_since_last_activity(memory, now: datetime = None) -> float:
+        """Calculate days since the memory was last injected or used."""
         if now is None:
             now = datetime.now()
 
+        def _get(field):
+            if isinstance(memory, dict):
+                return memory.get(field)
+            return getattr(memory, field, None)
+
         candidates = []
         for field in ("last_used_at", "last_injected_at", "updated_at", "created_at"):
-            val = memory.get(field)
+            val = _get(field)
             if val:
                 try:
                     candidates.append(datetime.fromisoformat(val))
@@ -429,7 +393,7 @@ class RelevanceEngine:
                     pass
 
         if not candidates:
-            return 365.0  # treat as very old if no timestamps at all
+            return 365.0
 
         last_activity = max(candidates)
         delta = now - last_activity

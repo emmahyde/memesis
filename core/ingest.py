@@ -8,18 +8,22 @@ creates consolidated memories so they participate in the normal lifecycle
 (promotion, archival, relevance scoring, etc.).
 
 Native memory types map to memesis observation types:
-    user        → workflow_pattern (who the user is, how they work)
-    feedback    → correction / preference_signal (what to do differently)
-    project     → decision_context (ongoing work, goals, decisions)
-    reference   → domain_knowledge (pointers to external systems)
+    user        -> workflow_pattern (who the user is, how they work)
+    feedback    -> correction / preference_signal (what to do differently)
+    project     -> decision_context (ongoing work, goals, decisions)
+    reference   -> domain_knowledge (pointers to external systems)
 """
 
+import hashlib
+import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .storage import MemoryStore
+from .database import get_base_dir
+from .models import Memory
 
 logger = logging.getLogger(__name__)
 
@@ -74,19 +78,10 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def find_native_memory_dir(project_context: str = None) -> Optional[Path]:
     """
     Locate the native Claude Code memory directory.
-
-    Checks project-scoped first, then global.
-
-    Args:
-        project_context: Project directory path.
-
-    Returns:
-        Path to the memory directory, or None if not found.
     """
     candidates = []
 
     if project_context:
-        # Match Claude Code's path hashing convention
         path_hash = re.sub(r'[^a-zA-Z0-9-]', '-', project_context)
         candidates.append(
             Path.home() / ".claude" / "projects" / path_hash / "memory"
@@ -104,44 +99,30 @@ def find_native_memory_dir(project_context: str = None) -> Optional[Path]:
 def scan_native_memories(memory_dir: Path) -> list[dict]:
     """
     Scan a native Claude Code memory directory for .md files with frontmatter.
-
-    Reads MEMORY.md to find linked files, then reads each file's frontmatter
-    and body. Skips files that don't have the expected frontmatter format.
-
-    Args:
-        memory_dir: Path to the memory directory.
-
-    Returns:
-        List of dicts with keys: path, name, description, type, body, filename.
     """
     memories = []
 
-    # Read MEMORY.md to find linked files
     memory_md = memory_dir / "MEMORY.md"
     if not memory_md.exists():
         return memories
 
     index_content = memory_md.read_text(encoding="utf-8")
 
-    # Extract linked file paths from markdown links: [Title](filename.md)
     link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+\.md)\)')
     linked_files = set()
     for match in link_pattern.finditer(index_content):
         linked_files.add(match.group(2))
 
-    # Also scan for any .md files at the root (not in subdirectories used by memesis)
     memesis_dirs = {"ephemeral", "consolidated", "crystallized", "instinctive", "archived", "meta"}
     for md_file in memory_dir.glob("*.md"):
         if md_file.name != "MEMORY.md":
             linked_files.add(md_file.name)
 
-    # Read each file
     for filename in linked_files:
         file_path = memory_dir / filename
         if not file_path.exists():
             continue
 
-        # Skip files in memesis subdirectories
         try:
             relative = file_path.relative_to(memory_dir)
             if relative.parts[0] in memesis_dirs:
@@ -173,24 +154,14 @@ def scan_native_memories(memory_dir: Path) -> list[dict]:
 class NativeMemoryIngestor:
     """
     Ingests native Claude Code memories into the memesis store.
-
-    Reads .md files written by the built-in auto-memory system, deduplicates
-    against existing memesis memories (by content hash), and creates
-    consolidated entries that participate in the normal lifecycle.
     """
 
-    def __init__(self, store: MemoryStore):
-        self.store = store
+    def __init__(self):
+        pass
 
     def ingest(self, project_context: str = None) -> dict:
         """
         Scan for native memories and ingest any that aren't already in the store.
-
-        Args:
-            project_context: Project directory path.
-
-        Returns:
-            Summary dict with 'ingested' (list of titles) and 'skipped' count.
         """
         memory_dir = find_native_memory_dir(project_context)
         if memory_dir is None:
@@ -201,6 +172,7 @@ class NativeMemoryIngestor:
         if not native_memories:
             return {"ingested": [], "skipped": 0, "source": str(memory_dir)}
 
+        base_dir = get_base_dir()
         ingested = []
         skipped = 0
 
@@ -209,12 +181,11 @@ class NativeMemoryIngestor:
             obs_type = NATIVE_TYPE_MAP.get(native_type, "domain_knowledge")
             importance = NATIVE_IMPORTANCE.get(native_type, 0.5)
 
-            # Build the content — include the original description as context
+            # Build the content
             content = mem["body"]
             if mem.get("description"):
                 content = f"*{mem['description']}*\n\n{content}"
 
-            # Build a safe filename from the original
             safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', mem["name"].lower())
             target_path = f"native/{safe_name}.md"
 
@@ -222,24 +193,51 @@ class NativeMemoryIngestor:
             if native_type:
                 tags.append(f"native-type:{native_type}")
 
-            try:
-                memory_id = self.store.create(
-                    path=target_path,
-                    content=content,
-                    metadata={
-                        "stage": "consolidated",
-                        "title": mem["name"],
-                        "summary": (mem.get("description") or "")[:150],
-                        "tags": tags,
-                        "importance": importance,
-                    },
-                )
-                ingested.append(mem["name"])
-                logger.info("Ingested native memory: %s → %s", mem["name"], memory_id)
-            except ValueError as e:
-                # Duplicate content hash — already ingested
+            # Build full content with frontmatter
+            frontmatter_lines = [
+                '---',
+                f'name: {mem["name"]}',
+                f'description: {(mem.get("description") or "")[:150]}',
+                'type: memory',
+                '---',
+                '',
+                content,
+            ]
+            full_content = '\n'.join(frontmatter_lines)
+            content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+
+            # Dedup check
+            if Memory.select().where(Memory.content_hash == content_hash).exists():
                 skipped += 1
-                logger.debug("Skipped duplicate native memory: %s (%s)", mem["name"], e)
+                logger.debug("Skipped duplicate native memory: %s", mem["name"])
+                continue
+
+            file_path = base_dir / "consolidated" / target_path
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            now = datetime.now().isoformat()
+            try:
+                new_mem = Memory.create(
+                    file_path=str(file_path),
+                    stage="consolidated",
+                    title=mem["name"],
+                    summary=(mem.get("description") or "")[:150],
+                    content=full_content,
+                    tags=json.dumps(tags),
+                    importance=importance,
+                    reinforcement_count=0,
+                    created_at=now,
+                    updated_at=now,
+                    content_hash=content_hash,
+                )
+                # Write file
+                file_path.write_text(full_content, encoding="utf-8")
+
+                ingested.append(mem["name"])
+                logger.info("Ingested native memory: %s -> %s", mem["name"], new_mem.id)
+            except Exception as e:
+                skipped += 1
+                logger.debug("Skipped native memory: %s (%s)", mem["name"], e)
 
         return {
             "ingested": ingested,

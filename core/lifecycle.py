@@ -6,12 +6,14 @@ and D-09 (demotion for unused memories).
 """
 
 import shutil
-import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from .storage import MemoryStore
+from peewee import fn
+
+from .database import get_base_dir
+from .models import ConsolidationLog, Memory, RetrievalLog, db
 
 
 class LifecycleManager:
@@ -19,13 +21,13 @@ class LifecycleManager:
     Manages memory lifecycle transitions with validation and logging.
 
     Stage progression:
-        ephemeral → consolidated → crystallized → instinctive
+        ephemeral -> consolidated -> crystallized -> instinctive
 
     Promotion rules:
-        - ephemeral → consolidated (always valid during consolidation)
-        - consolidated → crystallized: requires reinforcement_count >= 3
-          with temporal spacing (spacing effect — brain-inspired)
-        - crystallized → instinctive: requires importance > 0.85 AND usage in 10+ sessions
+        - ephemeral -> consolidated (always valid during consolidation)
+        - consolidated -> crystallized: requires reinforcement_count >= 3
+          with temporal spacing (spacing effect -- brain-inspired)
+        - crystallized -> instinctive: requires importance > 0.85 AND usage in 10+ sessions
 
     Demotion rules:
         - Always valid, can skip stages
@@ -36,20 +38,10 @@ class LifecycleManager:
     STAGE_ORDER = ['ephemeral', 'consolidated', 'crystallized', 'instinctive']
 
     # Spacing effect: minimum distinct calendar days reinforcements must span.
-    # The brain forms stronger memories when reinforcement is distributed over
-    # time rather than massed in a single session (Ebbinghaus, 1885; Cepeda
-    # et al., 2006). A value of 2 catches the worst case (all-in-one-day burst)
-    # while allowing rapid but genuine multi-day reinforcement.
     MIN_REINFORCEMENT_SPAN_DAYS = 2
 
-    def __init__(self, store: MemoryStore):
-        """
-        Initialize lifecycle manager.
-
-        Args:
-            store: MemoryStore instance for persistence
-        """
-        self.store = store
+    def __init__(self):
+        pass
 
     def promote(self, memory_id: str, rationale: str) -> str:
         """
@@ -65,8 +57,8 @@ class LifecycleManager:
         Raises:
             ValueError: If promotion is not allowed
         """
-        memory = self.store.get(memory_id)
-        current_stage = memory['stage']
+        memory = Memory.get_by_id(memory_id)
+        current_stage = memory.stage
 
         # Determine next stage
         current_idx = self.STAGE_ORDER.index(current_stage)
@@ -81,16 +73,19 @@ class LifecycleManager:
             raise ValueError(f"Cannot promote memory: {reason}")
 
         if not self.validate_transition(current_stage, next_stage):
-            raise ValueError(f"Invalid transition: {current_stage} → {next_stage}")
+            raise ValueError(f"Invalid transition: {current_stage} -> {next_stage}")
 
         # Perform transition
-        self.store.update(memory_id, metadata={'stage': next_stage})
-        self.store.log_consolidation(
+        memory.stage = next_stage
+        memory.save()
+
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
             action='promoted',
             memory_id=memory_id,
             from_stage=current_stage,
             to_stage=next_stage,
-            rationale=rationale
+            rationale=rationale,
         )
 
         return next_stage
@@ -109,8 +104,8 @@ class LifecycleManager:
         Raises:
             ValueError: If memory is already at lowest stage
         """
-        memory = self.store.get(memory_id)
-        current_stage = memory['stage']
+        memory = Memory.get_by_id(memory_id)
+        current_stage = memory.stage
 
         # Determine target stage (demote by one level)
         current_idx = self.STAGE_ORDER.index(current_stage)
@@ -120,13 +115,16 @@ class LifecycleManager:
         target_stage = self.STAGE_ORDER[current_idx - 1]
 
         # Perform transition
-        self.store.update(memory_id, metadata={'stage': target_stage})
-        self.store.log_consolidation(
+        memory.stage = target_stage
+        memory.save()
+
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
             action='demoted',
             memory_id=memory_id,
             from_stage=current_stage,
             to_stage=target_stage,
-            rationale=rationale
+            rationale=rationale,
         )
 
         return target_stage
@@ -142,29 +140,31 @@ class LifecycleManager:
         Raises:
             ValueError: If memory not found
         """
-        memory = self.store.get(memory_id)
-        current_stage = memory['stage']
-        file_path = Path(memory['file_path'])
+        memory = Memory.get_by_id(memory_id)
+        current_stage = memory.stage
+        file_path = Path(memory.file_path) if memory.file_path else None
 
-        archived_path = self.store.base_dir / 'archived' / file_path.name
+        base_dir = get_base_dir()
+        archived_path = base_dir / 'archived' / (file_path.name if file_path else f"{memory_id}.md")
         archived_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Move file first; store.delete() skips unlink if file is absent from original path
-        if file_path.exists():
+        # Move file first
+        if file_path and file_path.exists():
             shutil.move(str(file_path), str(archived_path))
 
-        # DB operations — roll back file move on failure so state stays consistent
+        # DB operations -- roll back file move on failure
         try:
-            self.store.log_consolidation(
+            ConsolidationLog.create(
+                timestamp=datetime.now().isoformat(),
                 action='deprecated',
                 memory_id=memory_id,
                 from_stage=current_stage,
                 to_stage='archived',
-                rationale=rationale
+                rationale=rationale,
             )
-            self.store.delete(memory_id)
+            memory.delete_instance()
         except Exception:
-            if archived_path.exists():
+            if archived_path.exists() and file_path:
                 shutil.move(str(archived_path), str(file_path))
             raise
 
@@ -175,19 +175,22 @@ class LifecycleManager:
         Returns:
             List of consolidated memories with reinforcement_count >= 3
         """
-        consolidated_memories = self.store.list_by_stage('consolidated')
+        consolidated_memories = list(Memory.by_stage('consolidated'))
         candidates = []
 
         for memory in consolidated_memories:
-            can_promote, reason = self._can_promote_to_crystallized(memory)
+            mem_dict = {
+                'id': memory.id,
+                'title': memory.title,
+                'reinforcement_count': memory.reinforcement_count,
+                'stage': memory.stage,
+                'importance': memory.importance,
+                'usage_count': memory.usage_count,
+            }
+            can_promote, reason = self._can_promote_to_crystallized(mem_dict)
             if can_promote:
-                candidates.append({
-                    'id': memory['id'],
-                    'title': memory['title'],
-                    'reinforcement_count': memory['reinforcement_count'],
-                    'stage': memory['stage'],
-                    'reason': reason
-                })
+                mem_dict['reason'] = reason
+                candidates.append(mem_dict)
 
         return candidates
 
@@ -198,33 +201,28 @@ class LifecycleManager:
         Returns:
             List of memories meeting demotion criteria (D-09)
         """
-        with sqlite3.connect(self.store.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+        memories = (
+            Memory.select()
+            .where(
+                Memory.injection_count >= 10,
+                Memory.usage_count == 0,
+                Memory.stage.in_(['crystallized', 'instinctive']),
+            )
+            .order_by(Memory.injection_count.desc())
+        )
 
-            # Find memories with high injection count but zero usage
-            cursor.execute('''
-                SELECT *
-                FROM memories
-                WHERE injection_count >= 10
-                  AND usage_count = 0
-                  AND stage IN ('crystallized', 'instinctive')
-                ORDER BY injection_count DESC
-            ''')
+        candidates = []
+        for memory in memories:
+            candidates.append({
+                'id': memory.id,
+                'title': memory.title,
+                'stage': memory.stage,
+                'injection_count': memory.injection_count,
+                'usage_count': memory.usage_count,
+                'reason': f"Injected {memory.injection_count} times but never used",
+            })
 
-            candidates = []
-            for row in cursor.fetchall():
-                memory = dict(row)
-                candidates.append({
-                    'id': memory['id'],
-                    'title': memory['title'],
-                    'stage': memory['stage'],
-                    'injection_count': memory['injection_count'],
-                    'usage_count': memory['usage_count'],
-                    'reason': f"Injected {memory['injection_count']} times but never used"
-                })
-
-            return candidates
+        return candidates
 
     def get_deprecation_candidates(self, stale_sessions: int = 30) -> list[dict]:
         """
@@ -238,33 +236,28 @@ class LifecycleManager:
         """
         cutoff_date = (datetime.now() - timedelta(days=stale_sessions)).isoformat()
 
-        with sqlite3.connect(self.store.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+        memories = (
+            Memory.select()
+            .where(
+                (Memory.last_injected_at.is_null() | (Memory.last_injected_at < cutoff_date)),
+                (Memory.last_used_at.is_null() | (Memory.last_used_at < cutoff_date)),
+                Memory.stage == 'ephemeral',
+            )
+            .order_by(Memory.created_at.asc())
+        )
 
-            # Find memories not injected or used since cutoff
-            cursor.execute('''
-                SELECT *
-                FROM memories
-                WHERE (last_injected_at IS NULL OR last_injected_at < ?)
-                  AND (last_used_at IS NULL OR last_used_at < ?)
-                  AND stage = 'ephemeral'
-                ORDER BY created_at ASC
-            ''', (cutoff_date, cutoff_date))
+        candidates = []
+        for memory in memories:
+            last_activity = memory.last_injected_at or memory.last_used_at or memory.created_at
+            candidates.append({
+                'id': memory.id,
+                'title': memory.title,
+                'stage': memory.stage,
+                'last_activity': last_activity,
+                'reason': f"No activity since {last_activity}",
+            })
 
-            candidates = []
-            for row in cursor.fetchall():
-                memory = dict(row)
-                last_activity = memory['last_injected_at'] or memory['last_used_at'] or memory['created_at']
-                candidates.append({
-                    'id': memory['id'],
-                    'title': memory['title'],
-                    'stage': memory['stage'],
-                    'last_activity': last_activity,
-                    'reason': f"No activity since {last_activity}"
-                })
-
-            return candidates
+        return candidates
 
     def can_promote(self, memory_id: str) -> tuple[bool, str]:
         """
@@ -276,8 +269,8 @@ class LifecycleManager:
         Returns:
             (eligible, reason) tuple
         """
-        memory = self.store.get(memory_id)
-        current_stage = memory['stage']
+        memory = Memory.get_by_id(memory_id)
+        current_stage = memory.stage
 
         # Check if already at highest stage
         if current_stage == 'instinctive':
@@ -292,10 +285,20 @@ class LifecycleManager:
             return True, "Eligible for consolidation"
 
         if current_stage == 'consolidated' and next_stage == 'crystallized':
-            return self._can_promote_to_crystallized(memory)
+            mem_dict = {
+                'id': memory.id,
+                'reinforcement_count': memory.reinforcement_count,
+                'stage': memory.stage,
+            }
+            return self._can_promote_to_crystallized(mem_dict)
 
         if current_stage == 'crystallized' and next_stage == 'instinctive':
-            return self._can_promote_to_instinctive(memory)
+            mem_dict = {
+                'id': memory.id,
+                'importance': memory.importance,
+                'usage_count': memory.usage_count,
+            }
+            return self._can_promote_to_instinctive(mem_dict)
 
         return True, "Transition allowed"
 
@@ -334,7 +337,7 @@ class LifecycleManager:
         D-07: Requires 3+ independent reinforcements.
         Spacing effect: reinforcements must span multiple distinct days.
         """
-        reinforcement_count = memory.get('reinforcement_count', 0)
+        reinforcement_count = memory.get('reinforcement_count', 0) or 0
         if reinforcement_count < 3:
             return False, f"Only {reinforcement_count} reinforcements (need 3+)"
 
@@ -352,44 +355,24 @@ class LifecycleManager:
     ) -> tuple[bool, str]:
         """
         Check if reinforcements are temporally spaced (spacing effect).
-
-        The brain forms stronger memories when reinforcement is distributed
-        across time rather than concentrated in a single burst. This method
-        checks that consolidation log entries for a memory span at least
-        MIN_REINFORCEMENT_SPAN_DAYS distinct calendar days.
-
-        If no consolidation log entries exist (legacy/manual reinforcement_count),
-        the check passes — the count was set deliberately outside the normal
-        consolidation path.
-
-        Args:
-            memory_id: Memory UUID.
-            min_distinct_days: Override for MIN_REINFORCEMENT_SPAN_DAYS.
-
-        Returns:
-            (spaced, reason) tuple.
         """
         if min_distinct_days is None:
             min_distinct_days = self.MIN_REINFORCEMENT_SPAN_DAYS
 
-        with sqlite3.connect(self.store.db_path) as conn:
-            # Reinforcement events have from_stage == to_stage (memory stays
-            # in its current stage but gets reinforced). Stage transitions
-            # have from_stage != to_stage — we exclude those.
-            cursor = conn.execute(
-                """
-                SELECT DISTINCT DATE(timestamp) AS reinforcement_date
-                FROM consolidation_log
-                WHERE memory_id = ? AND action = 'promoted'
-                  AND from_stage = to_stage
-                ORDER BY reinforcement_date
-                """,
-                (memory_id,),
+        rows = (
+            ConsolidationLog.select(
+                fn.DISTINCT(fn.DATE(ConsolidationLog.timestamp)).alias('reinforcement_date')
             )
-            dates = [row[0] for row in cursor.fetchall()]
+            .where(
+                ConsolidationLog.memory_id == memory_id,
+                ConsolidationLog.action == 'promoted',
+                ConsolidationLog.from_stage == ConsolidationLog.to_stage,
+            )
+            .order_by(fn.DATE(ConsolidationLog.timestamp))
+        )
+        dates = [r.reinforcement_date for r in rows]
 
-        # No log entries → reinforcement_count was set directly
-        # (backfill, manual, or legacy). Trust the count.
+        # No log entries -> reinforcement_count was set directly
         if not dates:
             return True, "No consolidation log entries (manual/legacy reinforcement)"
 
@@ -408,10 +391,7 @@ class LifecycleManager:
 
         Requires: importance > 0.85 AND usage in 10+ sessions.
         """
-        importance = memory.get('importance', 0.5)
-        usage_count = memory.get('usage_count', 0)
-
-        # Count unique sessions from retrieval log
+        importance = memory.get('importance', 0.5) or 0.5
         session_count = self._count_unique_sessions(memory['id'])
 
         if importance <= 0.85:
@@ -432,11 +412,12 @@ class LifecycleManager:
         Returns:
             Number of unique sessions
         """
-        with sqlite3.connect(self.store.db_path) as conn:
-            cursor = conn.execute('''
-                SELECT COUNT(DISTINCT session_id)
-                FROM retrieval_log
-                WHERE memory_id = ? AND was_used = 1
-            ''', (memory_id,))
-            result = cursor.fetchone()
-            return result[0] if result else 0
+        result = (
+            RetrievalLog.select(fn.COUNT(fn.DISTINCT(RetrievalLog.session_id)))
+            .where(
+                RetrievalLog.memory_id == memory_id,
+                RetrievalLog.was_used == 1,
+            )
+            .scalar()
+        )
+        return result or 0
