@@ -28,7 +28,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 ### v1 — Foundation
 
 - [x] **Phase 7: Hybrid RRF Retrieval** - Fuse FTS5 BM25 + sqlite-vec KNN via Reciprocal Rank Fusion (completed 2026-03-29)
-- [ ] **Phase 8: Prompt-Aware Tier 2 Injection** - Wire user prompt text into Tier 2 injection (currently context-free)
+- [x] **Phase 8: Prompt-Aware Tier 2 Injection** - Wire user prompt text into Tier 2 injection (currently context-free) (completed 2026-03-29)
 - [ ] **Phase 9: Thompson Sampling Selection** - Select memories via Beta(usage+1, unused+1) from stdlib random
 - [ ] **Phase 10: Provenance Signals** - Add "established across N sessions over M weeks" metadata at injection time
 
@@ -356,7 +356,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 5. NarrativeThread Timestamps | - | Complete | 2026-03-29 |
 | 6. Remove Unused Imports | - | Complete | 2026-03-29 |
 | 7. Hybrid RRF Retrieval | 2/2 | Complete   | 2026-03-29 |
-| 8. Prompt-Aware Tier 2 Injection | 0/1 | Not started | - |
+| 8. Prompt-Aware Tier 2 Injection | 1/1 | Complete   | 2026-03-29 |
 | 9. Thompson Sampling Selection | 0/? | Not started | - |
 | 10. Provenance Signals | 0/? | Not started | - |
 | 11. OrientingDetector | 0/? | Not started | - |
