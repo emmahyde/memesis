@@ -6,12 +6,15 @@ Tier 2 — Crystallized: context-matched, token-budgeted.
 Tier 3 — Active search: agent-initiated FTS with progressive disclosure.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from .storage import MemoryStore
 
 CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens × 4 chars/token
+THREAD_BUDGET_CHARS = 8_000
+_THREAD_NARRATIVE_CAP = 1_000
 
 
 class RetrievalEngine:
@@ -164,23 +167,42 @@ class RetrievalEngine:
 
     def _get_thread_narratives(self, tier2_memories: list[dict]) -> list[dict]:
         """
-        Find narrative threads that contain any of the Tier 2 injected memories.
-
-        Deduplicates threads (a thread is only included once even if multiple
-        of its members are in tier2). Returns thread dicts with narrative text.
+        Find narrative threads whose members appear in tier2_memories.
+        Uses batch query. Applies per-narrative cap and total budget (shortest-first).
+        Updates last_surfaced_at lazily.
         """
-        seen_thread_ids = set()
-        threads = []
+        if not tier2_memories:
+            return []
 
-        for memory in tier2_memories:
-            memory_threads = self.store.get_threads_for_memory(memory["id"])
-            for t in memory_threads:
-                if t["id"] not in seen_thread_ids:
-                    seen_thread_ids.add(t["id"])
-                    full_thread = self.store.get_thread(t["id"])
-                    threads.append(full_thread)
+        memory_ids = [m["id"] for m in tier2_memories]
+        candidates = self.store.get_threads_for_memories_batch(memory_ids)
 
-        return threads
+        # Per-narrative cap: truncate at sentence boundary
+        for t in candidates:
+            narrative = t.get("narrative") or ""
+            if len(narrative) > _THREAD_NARRATIVE_CAP:
+                truncated = narrative[:_THREAD_NARRATIVE_CAP]
+                last_period = truncated.rfind(".")
+                if last_period > _THREAD_NARRATIVE_CAP // 2:
+                    truncated = truncated[:last_period + 1]
+                t["narrative"] = truncated
+
+        # Greedy budget: shortest first maximises arc count
+        candidates_sorted = sorted(candidates, key=lambda t: len(t.get("narrative") or ""))
+        budget_remaining = THREAD_BUDGET_CHARS
+        selected = []
+        for thread in candidates_sorted:
+            cost = len(thread.get("narrative") or "")
+            if cost <= budget_remaining:
+                selected.append(thread)
+                budget_remaining -= cost
+
+        # Lazy update: record surfacing timestamp
+        if selected:
+            now = datetime.now(timezone.utc).isoformat()
+            self.store.update_threads_last_surfaced([t["id"] for t in selected], now)
+
+        return selected
 
     def get_instinctive_memories(self) -> list[dict]:
         """

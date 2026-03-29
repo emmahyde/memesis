@@ -961,6 +961,19 @@ class MemoryStore:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def update_threads_last_surfaced(self, thread_ids: list[str], timestamp: str) -> None:
+        """Update last_surfaced_at for given thread IDs in a single query."""
+        if not thread_ids:
+            return
+        placeholders = ",".join("?" * len(thread_ids))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                f"UPDATE narrative_threads SET last_surfaced_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [timestamp, *thread_ids],
+            )
+            conn.commit()
+
     def list_threads(self) -> list[dict]:
         """
         List all narrative threads.
