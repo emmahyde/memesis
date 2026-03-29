@@ -190,7 +190,9 @@ def apply_operations(conn: sqlite3.Connection, result: dict, session_id: str):
 # LLM reduce prompt
 # ---------------------------------------------------------------------------
 
-REDUCE_PROMPT = """You are building an observation store from conversation transcripts. You see one session at a time, alongside what you've already captured.
+REDUCE_PROMPT = """You are building an observation store from conversation transcripts. Your goal is to build a rich, textured understanding of the person you collaborate with — not just what they do technically, but who they are, how they think, what they value, and how to be a great collaborator for them specifically.
+
+You see one session at a time, alongside what you've already captured.
 
 CURRENT OBSERVATION STORE:
 {store_manifest}
@@ -203,20 +205,37 @@ YOUR TASK: Extract durable observations from this session. For each insight:
 - If it REINFORCES an existing observation: REINFORCE it by ID
 - If it's noise, ephemeral, or re-derivable from code: SKIP it
 
-THE BEHAVIORAL GATE: "If I didn't have this, would I do something wrong next time?"
+TWO GATES — an observation passes if it clears EITHER one:
+
+1. THE BEHAVIORAL GATE: "If I didn't have this, would I do something wrong next time?"
+   Good for: technical corrections, workflow patterns, domain knowledge.
+
+2. THE COLLABORATOR GATE: "Does this help me understand who this person is and how to work with them?"
+   Good for: personality, values, aesthetic sense, communication style, trust dynamics, decision-making patterns.
 
 WHAT TO EXTRACT:
+
+Technical signal:
 - Corrections (mistakes and the pattern that caused them)
-- Preference signals (user pushed back — WHY matters more than WHAT)
-- Self-observations (your own tendencies and failure modes)
 - Workflow patterns (how this person works in non-obvious ways)
 - Decision context (constraints and trade-offs behind choices)
+
+Human signal — EQUALLY IMPORTANT, don't deprioritize these:
+- Personality and values (what they care about, how they express opinions, what energizes vs drains them)
+- Aesthetic preferences (visual taste, quality standards, design sensibility — "I like the angularness" is gold)
+- Communication style (direct? diplomatic? when do they push back vs defer? what tone do they use when frustrated vs excited?)
+- Trust and delegation patterns (when do they hand off control? when do they micromanage? what earns their trust?)
+- Decision-making style (intuition vs analysis? speed vs thoroughness? when do they want options vs just a decision?)
+- Collaboration dynamics (how do they give feedback? what does "good work" look like from them? how do they course-correct?)
+- Self-observations (your own tendencies and failure modes working with THIS person)
 
 WHAT TO SKIP:
 - Facts derivable from code, git, or docs
 - Tool output, file paths, one-time task mechanics
-- Generic engineering truths
+- Generic engineering truths that apply to any engineer
 - Anything already captured (REINFORCE instead of duplicating)
+
+IMPORTANT: Don't strip the humanity out of observations. "User prefers rebase" is worse than "Emma rebases even when it's painful — she values linear history enough to eat the conflict resolution cost, including generated lockfile churn." The texture matters.
 
 {focus_block}
 
@@ -225,8 +244,8 @@ Respond ONLY with valid JSON:
   "create": [
     {{
       "title": "Short pattern-level title",
-      "content": "The observation — dense, behavioral, pattern-level. 1-3 sentences.",
-      "observation_type": "correction|preference_signal|workflow_pattern|self_observation|decision_context",
+      "content": "The observation — dense, textured, capturing the person not just the pattern. 1-3 sentences.",
+      "observation_type": "correction|preference_signal|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic",
       "tags": ["tag1", "tag2"]
     }}
   ],
@@ -329,12 +348,12 @@ def print_report(conn: sqlite3.Connection):
 
 
 def main():
-    summaries_path = OUTPUT_DIR / "summaries.jsonl"
-    if not summaries_path.exists():
-        print("No summaries.jsonl found. Run scripts/scan.py first.", file=sys.stderr)
+    summary_files = sorted(OUTPUT_DIR.glob("summaries-*.jsonl"))
+    if not summary_files:
+        print("No summaries-*.jsonl found. Run scripts/scan.py first.", file=sys.stderr)
         sys.exit(1)
 
-    limit, focus, dry_run, report_only, reset = None, None, False, False, False
+    limit, focus, dry_run, report_only, reset, project = None, None, False, False, False, None
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -342,6 +361,8 @@ def main():
             limit = int(args[i + 1]); i += 2
         elif args[i] == "--focus" and i + 1 < len(args):
             focus = args[i + 1]; i += 2
+        elif args[i] == "--project" and i + 1 < len(args):
+            project = args[i + 1]; i += 2
         elif args[i] == "--dry-run":
             dry_run = True; i += 1
         elif args[i] == "--report":
@@ -351,6 +372,9 @@ def main():
         else:
             print(f"Unknown: {args[i]}", file=sys.stderr); sys.exit(1)
 
+    if project:
+        summary_files = [f for f in summary_files if project in f.stem]
+
     conn = init_db(reset=reset)
 
     if report_only:
@@ -359,9 +383,10 @@ def main():
         return
 
     summaries = []
-    with open(summaries_path) as f:
-        for line in f:
-            summaries.append(json.loads(line))
+    for sf in summary_files:
+        with open(sf) as f:
+            for line in f:
+                summaries.append(json.loads(line))
     if limit:
         summaries = summaries[:limit]
 
