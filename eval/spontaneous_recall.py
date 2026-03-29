@@ -20,14 +20,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-try:
-    from core.retrieval import RetrievalEngine
-    from core.storage import MemoryStore
-    _CORE_STORAGE_AVAILABLE = True
-except ImportError:
-    RetrievalEngine = None
-    MemoryStore = None
-    _CORE_STORAGE_AVAILABLE = False
+import json
+from core.database import init_db, close_db
+from core.models import Memory
+from core.retrieval import RetrievalEngine
 
 
 # ---------------------------------------------------------------------------
@@ -85,33 +81,27 @@ PREFERENCE_MEMORIES = [
 
 @pytest.fixture
 def preference_store(tmp_path):
-    """Store populated with 5 preference memories in instinctive stage."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    store = MemoryStore(base_dir=str(tmp_path / "preference_memory"))
+    """Database populated with 5 preference memories in instinctive stage."""
+    init_db(base_dir=str(tmp_path / "preference_memory"))
 
     for pref in PREFERENCE_MEMORIES:
-        store.create(
-            path=pref["path"],
+        Memory.create(
+            stage="instinctive",
+            title=pref["title"],
+            summary=pref["summary"],
             content=pref["content"],
-            metadata={
-                "stage": "instinctive",
-                "title": pref["title"],
-                "summary": pref["summary"],
-                "importance": pref["importance"],
-                "tags": pref["tags"],
-            },
+            importance=pref["importance"],
+            tags=json.dumps(pref["tags"]),
         )
 
-    return store
+    yield tmp_path / "preference_memory"
+    close_db()
 
 
 @pytest.fixture
 def preference_context(preference_store):
     """Context injected for a session, without any agent prompt about memory."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    engine = RetrievalEngine(preference_store)
+    engine = RetrievalEngine()
     return engine.inject_for_session(session_id="spontaneous_recall_session")
 
 
@@ -188,12 +178,12 @@ def test_context_contains_instinctive_section(preference_context):
 
 def test_all_preferences_in_instinctive_stage(preference_store):
     """Confirm all 5 preference memories are stored in the instinctive stage."""
-    instinctive = preference_store.list_by_stage("instinctive")
+    instinctive = list(Memory.by_stage("instinctive"))
     assert len(instinctive) == 5, (
         f"Expected 5 instinctive memories, found {len(instinctive)}"
     )
 
-    titles = {m["title"] for m in instinctive}
+    titles = {m.title for m in instinctive}
     expected_titles = {pref["title"] for pref in PREFERENCE_MEMORIES}
     assert titles == expected_titles, (
         f"Instinctive stage titles mismatch.\nExpected: {expected_titles}\nGot: {titles}"

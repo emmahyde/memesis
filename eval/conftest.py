@@ -8,6 +8,7 @@ that curation_audit.py and spontaneous_recall.py are collected alongside the
 standard *_test.py pattern in pytest.ini.
 """
 
+import json
 import sys
 import pytest
 from pathlib import Path
@@ -22,16 +23,10 @@ def pytest_collect_file(parent, file_path):
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-try:
-    from core.storage import MemoryStore
-    from core.lifecycle import LifecycleManager
-    from core.retrieval import RetrievalEngine
-    _CORE_STORAGE_AVAILABLE = True
-except ImportError:
-    MemoryStore = None
-    LifecycleManager = None
-    RetrievalEngine = None
-    _CORE_STORAGE_AVAILABLE = False
+from core.database import init_db, close_db
+from core.models import Memory
+from core.lifecycle import LifecycleManager
+from core.retrieval import RetrievalEngine
 
 FIXED_SEED = 42  # for reproducible synthetic data
 
@@ -228,69 +223,57 @@ SYNTHETIC_MEMORIES = [
 ]
 
 
-def seed_store(store) -> list[str]:  # store: MemoryStore when available
+def seed_store() -> list[str]:
     """
-    Populate a MemoryStore with all 20 synthetic memories.
+    Populate the database with all 20 synthetic memories.
 
+    Requires init_db() to have been called first.
     Returns list of created memory IDs in insertion order.
     """
     ids = []
     for spec in SYNTHETIC_MEMORIES:
-        mid = store.create(
-            path=spec["path"],
+        mem = Memory.create(
+            stage=spec["stage"],
+            title=spec["title"],
+            summary=spec["summary"],
             content=spec["content"],
-            metadata={
-                "stage": spec["stage"],
-                "title": spec["title"],
-                "summary": spec["summary"],
-                "importance": spec["importance"],
-                "tags": spec["tags"],
-            },
+            importance=spec["importance"],
+            tags=json.dumps(spec["tags"]),
         )
-        ids.append(mid)
+        ids.append(mem.id)
     return ids
 
 
 @pytest.fixture
 def eval_store(tmp_path):
-    """Isolated MemoryStore for each eval. Checkpoints WAL on teardown."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    store = MemoryStore(base_dir=str(tmp_path / "eval_memory"))
-    yield store
-    store.close()
+    """Isolated Peewee database for each eval."""
+    init_db(base_dir=str(tmp_path / "eval_memory"))
+    yield tmp_path / "eval_memory"
+    close_db()
 
 
 @pytest.fixture
 def seeded_store(tmp_path):
-    """Store pre-seeded with 20 synthetic memories. Checkpoints WAL on teardown."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    store = MemoryStore(base_dir=str(tmp_path / "eval_memory"))
-    seed_store(store)
-    yield store
-    store.close()
+    """Database pre-seeded with 20 synthetic memories."""
+    init_db(base_dir=str(tmp_path / "eval_memory"))
+    seed_store()
+    yield tmp_path / "eval_memory"
+    close_db()
 
 
 @pytest.fixture
 def eval_engine(eval_store):
-    """RetrievalEngine bound to the eval_store."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    return RetrievalEngine(eval_store)
+    """RetrievalEngine using the eval database."""
+    return RetrievalEngine()
 
 
 @pytest.fixture
 def seeded_engine(seeded_store):
-    """RetrievalEngine bound to the seeded_store."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    return RetrievalEngine(seeded_store)
+    """RetrievalEngine using the seeded database."""
+    return RetrievalEngine()
 
 
 @pytest.fixture
 def lifecycle(eval_store):
-    """LifecycleManager bound to the eval_store."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    return LifecycleManager(eval_store)
+    """LifecycleManager using the eval database."""
+    return LifecycleManager()
