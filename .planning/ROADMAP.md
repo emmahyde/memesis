@@ -202,7 +202,10 @@ Plans:
   2. Three or more errors in a short window triggers an error-spike orienting flag
   3. Orienting-flagged observations have a higher base importance score than non-flagged observations
   4. The detector runs without any LLM call (pure rule-based, fast path)
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [ ] 11-01-PLAN.md — TDD OrientingDetector with correction, emphasis, error_spike, pacing_break signals + feature flag
 
 ### Phase 12: Habituation Baseline
 **Goal**: A per-project event frequency model suppresses routine events — events the project sees frequently are de-weighted before they reach the consolidation LLM
@@ -365,7 +368,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 8. Prompt-Aware Tier 2 Injection | 1/1 | Complete   | 2026-03-29 |
 | 9. Thompson Sampling Selection | 1/1 | Complete   | 2026-03-29 |
 | 10. Provenance Signals | 1/1 | Complete    | 2026-03-29 |
-| 11. OrientingDetector | 0/? | Not started | - |
+| 11. OrientingDetector | 0/1 | Planning   | - |
 | 12. Habituation Baseline | 0/? | Not started | - |
 | 13. Somatic Markers | 0/? | Not started | - |
 | 14. Replay Priority | 0/? | Not started | - |
