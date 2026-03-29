@@ -22,6 +22,35 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 OUTPUT_DIR = Path(__file__).parent.parent / "backfill-output"
 
 
+def project_slug(dirname: str) -> str:
+    """Derive canonical project name from Claude project dir name.
+
+    Examples:
+        -Users-emma-hyde-work-ai-tools -> ai-tools
+        -Users-emma-hyde-worktrees-ai-tools-RETIRE-4689 -> ai-tools
+        -Users-emma-hyde-projects-memesis -> memesis
+        -Users-emma-hyde-work-ai-tools--claude-worktrees-foo -> ai-tools
+    """
+    name = dirname.lstrip('-')
+    # Strip worktree clone suffixes
+    if '--claude-worktrees' in name:
+        name = name.split('--claude-worktrees')[0]
+    # Find the repo name after known parent markers
+    for marker in ('-work-', '-projects-', '-personal-', '-worktrees-'):
+        idx = name.find(marker)
+        if idx != -1:
+            rest = name[idx + len(marker):]
+            # Worktree branches append UPPERCASE or ticket-number segments
+            parts = rest.split('-')
+            repo_parts = []
+            for p in parts:
+                if p.isupper() or (p.isdigit() and len(p) >= 4):
+                    break
+                repo_parts.append(p)
+            return '-'.join(repo_parts) if repo_parts else rest
+    return name
+
+
 def parse_duration(s: str) -> timedelta:
     match = re.match(r'^(\d+)([dhwm])$', s.strip().lower())
     if not match:
@@ -228,15 +257,24 @@ def main():
             "size_kb": sess["size_kb"],
         })
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = OUTPUT_DIR / "summaries.jsonl"
-    with open(output_path, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
+    # Group by canonical project slug, write per-project files
+    by_slug: dict[str, list] = {}
+    for r in results:
+        slug = project_slug(r["project"])
+        by_slug.setdefault(slug, []).append(r)
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for slug, items in sorted(by_slug.items()):
+        output_path = OUTPUT_DIR / f"summaries-{slug}.jsonl"
+        with open(output_path, "w") as f:
+            for r in items:
+                f.write(json.dumps(r) + "\n")
+        print(f"  {slug}: {len(items)} sessions → {output_path.name}", file=sys.stderr)
+
+    total = sum(len(v) for v in by_slug.values())
     total_chars = sum(len(r["summary"]) for r in results)
-    print(f"\n{len(results)} sessions → {output_path}", file=sys.stderr)
-    print(f"Avg summary: {total_chars // max(len(results), 1):,} chars/session", file=sys.stderr)
+    print(f"\n{total} sessions across {len(by_slug)} projects", file=sys.stderr)
+    print(f"Avg summary: {total_chars // max(total, 1):,} chars/session", file=sys.stderr)
 
 
 if __name__ == "__main__":
