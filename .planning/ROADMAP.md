@@ -42,7 +42,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 ### v1 — Memory Lifecycle
 
 - [x] **Phase 15: SM-2 Spaced Injection** - Three new fields + hard suppression when next_injection_due is in the future (completed 2026-03-29)
-- [ ] **Phase 16: Reconsolidation at PreCompact** - Update injected memories when session confirms/contradicts/refines them
+- [x] **Phase 16: Reconsolidation at PreCompact** - Update injected memories when session confirms/contradicts/refines them (completed 2026-03-29)
 - [ ] **Phase 17: Saturation Decay** - Penalize high injection_count + low usage_count in relevance formula
 - [ ] **Phase 18: Integration Factor** - Accelerate decay for isolated memories with no threads, tags, or reinforcement
 
@@ -376,7 +376,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 13. Somatic Markers | 0/? | Complete    | 2026-03-29 |
 | 14. Replay Priority | 0/? | Complete    | 2026-03-29 |
 | 15. SM-2 Spaced Injection | 0/? | Complete    | 2026-03-29 |
-| 16. Reconsolidation at PreCompact | 0/? | Not started | - |
+| 16. Reconsolidation at PreCompact | 0/? | Complete    | 2026-03-29 |
 | 17. Saturation Decay | 0/? | Not started | - |
 | 18. Integration Factor | 0/? | Not started | - |
 | 19. 1-Hop Graph Expansion | 0/? | Not started | - |
