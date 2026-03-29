@@ -148,7 +148,11 @@ Plans:
   2. Memories that rank high in FTS but low in vector (or vice versa) are not penalized — they appear in results
   3. Retrieval completes within 500ms on a corpus of 1000 memories
   4. The implementation adds zero new dependencies beyond what is already in the venv
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 07-01-PLAN.md — Core hybrid_search() RRF algorithm + unit tests
+- [ ] 07-02-PLAN.md — Wire hybrid search into all retrieval paths + performance test
 
 ### Phase 8: Prompt-Aware Tier 2 Injection
 **Goal**: Tier 2 injection uses the actual user prompt text as a retrieval signal — not just project name matching
@@ -348,7 +352,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 4. Stop Creating Stage Directories | - | Complete | 2026-03-29 |
 | 5. NarrativeThread Timestamps | - | Complete | 2026-03-29 |
 | 6. Remove Unused Imports | - | Complete | 2026-03-29 |
-| 7. Hybrid RRF Retrieval | 0/? | Not started | - |
+| 7. Hybrid RRF Retrieval | 0/2 | Planning | - |
 | 8. Prompt-Aware Tier 2 Injection | 0/? | Not started | - |
 | 9. Thompson Sampling Selection | 0/? | Not started | - |
 | 10. Provenance Signals | 0/? | Not started | - |
