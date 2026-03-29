@@ -29,6 +29,8 @@ DEFAULTS = {
     "habituation_baseline": True,
     "somatic_markers": True,
     "replay_priority": True,
+    "sm2_spaced_injection": True,
+    "affect_awareness": True,
 }
 
 _cache: dict | None = None

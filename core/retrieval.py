@@ -388,7 +388,8 @@ class RetrievalEngine:
             )
 
         # --- Static path (no query) — preserved exactly as before --------------
-        records = list(Memory.by_stage("crystallized"))
+        from .spaced import is_injection_eligible
+        records = [m for m in Memory.by_stage("crystallized") if is_injection_eligible(m)]
 
         # Three-pass stable sort
         records_sorted = sorted(
@@ -594,11 +595,14 @@ class RetrievalEngine:
             for m in Memory.select().where(Memory.id.in_(ranked_ids))
         }
 
+        # Filter by SM-2 eligibility
+        from .spaced import is_injection_eligible
+
         # Build score table with optional project_context boost
         scored: list[tuple[float, Memory]] = []
         for memory_id, rrf_score in ranked:
             memory = memories_by_id.get(memory_id)
-            if memory is None:
+            if memory is None or not is_injection_eligible(memory):
                 continue
             boost = 0.0
             if project_context is not None and memory.project_context == project_context:
