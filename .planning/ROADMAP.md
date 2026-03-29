@@ -368,7 +368,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 8. Prompt-Aware Tier 2 Injection | 1/1 | Complete   | 2026-03-29 |
 | 9. Thompson Sampling Selection | 1/1 | Complete   | 2026-03-29 |
 | 10. Provenance Signals | 1/1 | Complete    | 2026-03-29 |
-| 11. OrientingDetector | 1/1 | Complete   | 2026-03-29 |
+| 11. OrientingDetector | 1/1 | Complete    | 2026-03-29 |
 | 12. Habituation Baseline | 0/? | Not started | - |
 | 13. Somatic Markers | 0/? | Not started | - |
 | 14. Replay Priority | 0/? | Not started | - |
