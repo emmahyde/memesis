@@ -37,7 +37,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 11: OrientingDetector** - Rule-based detector for corrections, emphasis, error spikes, pacing breaks (completed 2026-03-29)
 - [x] **Phase 12: Habituation Baseline** - Per-project event frequency model suppressing routine events (completed 2026-03-29)
 - [x] **Phase 13: Somatic Markers** - Valence classification (neutral/friction/surprise/delight) with importance bump (completed 2026-03-29)
-- [ ] **Phase 14: Replay Priority** - Sort observations by salience before presenting to consolidation LLM
+- [x] **Phase 14: Replay Priority** - Sort observations by salience before presenting to consolidation LLM (completed 2026-03-29)
 
 ### v1 — Memory Lifecycle
 
@@ -374,7 +374,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 11. OrientingDetector | 1/1 | Complete    | 2026-03-29 |
 | 12. Habituation Baseline | 0/1 | Complete    | 2026-03-29 |
 | 13. Somatic Markers | 0/? | Complete    | 2026-03-29 |
-| 14. Replay Priority | 0/? | Not started | - |
+| 14. Replay Priority | 0/? | Complete    | 2026-03-29 |
 | 15. SM-2 Spaced Injection | 0/? | Not started | - |
 | 16. Reconsolidation at PreCompact | 0/? | Not started | - |
 | 17. Saturation Decay | 0/? | Not started | - |
