@@ -98,18 +98,24 @@ def search_and_inject(
     """
     Search for memories relevant to the prompt and format for injection.
 
-    Uses hybrid RRF (FTS + optional vector) via RetrievalEngine.  The FTS
-    query is built from extracted terms; the embedding is generated from the
-    raw prompt (natural language).  If embedding fails, FTS-only hybrid runs.
+    Uses two complementary retrieval paths:
+    - Tier 2: get_crystallized_for_context with prompt-derived query — applies
+      project_context boost, token budget, and crystallized-only filtering via
+      hybrid RRF.
+    - Tier 3 JIT: hybrid_search across ALL stages — supplements with
+      non-crystallized memories not covered by Tier 2.
+
+    The embedding is computed once and shared by both calls to stay within the
+    500ms latency budget.  If embedding fails, both paths fall back to FTS-only.
     """
     terms = extract_query_terms(prompt)
     if not terms:
         return ""
 
-    # Build FTS query string (FTS leg of hybrid_search)
+    # Build FTS query string (shared by both Tier 2 and Tier 3 legs)
     fts_query = " OR ".join(Memory.sanitize_fts_term(t) for t in terms)
 
-    # Attempt embedding from raw prompt text (vector leg of hybrid_search)
+    # Attempt embedding from raw prompt text — computed ONCE, reused by both legs
     query_embedding = None
     try:
         from core.embeddings import embed_text
@@ -117,39 +123,59 @@ def search_and_inject(
     except Exception:
         pass  # FTS-only hybrid fallback
 
-    # Run hybrid RRF via RetrievalEngine
+    # --- Tier 2: crystallized-only path (project_context boost, token budget) ---
+    tier2_memories: list = []
+    tier2_ids: set = set()
     try:
         engine = RetrievalEngine()
+        tier2_memories = engine.get_crystallized_for_context(
+            query=fts_query,
+            query_embedding=query_embedding,
+            project_context=project_context,
+            token_limit=TOKEN_BUDGET_CHARS,
+        )
+        tier2_ids = {m.id for m in tier2_memories}
+    except Exception:
+        engine = None
+
+    # --- Tier 3 JIT: all-stage hybrid search (supplements Tier 2) ---
+    tier3_candidates: list = []
+    try:
+        if engine is None:
+            engine = RetrievalEngine()
         ranked = engine.hybrid_search(
             query=fts_query,
             query_embedding=query_embedding,
             k=10,
             vec_store=get_vec_store(),
         )
+        if ranked:
+            ranked_ids = [mid for mid, _ in ranked]
+            memories_by_id = {
+                m.id: m
+                for m in Memory.select().where(Memory.id.in_(ranked_ids))
+            }
+            tier3_candidates = [
+                memories_by_id[mid] for mid, _ in ranked
+                if mid in memories_by_id and mid not in tier2_ids
+            ]
     except Exception:
-        return ""
+        pass
 
-    if not ranked:
-        return ""
-
-    # Hydrate Memory objects from ranked IDs
-    ranked_ids = [mid for mid, _ in ranked]
-    memories_by_id = {
-        m.id: m
-        for m in Memory.select().where(Memory.id.in_(ranked_ids))
-    }
-
-    # Build ordered candidate list (preserve RRF order)
-    all_candidates = [memories_by_id[mid] for mid, _ in ranked if mid in memories_by_id]
-
-    # Filter out already-injected, archived, and ephemeral memories
+    # --- Merge: Tier 2 first, then Tier 3 JIT to fill remaining slots ---
     already_injected = get_already_injected(session_id)
-    candidates = [
-        m for m in all_candidates
-        if m.id not in already_injected
-        and not m.archived_at
-        and m.stage != "ephemeral"
-    ]
+
+    def _is_eligible(m) -> bool:
+        return (
+            m.id not in already_injected
+            and not m.archived_at
+            and m.stage != "ephemeral"
+        )
+
+    candidates = (
+        [m for m in tier2_memories if _is_eligible(m)]
+        + [m for m in tier3_candidates if _is_eligible(m)]
+    )
 
     if not candidates:
         return ""
