@@ -36,8 +36,32 @@ Captured during the 2026-03-29 session. Not prioritized, not committed to — ju
 - **Observation decay for automated sessions**: RETIRE worktree sessions are highly repetitive. Reinforcements from automated sessions should decay faster than from interactive ones
 - **Mode detection**: one-shot sessions (8 messages, single question) vs building sessions (484 messages, multi-hour) vs creative sessions (Sector game design). Different modes should produce different observation types
 
+## Architecture (from research synthesis)
+
+- **Retrieval is metabolic, not read-only**: every research dimension (algorithms, neuroscience, arxiv, sense memory, sci-fi) independently converged on this — retrieval should change system state. Thompson sampling updates arm distributions, reconsolidation updates memories, priming lowers gate thresholds. "Living memory"
+- **Five Properties of Living Memory**: metabolic decay, association propagation, narrative coherence, identity grounding, trajectory preservation. These are the design principles, not just features
+- **Encoding specificity**: memories should store multi-dimensional context at encoding time (what project, what mood, what was happening). Retrieval quality depends on matching the encoding context, not just content similarity. Deferred but high value
+- **`was_used` is a heuristic, not ground truth**: FeedbackLoop's keyword matching for usage detection is a proxy. Thompson sampling and RL estimates should be weighted conservatively until we have better signal
+- **3s timeout budget**: UserPromptSubmit hook has 3s total. All per-prompt retrieval must complete in ~500ms. This hard-constrains what we can do at injection time (no LLM re-ranker, no multi-hop graph traversal synchronously)
+
+## Pipeline Economics
+
+- **Scan compresses 287:1**: 260M raw transcript tokens → 906K summary tokens. Scan is pure Python (regex, truncation), zero LLM cost
+- **Full reduce is ~$10 on Sonnet**: 724 sessions × ~2.9K input tokens + ~300 output tokens per call
+- **10% sample is ~$1 and takes 3 minutes**: good enough for iteration. Full corpus for milestone validation
+- **Thinking blocks add 55% to scan output**: 906K → 1.4M tokens. Still cheap. Worth it for self-correction and decision reasoning signal
+- **Claude Code transcript rolling window is ~2-4 weeks**: transcripts disappear. Copy them early. We got 777 files (Feb 27 – Mar 29) representing everything available on 2026-03-29
+
+## Observation Store Quality
+
+- **High-frequency observations are dominated by automated sessions**: x68 "Autonomous investigation" and x56 "Unattended execution" are inflated by RETIRE worktree runs. Need frequency normalization or session-type weighting
+- **Reduce prompt creates near-duplicates instead of merging**: #7/#13 and #9/#12 are the same observation with different wording. Reduce's dedup is semantic-distance based but the threshold may be too tight
+- **Observation titles should be warm, not clinical**: the observations describe a person, not a system. "Cut-and-abandon" should be "decisive about what's not worth finishing"
+
 ## Long-term
 
 - **Gold set expansion**: 6 sessions is a start. Need 20+ for statistical confidence, covering all project types and session lengths
 - **LLM judge for observation quality**: after gold set establishes ground truth, could train an LLM judge to score new observations against the patterns established in the gold set
 - **Observation store browser**: not a UI (out of scope) but a CLI skill that lets you browse, merge, reclassify, and prune observations interactively
+- **Eval as CI gate**: run `python3 eval/report.py` in verify_phase.py after each roadmap phase. Track LongMemEval accuracy, injection rate, FTS precision over time
+- **Planted-fact eval for reduce**: write synthetic transcripts with known signals, run scan → reduce, check if reduce extracts them. Fully automated, good for CI alongside the gold set
