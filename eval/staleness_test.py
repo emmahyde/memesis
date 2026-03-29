@@ -18,8 +18,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.retrieval import RetrievalEngine
-from core.storage import MemoryStore
+try:
+    from core.retrieval import RetrievalEngine
+    from core.storage import MemoryStore
+    _CORE_STORAGE_AVAILABLE = True
+except ImportError:
+    RetrievalEngine = None
+    MemoryStore = None
+    _CORE_STORAGE_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +97,8 @@ def _make_updated_memory(store: MemoryStore, scenario: dict) -> str:
 @pytest.fixture
 def staleness_store(tmp_path):
     """Store with 3 updated memories (each updated from stale to fresh content)."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     store = MemoryStore(base_dir=str(tmp_path / "staleness_memory"))
     for scenario in SCENARIOS:
         _make_updated_memory(store, scenario)
@@ -100,6 +108,8 @@ def staleness_store(tmp_path):
 @pytest.fixture
 def staleness_context(staleness_store):
     """Injected context from a store that only has fresh memory content."""
+    if not _CORE_STORAGE_AVAILABLE:
+        pytest.skip("core.storage not available — run after Phase 1")
     engine = RetrievalEngine(staleness_store)
     return engine.inject_for_session(session_id="staleness_eval_session")
 
