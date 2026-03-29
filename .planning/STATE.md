@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 00.5-ai-eval-harness-01-PLAN.md
-last_updated: "2026-03-29T19:37:57.473Z"
+stopped_at: Completed 00.5-ai-eval-harness-02-PLAN.md
+last_updated: "2026-03-29T19:42:24.266Z"
 last_activity: 2026-03-29 — Roadmap created, 20 v1 phases + 6 v2 future phases defined
 progress:
   total_phases: 27
@@ -51,6 +51,7 @@ Progress: [███░░░░░░░] 33%
 
 *Updated after each plan completion*
 | Phase 00.5-ai-eval-harness P01 | 5 | 2 tasks | 8 files |
+| Phase 00.5-ai-eval-harness P02 | 2 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -64,6 +65,8 @@ Recent decisions affecting current work:
 - [Pre-Phase 1]: Thompson sampling over UCB1 — handles cold-start via Beta prior, no hyperparameters, stdlib-only
 - [Phase 00.5-ai-eval-harness]: prune_accuracy precision denominator is |kept| (not |true_keep|) - measures quality of kept set
 - [Phase 00.5-ai-eval-harness]: conditional import guard pattern with _CORE_STORAGE_AVAILABLE flag established for all eval/ files
+- [Phase 00.5-ai-eval-harness]: Case-insensitive substring match for LongMemEval answer scoring - matches benchmark loose evaluation protocol
+- [Phase 00.5-ai-eval-harness]: Retrieval callable interface pattern established: retrieval_fn(query str) -> list[str] for deferred Phase 7 wiring
 
 ### Pending Todos
 
@@ -77,6 +80,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T19:37:57.470Z
-Stopped at: Completed 00.5-ai-eval-harness-01-PLAN.md
+Last session: 2026-03-29T19:42:24.264Z
+Stopped at: Completed 00.5-ai-eval-harness-02-PLAN.md
 Resume file: None
