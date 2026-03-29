@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -157,10 +158,10 @@ MOCK_LLM_RESPONSE = {
 }
 
 
-@patch("core.crystallizer._call_llm")
+@patch("core.crystallizer.call_llm")
 def test_crystallize_single_candidate(mock_llm, crystallizer, store):
     """Single candidate still gets synthesized (episodic → semantic)."""
-    mock_llm.return_value = MOCK_LLM_RESPONSE
+    mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     mem_id = _create_consolidated(
         store, "Bedrock Client", "Use AnthropicBedrock() not Anthropic()",
@@ -182,10 +183,10 @@ def test_crystallize_single_candidate(mock_llm, crystallizer, store):
     assert "diverges at every surface" in crystal["content"]
 
 
-@patch("core.crystallizer._call_llm")
+@patch("core.crystallizer.call_llm")
 def test_crystallize_group(mock_llm, crystallizer, store):
     """Multiple related candidates get synthesized into one insight."""
-    mock_llm.return_value = MOCK_LLM_RESPONSE
+    mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     ids = [
         _create_consolidated(
@@ -206,10 +207,10 @@ def test_crystallize_group(mock_llm, crystallizer, store):
         assert source["archived_at"] is not None
 
 
-@patch("core.crystallizer._call_llm")
+@patch("core.crystallizer.call_llm")
 def test_crystallize_preserves_importance(mock_llm, crystallizer, store):
     """Crystallized memories start at 0.75 importance."""
-    mock_llm.return_value = MOCK_LLM_RESPONSE
+    mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     _create_consolidated(
         store, "Test", "Content",
@@ -221,10 +222,10 @@ def test_crystallize_preserves_importance(mock_llm, crystallizer, store):
     assert crystal["importance"] == 0.75
 
 
-@patch("core.crystallizer._call_llm")
+@patch("core.crystallizer.call_llm")
 def test_crystallize_tags_include_source_marker(mock_llm, crystallizer, store):
     """Crystallized memories are tagged with source:crystallization."""
-    mock_llm.return_value = MOCK_LLM_RESPONSE
+    mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     _create_consolidated(
         store, "Test", "Content",
@@ -237,10 +238,10 @@ def test_crystallize_tags_include_source_marker(mock_llm, crystallizer, store):
     assert "source:crystallization" in tags
 
 
-@patch("core.crystallizer._call_llm")
+@patch("core.crystallizer.call_llm")
 def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, store):
     """Source memories get a 'subsumed' consolidation log entry."""
-    mock_llm.return_value = MOCK_LLM_RESPONSE
+    mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     mem_id = _create_consolidated(
         store, "Test", "Content",
@@ -261,7 +262,7 @@ def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, store):
 # --- Fallback ---
 
 
-@patch("core.crystallizer._call_llm", side_effect=Exception("LLM unavailable"))
+@patch("core.llm.call_llm", side_effect=Exception("LLM unavailable"))
 def test_fallback_on_llm_failure(mock_llm, crystallizer, store):
     """LLM failure falls back to simple promotion."""
     mem_id = _create_consolidated(
@@ -294,24 +295,24 @@ def test_crystallization_prompt_requests_json():
 # --- Integration with pre_compact ---
 
 
-@patch("core.crystallizer._call_llm")
+@patch("core.crystallizer.call_llm")
 def test_mixed_candidates_produce_separate_crystallizations(mock_llm, crystallizer, store):
     """Candidates from different observation types crystallize separately."""
     mock_llm.side_effect = [
-        {
+        json.dumps({
             "title": "Correction pattern",
             "insight": "A correction insight",
             "observation_type": "correction",
             "tags": ["testing"],
             "source_pattern": "Testing corrections",
-        },
-        {
+        }),
+        json.dumps({
             "title": "Workflow pattern",
             "insight": "A workflow insight",
             "observation_type": "workflow_pattern",
             "tags": ["pr"],
             "source_pattern": "PR patterns",
-        },
+        }),
     ]
 
     _create_consolidated(
@@ -334,3 +335,107 @@ def test_mixed_candidates_produce_separate_crystallizations(mock_llm, crystalliz
     titles = {r["title"] for r in results}
     assert "Correction pattern" in titles
     assert "Workflow pattern" in titles
+
+
+# ---------------------------------------------------------------------------
+# Embedding helpers (deterministic, no real model loaded)
+# ---------------------------------------------------------------------------
+
+
+def _fake_embeddings(n, dim=384, seed=42):
+    """Return n unit-normed random embeddings seeded for determinism."""
+    rng = np.random.default_rng(seed)
+    raw = rng.standard_normal((n, dim))
+    norms = np.linalg.norm(raw, axis=1, keepdims=True)
+    return raw / np.maximum(norms, 1e-9)
+
+
+def _cluster_embeddings(n, cluster_size=2):
+    """Return embeddings where the first cluster_size items are highly similar (cosine > 0.9).
+
+    Uses noise scale 0.01 so the cluster pair cosine similarity ~0.97, which comfortably
+    exceeds the crystallizer grouping threshold of 0.75.
+    """
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal(384)
+    base /= np.linalg.norm(base)
+    similar = base + rng.standard_normal((cluster_size, 384)) * 0.01
+    dissimilar = rng.standard_normal((n - cluster_size, 384))
+    all_vecs = np.vstack([similar, dissimilar])
+    norms = np.linalg.norm(all_vecs, axis=1, keepdims=True)
+    return all_vecs / np.maximum(norms, 1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Embedding-based grouping (D-09, D-10)
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingGrouping:
+    """Tests for embedding-based candidate grouping in _group_candidates."""
+
+    def _make_candidates(self, crystallizer, store, n=3, tags=None):
+        """Create n consolidated memories with reinforcement_count >= 3."""
+        candidates = []
+        for i in range(n):
+            mem_tags = tags or [f"type:correction", f"topic{i}"]
+            mem_id = _create_consolidated(
+                store,
+                title=f"Candidate {i}",
+                content=f"Content for candidate {i}",
+                tags=mem_tags,
+                reinforcement_count=3,
+            )
+            mem = store.get(mem_id)
+            candidates.append(mem)
+        return candidates
+
+    def test_similar_candidates_grouped_by_embeddings(self, crystallizer, store):
+        """Two highly similar embeddings are placed in the same group."""
+        candidates = self._make_candidates(crystallizer, store, n=3)
+        embeddings = _cluster_embeddings(3, cluster_size=2)
+
+        with patch("core.crystallizer._get_embeddings", return_value=embeddings):
+            groups = crystallizer._group_candidates(candidates)
+
+        # The first two candidates (high cosine similarity) must share a group.
+        group_sets = [frozenset(c["id"] for c in g) for g in groups]
+        similar_ids = frozenset(c["id"] for c in candidates[:2])
+        assert any(similar_ids <= gs for gs in group_sets), (
+            "The two similar candidates should be in the same group"
+        )
+
+    def test_dissimilar_candidates_not_grouped(self, crystallizer, store):
+        """Random (dissimilar) embeddings produce singleton groups."""
+        candidates = self._make_candidates(crystallizer, store, n=3)
+        embeddings = _fake_embeddings(3)
+
+        with patch("core.crystallizer._get_embeddings", return_value=embeddings):
+            groups = crystallizer._group_candidates(candidates)
+
+        # All pairs should be below the 0.75 threshold for random unit vectors.
+        assert len(groups) == 3
+        assert all(len(g) == 1 for g in groups)
+
+    def test_embedding_fallback_when_unavailable(self, crystallizer, store):
+        """When _get_embeddings returns None, grouping falls back to tag overlap."""
+        # Three candidates: two share a tag, one is separate.
+        ids = [
+            _create_consolidated(
+                store, f"Tagged {i}", f"Content {i}",
+                tags=["type:correction", "shared-tag"] if i < 2 else ["type:correction", "other-tag"],
+                reinforcement_count=3,
+            )
+            for i in range(3)
+        ]
+        candidates = [store.get(mid) for mid in ids]
+
+        with patch("core.crystallizer._get_embeddings", return_value=None):
+            groups = crystallizer._group_candidates(candidates)
+
+        # Tag-overlap fallback: ids[0] and ids[1] share "shared-tag" → grouped together.
+        group_sets = [frozenset(c["id"] for c in g) for g in groups]
+        shared_ids = frozenset([ids[0], ids[1]])
+        assert any(shared_ids <= gs for gs in group_sets), (
+            "Tag-overlap fallback should group the two candidates that share a tag"
+        )

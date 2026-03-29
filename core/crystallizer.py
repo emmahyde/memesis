@@ -18,10 +18,10 @@ detail, generalized into a reusable pattern.
 """
 
 import json
-import os
 from typing import Optional
 
 from .lifecycle import LifecycleManager
+from .llm import call_llm
 from .storage import MemoryStore
 
 # ---------------------------------------------------------------------------
@@ -67,30 +67,25 @@ Respond ONLY with valid JSON:
 }}"""
 
 
-def _call_llm(prompt: str) -> dict:
-    """Call the LLM for crystallization synthesis."""
-    import anthropic
 
-    if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-        client = anthropic.AnthropicBedrock()
-        model = "us.anthropic.claude-sonnet-4-6"
-    else:
-        client = anthropic.Anthropic()
-        model = "claude-sonnet-4-6"
+def _get_embeddings(texts: list[str]):
+    """
+    Encode texts with sentence-transformers (all-MiniLM-L6-v2).
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        temperature=0,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    return json.loads(text)
+    Returns numpy array of shape (len(texts), 384), or None if
+    sentence-transformers is unavailable. Caller falls back to tag-overlap.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        return model.encode(texts)
+    except Exception:
+        import sys
+        print(
+            "[crystallizer] sentence-transformers unavailable, falling back to tag-overlap",
+            file=sys.stderr,
+        )
+        return None
 
 
 class Crystallizer:
@@ -142,15 +137,36 @@ class Crystallizer:
 
     def _group_candidates(self, candidates: list[dict]) -> list[list[dict]]:
         """
-        Group related candidates by observation type and tag overlap.
+        Group related candidates by theme.
 
-        Simple heuristic: same observation_type AND at least one shared tag.
+        Phase 1: tries embedding cosine similarity (sentence-transformers).
+        Phase 2: falls back to tag-overlap if embeddings are unavailable.
         Ungrouped candidates form singleton groups (still get synthesized).
         """
         if len(candidates) <= 2:
             # Not enough to meaningfully cluster — each is its own group
             return [[c] for c in candidates]
 
+        # Phase 1: Try embedding-based clustering
+        # Skip if texts are too short to produce meaningful embeddings
+        # (degenerate inputs like single-character titles would cluster incorrectly)
+        texts = [f"{c.get('title', '')} {c.get('content', '')[:200]}" for c in candidates]
+        min_text_len = min(len(t.strip()) for t in texts)
+        embeddings = _get_embeddings(texts) if min_text_len >= 10 else None
+
+        if embeddings is not None:
+            return self._group_by_embeddings(candidates, embeddings, threshold=0.75)
+
+        # Phase 2: Fall back to tag-overlap (original logic)
+        return self._group_by_tags(candidates)
+
+    def _group_by_tags(self, candidates: list[dict]) -> list[list[dict]]:
+        """
+        Group related candidates by observation type and tag overlap.
+
+        Simple heuristic: same observation_type AND at least one shared tag.
+        Ungrouped candidates form singleton groups (still get synthesized).
+        """
         # Extract tags from metadata
         def get_tags(mem):
             tags = mem.get("tags", "")
@@ -215,6 +231,43 @@ class Crystallizer:
 
         return groups
 
+    def _group_by_embeddings(
+        self,
+        candidates: list[dict],
+        embeddings,  # numpy array (N, 384)
+        threshold: float,
+    ) -> list[list[dict]]:
+        """
+        Group candidates by embedding cosine similarity using union-find.
+
+        Pairs with cosine similarity >= threshold are merged into the same group.
+        """
+        import numpy as np
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        normed = embeddings / np.maximum(norms, 1e-9)
+        sims = normed @ normed.T  # (N, N) cosine similarity matrix
+
+        n = len(candidates)
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if sims[i, j] >= threshold:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+        groups: dict[int, list[dict]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(candidates[i])
+        return list(groups.values())
+
     def _crystallize_group(self, group: list[dict]) -> Optional[dict]:
         """
         Synthesize a group of related memories into one crystallized insight.
@@ -233,7 +286,8 @@ class Crystallizer:
         prompt = CRYSTALLIZATION_PROMPT.format(observations=observations_text)
 
         try:
-            result = _call_llm(prompt)
+            raw = call_llm(prompt, max_tokens=1024, temperature=0)
+            result = json.loads(raw)
         except Exception:
             # If synthesis fails, fall back to simple promotion
             return self._fallback_promote(group)

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -187,16 +188,19 @@ class TestThreadDetector:
         assert len(clusters[0]) == 3
 
     def test_unrelated_memories_no_thread(self, store):
-        _create_memory(store, "Python thing", "Content", tags=["python"])
-        _create_memory(store, "Rust thing", "Content", tags=["rust"])
+        _create_memory(store, "Python garbage collection internals", "CPython reference counting and generational GC", tags=["python"])
+        _create_memory(store, "Rust borrow checker rules", "Ownership model and lifetime annotations", tags=["rust"])
         ids = [
-            _create_memory(store, f"Unrelated {i}", f"Content {i}", tags=[f"unique_{i}"])
-            for i in range(3)
+            _create_memory(store, "Kubernetes pod scheduling", "Node affinity and tolerations", tags=["k8s_unique"]),
+            _create_memory(store, "SQL query optimization", "Index selection and explain plans", tags=["sql_unique"]),
+            _create_memory(store, "CSS grid layout patterns", "Responsive design with minmax and auto-fill", tags=["css_unique"]),
         ]
         self._spread_timestamps(store, ids)
 
         detector = ThreadDetector(store)
-        clusters = detector.detect_threads()
+        # Force tag-overlap path — this test validates tag-based behavior
+        with patch("core.threads._get_embeddings", return_value=None):
+            clusters = detector.detect_threads()
         # No cluster should form — tags don't overlap
         assert all(len(c) < 2 for c in clusters) or len(clusters) == 0
 
@@ -300,9 +304,9 @@ class TestThreadNarrator:
             ids.append(mid)
         return [store.get(mid) for mid in ids]
 
-    @patch("core.threads._call_llm")
+    @patch("core.threads.call_llm")
     def test_narrate_produces_thread(self, mock_llm, store):
-        mock_llm.return_value = MOCK_NARRATIVE_RESPONSE
+        mock_llm.return_value = json.dumps(MOCK_NARRATIVE_RESPONSE)
         cluster = self._make_cluster(store)
 
         narrator = ThreadNarrator(store)
@@ -316,20 +320,20 @@ class TestThreadNarrator:
         assert result["confidence"] == 0.85
         assert len(result["member_ids"]) == 3
 
-    @patch("core.threads._call_llm")
+    @patch("core.threads.call_llm")
     def test_low_confidence_rejected(self, mock_llm, store):
         """LLM says these don't form a real arc → None returned."""
-        mock_llm.return_value = {
+        mock_llm.return_value = json.dumps({
             **MOCK_NARRATIVE_RESPONSE,
             "confidence": 0.2,
-        }
+        })
         cluster = self._make_cluster(store)
 
         narrator = ThreadNarrator(store)
         result = narrator.narrate_cluster(cluster)
         assert result is None
 
-    @patch("core.threads._call_llm", side_effect=Exception("LLM down"))
+    @patch("core.llm.call_llm", side_effect=Exception("LLM down"))
     def test_llm_failure_returns_none(self, mock_llm, store):
         cluster = self._make_cluster(store)
 
@@ -359,9 +363,9 @@ class TestThreadNarrator:
 
 class TestBuildThreads:
 
-    @patch("core.threads._call_llm")
+    @patch("core.threads.call_llm")
     def test_end_to_end(self, mock_llm, store):
-        mock_llm.return_value = MOCK_NARRATIVE_RESPONSE
+        mock_llm.return_value = json.dumps(MOCK_NARRATIVE_RESPONSE)
 
         start = datetime(2026, 1, 1)
         ids = []
@@ -383,7 +387,7 @@ class TestBuildThreads:
         thread = store.get_thread(created[0]["id"])
         assert len(thread["member_ids"]) == 3
 
-    @patch("core.threads._call_llm")
+    @patch("core.threads.call_llm")
     def test_no_clusters_no_threads(self, mock_llm, store):
         """No related memories → no threads created."""
         _create_memory(store, "Lonely", "Content", tags=["unique_tag"])
@@ -544,3 +548,113 @@ class TestBatchThreadQuery:
         result_ids = {t["id"] for t in result}
         assert tid_a in result_ids
         assert tid_b in result_ids
+
+
+# ---------------------------------------------------------------------------
+# Embedding helpers (deterministic, no real model loaded)
+# ---------------------------------------------------------------------------
+
+
+def _fake_embeddings(n, dim=384, seed=42):
+    """Return n unit-normed random embeddings seeded for determinism."""
+    rng = np.random.default_rng(seed)
+    raw = rng.standard_normal((n, dim))
+    norms = np.linalg.norm(raw, axis=1, keepdims=True)
+    return raw / np.maximum(norms, 1e-9)
+
+
+def _cluster_embeddings(n, cluster_size=2):
+    """Return embeddings where the first cluster_size items are highly similar (cosine > 0.9).
+
+    Uses noise scale 0.01 so the cluster pair cosine similarity ~0.97, which comfortably
+    exceeds the thread clustering threshold of 0.70.
+    """
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal(384)
+    base /= np.linalg.norm(base)
+    similar = base + rng.standard_normal((cluster_size, 384)) * 0.01
+    dissimilar = rng.standard_normal((n - cluster_size, 384))
+    all_vecs = np.vstack([similar, dissimilar])
+    norms = np.linalg.norm(all_vecs, axis=1, keepdims=True)
+    return all_vecs / np.maximum(norms, 1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Embedding-based thread clustering (D-09, D-10)
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingClustering:
+    """Tests for embedding-based clustering in ThreadDetector.detect_threads."""
+
+    def _spread_timestamps(self, store, mem_ids, start=None, gap_hours=48):
+        """Set created_at timestamps with a gap between each memory."""
+        if start is None:
+            start = datetime(2026, 1, 1)
+        for i, mid in enumerate(mem_ids):
+            ts = (start + timedelta(hours=i * gap_hours)).isoformat()
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute(
+                    "UPDATE memories SET created_at = ? WHERE id = ?",
+                    (ts, mid),
+                )
+
+    def test_semantically_similar_memories_cluster(self, store):
+        """Memories with highly similar embeddings form at least one cluster."""
+        ids = [
+            _create_memory(
+                store, f"Async Fix {i}", f"Fixed async issue {i}",
+                tags=["type:correction", "async"],
+            )
+            for i in range(3)
+        ]
+        self._spread_timestamps(store, ids)
+
+        embeddings = _cluster_embeddings(3, cluster_size=3)
+        detector = ThreadDetector(store)
+
+        with patch("core.threads._get_embeddings", return_value=embeddings):
+            clusters = detector.detect_threads()
+
+        assert len(clusters) >= 1
+
+    def test_semantically_dissimilar_memories_do_not_cluster(self, store):
+        """Memories with dissimilar embeddings and no tag overlap do not cluster."""
+        ids = [
+            _create_memory(
+                store, f"Unrelated Topic {i}", f"Content about unrelated subject {i}",
+                tags=[f"unique_embed_tag_{i}"],
+            )
+            for i in range(3)
+        ]
+        self._spread_timestamps(store, ids)
+
+        embeddings = _fake_embeddings(3)
+        detector = ThreadDetector(store)
+
+        with patch("core.threads._get_embeddings", return_value=embeddings):
+            clusters = detector.detect_threads()
+
+        # Random unit vectors are far below the 0.70 clustering threshold.
+        assert all(len(c) < 2 for c in clusters) or len(clusters) == 0
+
+    def test_clustering_fallback_when_unavailable(self, store):
+        """When _get_embeddings returns None, tag-overlap fallback still forms clusters."""
+        ids = [
+            _create_memory(
+                store, f"Tag Cluster {i}", f"Content {i}",
+                tags=["type:correction", "fallback-topic"],
+            )
+            for i in range(3)
+        ]
+        self._spread_timestamps(store, ids)
+
+        detector = ThreadDetector(store)
+
+        with patch("core.threads._get_embeddings", return_value=None):
+            clusters = detector.detect_threads()
+
+        # All three share "fallback-topic" → tag-overlap fallback groups them.
+        assert len(clusters) >= 1
+        all_member_ids = {m["id"] for c in clusters for m in c}
+        assert all(mid in all_member_ids for mid in ids)
