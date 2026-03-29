@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from .database import get_base_dir
+from .database import get_base_dir, get_vec_store
 from .models import Memory, NarrativeThread, RetrievalLog, ThreadMember, db
 
 if TYPE_CHECKING:
@@ -71,14 +71,22 @@ class RetrievalEngine:
         self,
         session_id: str,
         project_context: str = None,
+        query: str = None,
+        query_embedding: bytes | None = None,
     ) -> str:
         """
         Build the full memory context string for injection into a session.
+
+        If ``query`` is provided, Tier 2 retrieval uses hybrid RRF ranking
+        instead of the static sort.  ``query_embedding`` is optional; when
+        absent the vector leg is skipped and FTS-only RRF applies.
         """
         tier1 = self.get_instinctive_memories()
         tier2 = self.get_crystallized_for_context(
             project_context=project_context,
             token_limit=self.token_limit,
+            query=query,
+            query_embedding=query_embedding,
         )
 
         # Log injections for every memory surfaced
@@ -142,12 +150,45 @@ class RetrievalEngine:
         limit: int = 10,
     ) -> list[dict]:
         """
-        Agent-initiated FTS search (Tier 3) with progressive disclosure.
-        """
-        results = Memory.search_fts(query, limit=limit)
+        Agent-initiated hybrid search (Tier 3) with progressive disclosure.
 
+        Uses hybrid_search (FTS + optional vector) via RRF fusion.  If the
+        Bedrock embedding API is unavailable, gracefully falls back to FTS-only
+        ranking.  Hydrates Memory objects from the ranked IDs and returns them
+        as dicts with progressive-disclosure fields.
+        """
+        # Attempt to get query embedding (lazy import avoids import-time Bedrock dependency)
+        query_embedding = None
+        try:
+            from .embeddings import embed_text
+            query_embedding = embed_text(query)
+        except Exception:
+            pass  # FTS-only fallback
+
+        # Run hybrid RRF fusion (falls back to FTS-only if query_embedding is None)
+        ranked = self.hybrid_search(
+            query=query,
+            query_embedding=query_embedding,
+            k=limit,
+            vec_store=get_vec_store(),
+        )
+
+        if not ranked:
+            return []
+
+        # Hydrate Memory objects in ranked order
+        ranked_ids = [mid for mid, _ in ranked]
+        memories_by_id = {
+            m.id: m
+            for m in Memory.select().where(Memory.id.in_(ranked_ids))
+        }
+
+        # Preserve RRF order when building the output
         disclosed = []
-        for memory in results:
+        for memory_id, rrf_score in ranked:
+            memory = memories_by_id.get(memory_id)
+            if memory is None:
+                continue
             disclosed.append({
                 "id": memory.id,
                 "title": memory.title,
@@ -156,7 +197,7 @@ class RetrievalEngine:
                 "importance": memory.importance or 0.5,
                 "stage": memory.stage,
                 "tags": memory.tag_list,
-                "rank": getattr(memory, '_rank', None),
+                "rank": rrf_score,
                 "project_context": memory.project_context,
             })
 
@@ -291,14 +332,30 @@ class RetrievalEngine:
         self,
         project_context: str = None,
         token_limit: int = None,
+        query: str = None,
+        query_embedding: bytes | None = None,
     ) -> list:
         """
         Return token-budgeted crystallized memories, optionally boosted by
         project context.
+
+        When ``query`` is provided, uses hybrid RRF ranking (FTS + optional
+        vector) instead of the static three-pass sort.  When ``query`` is None,
+        preserves the original static sort behaviour exactly (backward
+        compatible — SessionStart injection has no query).
         """
         if token_limit is None:
             token_limit = self.token_limit
 
+        if query is not None:
+            return self._crystallized_hybrid(
+                query=query,
+                query_embedding=query_embedding,
+                project_context=project_context,
+                token_limit=token_limit,
+            )
+
+        # --- Static path (no query) — preserved exactly as before --------------
         records = list(Memory.by_stage("crystallized"))
 
         # Three-pass stable sort
@@ -334,6 +391,67 @@ class RetrievalEngine:
 
             if cost <= budget_remaining:
                 selected.append(record)
+                budget_remaining -= cost
+
+        return selected
+
+    def _crystallized_hybrid(
+        self,
+        query: str,
+        query_embedding: bytes | None,
+        project_context: str | None,
+        token_limit: int,
+    ) -> list:
+        """
+        Hybrid RRF path for get_crystallized_for_context when a query is provided.
+
+        1. Run hybrid_search to get (memory_id, rrf_score) ranked list.
+        2. Hydrate Memory objects from ranked IDs.
+        3. Apply project_context boost (small RRF bonus keeps local memories competitive).
+        4. Re-sort by boosted score.
+        5. Apply greedy token budget packing.
+        """
+        # RRF_K constant used for the boost term (same constant as hybrid_search default)
+        _RRF_K = 60
+        PROJECT_BOOST = 1.0 / (_RRF_K + 0.5)  # ~0.01639
+
+        ranked = self.hybrid_search(
+            query=query,
+            query_embedding=query_embedding,
+            k=50,  # over-fetch to give token budget room to select
+            vec_store=get_vec_store(),
+        )
+
+        if not ranked:
+            return []
+
+        ranked_ids = [mid for mid, _ in ranked]
+        memories_by_id = {
+            m.id: m
+            for m in Memory.select().where(Memory.id.in_(ranked_ids))
+        }
+
+        # Build score table with optional project_context boost
+        scored: list[tuple[float, Memory]] = []
+        for memory_id, rrf_score in ranked:
+            memory = memories_by_id.get(memory_id)
+            if memory is None:
+                continue
+            boost = 0.0
+            if project_context is not None and memory.project_context == project_context:
+                boost = PROJECT_BOOST
+            scored.append((rrf_score + boost, memory))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Greedy token budget
+        budget_remaining = token_limit
+        selected = []
+        for _, memory in scored:
+            content = memory.content or ""
+            cost = len(content)
+            if cost <= budget_remaining:
+                selected.append(memory)
                 budget_remaining -= cost
 
         return selected
