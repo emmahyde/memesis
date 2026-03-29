@@ -114,11 +114,63 @@
       "labeling_notes": "This session exposed a pipeline bug: scan's 12K char cap treats 484-message sessions the same as 8-message sessions. Fixed in b6d1b21."
     }
   ],
+  "expected_merges": [
+    {
+      "ids": [7, 13],
+      "titles": ["Autonomous multi-step investigation without check-ins", "Unattended execution mode: no check-ins, no confirmations, just output"],
+      "reason": "Same pattern described differently — both capture 'Claude runs long chains without asking for direction'"
+    },
+    {
+      "ids": [9, 12],
+      "titles": ["Iterative review loop with fix log as source of truth", "Iterative review rounds tracked via fix_findings_log as source of truth"],
+      "reason": "Identical observation created twice with slightly different wording"
+    },
+    {
+      "ids": [1, 18],
+      "titles": ["Gives terse, directive corrections without over-explaining", "Commands are terse and assume full context — no scaffolding needed"],
+      "reason": "Overlapping — #1 is about corrections specifically, #18 is the general pattern. #1 should merge into #18"
+    }
+  ],
+  "misclassifications": [
+    {
+      "ids": [37, 16, 8, 17, 4, 56, 60, 64, 66, 73, 74, 77, 78, 81, 87],
+      "current_type": "self_observation",
+      "expected_type": "workflow_pattern",
+      "reason": "These are operational lessons about how to work effectively, not self-reflective personality observations. 'Verify tests pass on origin/main before blaming your changes' is a workflow rule, not a self-observation."
+    }
+  ],
+  "missing_global": {
+    "frustration_signals": [
+      "Frustration manifests as message compression — sentences shrink to fragments to single words as patience drops",
+      "When Claude misses something obvious, the correction is factual and cold — no softening, no 'it's okay'",
+      "Escalation pattern: redirect → abandon → nuke. 'compare to origin/main' → 'forget this part' → 'Delete all your memories'",
+      "Never repeats instructions — if Claude didn't get it the first time, she either kills the approach or gives a one-line factual redirect",
+      "Never explains WHY she's frustrated — just states the correction and moves on. The absence of explanation IS the frustration signal",
+      "Interrupts immediately when Claude investigates the wrong thing — doesn't let it play out to see if it converges"
+    ],
+    "collaboration_patterns": [
+      "Audits Claude's output in real-time and catches bugs before Claude does",
+      "Corrects by stating facts, not giving instructions — describes the world, expects Claude to derive the action",
+      "Uses abstract verbs that delegate scope determination — 'resolve', 'process', 'fix' mean 'figure out what this requires and do all of it'",
+      "Reads library/gem source code when docs don't answer the question — expects Claude to do the same",
+      "Works across 5+ repos in the same day — expects Claude to maintain cross-repo context",
+      "Has a personal game project (Sector) alongside work — completely different mode, creative rather than operational",
+      "One-shot mode exists alongside long building sessions — not every session is a marathon"
+    ],
+    "observation_quality": [
+      "Observation count should be proportional to session length — 484 messages should produce far more than 9 observations",
+      "Causal links between observations are consistently missed — system captures the WHAT but not the WHY",
+      "Observation titles sometimes read as judgmental rather than descriptive — 'cut-and-abandon' vs 'decisive about what's not worth finishing'"
+    ]
+  },
   "meta": {
     "total_correct_extractions": 22,
     "total_false_reinforcements": 6,
-    "total_missing": 10,
+    "total_missing_per_session": 10,
+    "total_missing_global": 16,
     "precision": "22 / (22 + 6) = 78.6%",
-    "recall_notes": "10 missing observations across 6 sessions. True recall unmeasurable without exhaustive labeling, but directionally: the system misses causal links, communication patterns, and meta-observations about the user's relationship with Claude's output."
+    "expected_merge_count": 3,
+    "misclassified_count": 15,
+    "recall_notes": "System consistently misses: causal links between events, communication micro-patterns (fact-stating vs instruction-giving), frustration signals, and proportional extraction from long sessions."
   }
 }
