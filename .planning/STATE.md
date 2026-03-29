@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 07-hybrid-rrf-retrieval-02-PLAN.md
-last_updated: "2026-03-29T22:25:58.888Z"
+stopped_at: Completed 08-prompt-aware-tier-2-injection-01-PLAN.md
+last_updated: "2026-03-29T22:37:22.016Z"
 last_activity: 2026-03-29 — Phases 1-6 (cleanup) complete, gold set eval wired into report
 progress:
   total_phases: 27
-  completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
+  completed_phases: 2
+  total_plans: 3
+  completed_plans: 3
   percent: 33
 ---
 
@@ -55,6 +55,7 @@ Progress: [███░░░░░░░] 33%
 | Phase 00.5-ai-eval-harness P03 | 2 | 2 tasks | 3 files |
 | Phase 07-hybrid-rrf-retrieval P01 | 15 | 1 tasks | 2 files |
 | Phase 07-hybrid-rrf-retrieval P02 | 5 | 2 tasks | 4 files |
+| Phase 08-prompt-aware-tier-2-injection P01 | 2 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -80,6 +81,9 @@ Recent decisions affecting current work:
 - [Phase 07-hybrid-rrf-retrieval]: inject_for_session does not call embed_text - embedding responsibility belongs to the hook caller for 500ms budget
 - [Phase 07-hybrid-rrf-retrieval]: active_search calls embed_text lazily - Tier 3 latency acceptable, Tier 2 is not
 - [Phase 07-hybrid-rrf-retrieval]: project_context boost = 1/(60+0.5) added to RRF score - keeps local memories competitive without overriding strong semantic matches
+- [Phase 08-prompt-aware-tier-2-injection]: Embedding computed once in search_and_inject, reused by both Tier 2 get_crystallized_for_context and Tier 3 hybrid_search — no extra latency
+- [Phase 08-prompt-aware-tier-2-injection]: Tier 2 results prioritised before Tier 3 JIT in merged candidates; Tier 2 IDs excluded from Tier 3 to prevent duplication
+- [Phase 08-prompt-aware-tier-2-injection]: token_limit=TOKEN_BUDGET_CHARS (2000) passed to get_crystallized_for_context overriding engine default to respect hook budget
 
 ### Pending Todos
 
@@ -93,6 +97,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T22:19:59.818Z
-Stopped at: Completed 07-hybrid-rrf-retrieval-02-PLAN.md
+Last session: 2026-03-29T22:37:22.013Z
+Stopped at: Completed 08-prompt-aware-tier-2-injection-01-PLAN.md
 Resume file: None

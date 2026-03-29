@@ -21,7 +21,7 @@
 ### Foundation
 
 - [x] **FOUND-01**: Implement Hybrid RRF retrieval — fuse FTS5 BM25 + sqlite-vec KNN using Reciprocal Rank Fusion (~30 lines, 0 deps)
-- [ ] **FOUND-02**: Wire user prompt text into Tier 2 injection path (currently context-free, only project match)
+- [x] **FOUND-02**: Wire user prompt text into Tier 2 injection path (currently context-free, only project match)
 - [ ] **FOUND-03**: Implement Thompson sampling for memory selection using Beta(usage_count+1, unused_count+1) from stdlib
 - [ ] **FOUND-04**: Add provenance signals at injection time — "established across N sessions over M weeks" metadata in injection format
 
@@ -81,7 +81,7 @@
 | CLEAN-05 | Phase 5 | Pending |
 | CLEAN-06 | Phase 6 | Pending |
 | FOUND-01 | Phase 7 | Complete |
-| FOUND-02 | Phase 8 | Pending |
+| FOUND-02 | Phase 8 | Complete |
 | FOUND-03 | Phase 9 | Pending |
 | FOUND-04 | Phase 10 | Pending |
 | OBSV-01 | Phase 11 | Pending |
