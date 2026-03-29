@@ -25,6 +25,7 @@ DEFAULTS = {
     "prompt_aware_tier2": True,
     "thompson_sampling": True,
     "provenance_signals": True,
+    "orienting_detector": True,
 }
 
 _cache: dict | None = None
