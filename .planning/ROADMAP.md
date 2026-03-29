@@ -72,7 +72,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Baseline scores are captured against current FTS-only retrieval and logged to `.planning/eval-baseline.json`
   4. A verifier hook exists that runs the eval suite after each phase and logs the delta from baseline
   5. `pytest eval/ -q` runs the full suite in under 60 seconds
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 00.5-01-PLAN.md — Internal metrics module (precision@k, MRR, prune accuracy, injection utility rate) + conftest guard
+- [ ] 00.5-02-PLAN.md — LongMemEval adapter with 10-question fixture and scoring logic
+- [ ] 00.5-03-PLAN.md — Baseline capture script + verifier hook + eval-baseline.json
 
 ### Phase 1: Commit ORM Migration
 **Goal**: The Peewee ORM migration is committed to git in clean, atomic commits, and the agent output transcripts exist as research files on disk
@@ -336,7 +341,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 0.5. AI Eval Harness (INSERTED) | 0/? | Not started | - |
+| 0.5. AI Eval Harness (INSERTED) | 0/3 | Not started | - |
 | 1. Commit ORM Migration | 0/? | Not started | - |
 | 2. Write Research Files | 0/? | Not started | - |
 | 3. Remove file_path Field | 0/? | Not started | - |
