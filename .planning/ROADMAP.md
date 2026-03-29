@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 ### v1 — Eval Framework
 
-- [ ] **Phase 0.5: AI Eval Harness** *(INSERTED)* - Build eval framework FIRST so every subsequent phase has a measurable baseline
+- [x] **Phase 0.5: AI Eval Harness** *(INSERTED)* - Build eval framework FIRST so every subsequent phase has a measurable baseline (completed 2026-03-29)
 
 ### v1 — Cleanup
 
@@ -341,7 +341,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 0.5. AI Eval Harness (INSERTED) | 0/3 | Not started | - |
+| 0.5. AI Eval Harness (INSERTED) | 0/3 | Complete    | 2026-03-29 |
 | 1. Commit ORM Migration | 0/? | Not started | - |
 | 2. Write Research Files | 0/? | Not started | - |
 | 3. Remove file_path Field | 0/? | Not started | - |
