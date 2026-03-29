@@ -17,6 +17,7 @@ Usage:
     python3 scripts/reduce.py --dry-run                # Print prompt, don't call LLM
     python3 scripts/reduce.py --report                 # Print current store state
     python3 scripts/reduce.py --db eval/eval.db --reset  # Isolated eval dataset
+    python3 scripts/reduce.py --sample 10 --seed 42      # Deterministic 10% sample
 
 Pipeline:
     scan.py → reduce.py → seed.py
@@ -352,6 +353,7 @@ def main():
 
     limit, focus, dry_run, report_only, reset, project = None, None, False, False, False, None
     db_path, summaries_dir = None, None
+    sample_pct, sample_seed = None, 42
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -365,6 +367,10 @@ def main():
             db_path = Path(args[i + 1]); i += 2
         elif args[i] == "--summaries-dir" and i + 1 < len(args):
             summaries_dir = Path(args[i + 1]); i += 2
+        elif args[i] == "--sample" and i + 1 < len(args):
+            sample_pct = float(args[i + 1]); i += 2
+        elif args[i] == "--seed" and i + 1 < len(args):
+            sample_seed = int(args[i + 1]); i += 2
         elif args[i] == "--dry-run":
             dry_run = True; i += 1
         elif args[i] == "--report":
@@ -400,6 +406,15 @@ def main():
         with open(sf) as f:
             for line in f:
                 summaries.append(json.loads(line))
+
+    if sample_pct is not None:
+        import random
+        rng = random.Random(sample_seed)
+        total = len(summaries)
+        n = max(1, int(total * sample_pct / 100))
+        summaries = rng.sample(summaries, n)
+        print(f"Sampled {n}/{total} sessions ({sample_pct}%, seed={sample_seed})", file=sys.stderr)
+
     if limit:
         summaries = summaries[:limit]
 
