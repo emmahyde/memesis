@@ -137,3 +137,106 @@ class TestAlreadyInjected:
         mem = _make_memory(stage='crystallized')
         _record_injection(mem.id, "sess-001")
         assert mem.id not in get_already_injected("sess-002")
+
+
+class TestSearchAndInjectHybrid:
+    """Tests for hybrid wiring in search_and_inject (via RetrievalEngine)."""
+
+    def test_search_and_inject_uses_hybrid_search(self, base, monkeypatch):
+        """search_and_inject calls hybrid_search via RetrievalEngine instead of raw Memory.search_fts."""
+        from core.retrieval import RetrievalEngine
+
+        _make_memory(stage='consolidated', title='Hybrid Payment Memory',
+                     content='payment pipeline processing hybrid search',
+                     summary='Hybrid payment processing details.')
+
+        hybrid_called = []
+
+        original_hybrid = RetrievalEngine.hybrid_search
+        def spy_hybrid(self, query, query_embedding=None, k=20, rrf_k=60, vec_store=None):
+            hybrid_called.append(query)
+            return original_hybrid(self, query, query_embedding, k, rrf_k, vec_store)
+
+        monkeypatch.setattr(RetrievalEngine, 'hybrid_search', spy_hybrid)
+
+        result = search_and_inject("payment pipeline processing", "sess-hybrid-001")
+
+        # hybrid_search should have been called
+        assert len(hybrid_called) > 0, "hybrid_search was not called"
+        assert "Hybrid Payment Memory" in result
+
+    def test_search_and_inject_works_when_embedding_unavailable(self, base, monkeypatch):
+        """search_and_inject still works when embedding is unavailable (FTS-only fallback)."""
+        import core.embeddings as embeddings_module
+        monkeypatch.setattr(embeddings_module, 'embed_text', lambda text, **kw: None)
+
+        _make_memory(stage='consolidated', title='Fallback Memory',
+                     content='fallback embedding unavailable content',
+                     summary='Fallback when embedding fails.')
+
+        result = search_and_inject("fallback embedding unavailable", "sess-fallback-001")
+        assert "Fallback Memory" in result
+
+    def test_search_and_inject_excludes_already_injected(self, base):
+        """search_and_inject still respects already-injected exclusion."""
+        mem = _make_memory(stage='consolidated', title='Already Injected Hybrid',
+                           content='hybrid already injected content test',
+                           summary='Already loaded via hybrid.')
+        _record_injection(mem.id, "sess-excl-001")
+
+        result = search_and_inject("hybrid already injected content test", "sess-excl-001")
+        assert "Already Injected Hybrid" not in result
+
+    def test_search_and_inject_respects_max_memories(self, base):
+        """search_and_inject still respects MAX_MEMORIES limit."""
+        for i in range(10):
+            _make_memory(stage='consolidated', title=f'Hybrid Max Memory {i}',
+                         content=f'hybrid maximum memories limit test content item {i}',
+                         summary=f'Hybrid memory {i}.')
+
+        result = search_and_inject("hybrid maximum memories limit test", "sess-max-001")
+
+        # Count the injected memory markers
+        memory_count = result.count("[Memory:")
+        from hooks.user_prompt_inject import MAX_MEMORIES
+        assert memory_count <= MAX_MEMORIES
+
+    def test_search_and_inject_respects_token_budget(self, base):
+        """search_and_inject still respects TOKEN_BUDGET_CHARS limits."""
+        _make_memory(stage='consolidated', title='Very Long Hybrid Memory',
+                     content='X' * 5000,
+                     summary='A' * 3000)
+
+        result = search_and_inject("kubernetes deployment strategy", "sess-budget-001")
+        from hooks.user_prompt_inject import TOKEN_BUDGET_CHARS
+        assert len(result) <= TOKEN_BUDGET_CHARS + 200  # small overhead allowance for formatting
+
+
+class TestHybridPerformanceUserPrompt:
+    """Performance test for hybrid search in the user prompt inject path."""
+
+    def test_hybrid_search_1000_memories_under_500ms(self, base):
+        """hybrid_search on 1000 memories completes in under 500ms (no embedding API call)."""
+        import time
+        from core.retrieval import RetrievalEngine
+
+        # Create 1000 memories with searchable content
+        for i in range(1000):
+            _make_memory(
+                stage='crystallized',
+                title=f'Perf Test Memory {i}',
+                content=f'performance test memory item number {i} with extra content for indexing',
+            )
+
+        engine = RetrievalEngine()
+        start = time.perf_counter()
+        results = engine.hybrid_search(
+            query="performance test memory",
+            query_embedding=None,
+            k=20,
+            vec_store=None,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        assert elapsed_ms < 500, f"hybrid_search took {elapsed_ms:.1f}ms, expected < 500ms"
+        assert len(results) > 0
