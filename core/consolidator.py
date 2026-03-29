@@ -77,6 +77,15 @@ class Consolidator:
         if was_filtered:
             logger.info("Privacy filter removed emotional state observations from ephemeral content")
 
+        # 2b. Habituation filter — suppress routine events before LLM call
+        base_dir = get_base_dir()
+        if base_dir:
+            from .habituation import HabituationModel
+            hab_model = HabituationModel(base_dir)
+            filtered_content, suppressed_count = hab_model.filter_observations(filtered_content)
+            if suppressed_count > 0:
+                logger.info("Habituation filter suppressed %d routine observations", suppressed_count)
+
         # 3. Build manifest summary
         manifest_summary = self._build_manifest_summary()
 
