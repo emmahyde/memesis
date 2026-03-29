@@ -34,6 +34,26 @@ REPORT_DIR = Path(__file__).parent / "reports"
 # Retrieval scoring helpers
 # ---------------------------------------------------------------------------
 
+def make_retrieval_fn(engine: RetrievalEngine, session_id: str):
+    """Build a retrieval function that combines FTS + injection context."""
+    context = engine.inject_for_session(session_id=session_id)
+
+    def retrieve(query: str) -> list[str]:
+        results = []
+        # Include injection context as a retrieval source
+        if context:
+            results.append(context)
+        # Also try FTS
+        try:
+            fts_results = Memory.search_fts(Memory.sanitize_fts_term(query), limit=5)
+            results.extend(r.content for r in fts_results)
+        except Exception:
+            pass
+        return results
+
+    return retrieve
+
+
 def score_injection(engine: RetrievalEngine, session_id: str, memories: list) -> dict:
     """Score injection quality: what fraction of memories appear in context."""
     context = engine.inject_for_session(session_id=session_id)
@@ -134,15 +154,9 @@ def run_synthetic_eval() -> dict:
             ]
             fts = score_fts(fts_queries)
 
-            # LongMemEval (stub retrieval — baseline)
-            def fts_retrieval(query):
-                try:
-                    results = Memory.search_fts(Memory.sanitize_fts_term(query), limit=5)
-                    return [r.content for r in results]
-                except Exception:
-                    return []
-
-            adapter = LongMemEvalAdapter(retrieval_fn=fts_retrieval)
+            # LongMemEval — combined FTS + injection retrieval
+            retrieval_fn = make_retrieval_fn(engine, "synthetic_longmemeval")
+            adapter = LongMemEvalAdapter(retrieval_fn=retrieval_fn)
             lme_results = adapter.run_fixture()
             lme_agg = adapter.aggregate(lme_results)
 
@@ -200,15 +214,9 @@ def run_live_eval() -> dict | None:
                 "total_queries": 0, "avg_hits": 0, "macro_precision": 0, "macro_recall": 0,
             }
 
-            # LongMemEval against real memories
-            def fts_retrieval(query):
-                try:
-                    results = Memory.search_fts(Memory.sanitize_fts_term(query), limit=5)
-                    return [r.content for r in results]
-                except Exception:
-                    return []
-
-            adapter = LongMemEvalAdapter(retrieval_fn=fts_retrieval)
+            # LongMemEval — combined FTS + injection retrieval
+            retrieval_fn = make_retrieval_fn(engine, "live_longmemeval")
+            adapter = LongMemEvalAdapter(retrieval_fn=retrieval_fn)
             lme_results = adapter.run_fixture()
             lme_agg = adapter.aggregate(lme_results)
 

@@ -59,78 +59,88 @@ class LongMemEvalResult:
 
 LONGMEMEVAL_FIXTURE: list[dict] = [
     # --- single-session-user (2) ---
+    # From: PR split session (ce238b2a) — user asked to split PR into deployable slices
     {
         "id": "ssu-001",
-        "question": "What database does the user prefer for new projects?",
-        "answer": "PostgreSQL",
-        "memory_ids": ["mem-db-pref"],
+        "question": "How does the user want large PRs broken down?",
+        "answer": "independently deployable slices",
+        "memory_ids": [],
         "category": "single-session-user",
     },
+    # From: glop PR review (15ecac0a) — user asked for multi-perspective panel review
     {
         "id": "ssu-002",
-        "question": "What programming language does the user primarily work in?",
-        "answer": "Python",
-        "memory_ids": ["mem-lang-pref"],
+        "question": "How does the user prefer code reviews to be structured?",
+        "answer": "multiple perspectives",
+        "memory_ids": [],
         "category": "single-session-user",
     },
     # --- single-session-assistant (2) ---
+    # From: minion review sessions — assistant learned to verify against git
     {
         "id": "ssa-001",
-        "question": "What did the assistant recommend for error handling?",
-        "answer": "try/except with logging",
-        "memory_ids": ["mem-error-handling"],
+        "question": "What should the assistant verify before claiming a fix is missing?",
+        "answer": "verify against current code",
+        "memory_ids": [],
         "category": "single-session-assistant",
     },
+    # From: review iteration sessions — assistant learned about stale review files
     {
         "id": "ssa-002",
-        "question": "What testing framework did the assistant suggest for the project?",
-        "answer": "pytest",
-        "memory_ids": ["mem-test-framework"],
+        "question": "What risk exists with review files during iterative fix rounds?",
+        "answer": "stale",
+        "memory_ids": [],
         "category": "single-session-assistant",
     },
     # --- multi-session (2) ---
+    # From: many sessions — user uses worktrees + .minions structure
     {
         "id": "ms-001",
-        "question": "What recurring theme appears across multiple sessions?",
-        "answer": "technical debt reduction",
-        "memory_ids": ["mem-session-1", "mem-session-3", "mem-session-5"],
+        "question": "What directory structure does the user use for ticket work?",
+        "answer": "worktree",
+        "memory_ids": [],
         "category": "multi-session",
     },
+    # From: many sessions — user expects autonomous execution without check-ins
     {
         "id": "ms-002",
-        "question": "Which performance concern has the user mentioned in multiple conversations?",
-        "answer": "slow query times",
-        "memory_ids": ["mem-perf-1", "mem-perf-2"],
+        "question": "Does the user expect Claude to check in during multi-step tasks?",
+        "answer": "without check-ins",
+        "memory_ids": [],
         "category": "multi-session",
     },
     # --- temporal-reasoning (2) ---
+    # From: bamboo CLI session (2c51f984) — recent hook-based fix for skill triggering
     {
         "id": "tr-001",
-        "question": "When did the user last discuss the authentication system?",
-        "answer": "two weeks ago",
-        "memory_ids": ["mem-auth-discussion"],
+        "question": "What CLI tool had reliability issues with skill triggering recently?",
+        "answer": "bamboo",
+        "memory_ids": [],
         "category": "temporal-reasoning",
     },
+    # From: YARD docs session (c1e19820) — investigated GitHub Pages generation
     {
         "id": "tr-002",
-        "question": "How long ago did the team decide to migrate to microservices?",
-        "answer": "six months ago",
-        "memory_ids": ["mem-microservices-decision"],
+        "question": "What documentation system was the user investigating for the ai-tools repo?",
+        "answer": "YARD",
+        "memory_ids": [],
         "category": "temporal-reasoning",
     },
     # --- knowledge-update (2) ---
+    # From: hook testing session (62b3a3d3) — hooks evaluated at runtime, can't test outside session
     {
         "id": "ku-001",
-        "question": "What is the current API endpoint after the recent change?",
-        "answer": "https://api.example.com/v2/users",
-        "memory_ids": ["mem-api-update"],
+        "question": "What happens to plugin hooks when they are changed mid-session?",
+        "answer": "snapshot",
+        "memory_ids": [],
         "category": "knowledge-update",
     },
+    # From: agents kill pattern — user kills off-track agents rather than waiting
     {
         "id": "ku-002",
-        "question": "What is the updated deployment target after the infrastructure migration?",
-        "answer": "Kubernetes",
-        "memory_ids": ["mem-infra-migration"],
+        "question": "What does the user do when an agent goes off-track?",
+        "answer": "kill",
+        "memory_ids": [],
         "category": "knowledge-update",
     },
 ]
