@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 09-thompson-sampling-selection-01-PLAN.md
-last_updated: "2026-03-29T23:01:49.019Z"
+stopped_at: Completed 10-provenance-signals-01-PLAN.md
+last_updated: "2026-03-29T23:13:52.300Z"
 last_activity: 2026-03-29 — Phases 1-6 (cleanup) complete, gold set eval wired into report
 progress:
   total_phases: 27
-  completed_phases: 3
-  total_plans: 4
-  completed_plans: 4
+  completed_phases: 4
+  total_plans: 5
+  completed_plans: 5
   percent: 33
 ---
 
@@ -57,6 +57,7 @@ Progress: [███░░░░░░░] 33%
 | Phase 07-hybrid-rrf-retrieval P02 | 5 | 2 tasks | 4 files |
 | Phase 08-prompt-aware-tier-2-injection P01 | 2 | 1 tasks | 2 files |
 | Phase 09-thompson-sampling-selection P01 | 12 | 1 tasks | 2 files |
+| Phase 10-provenance-signals P01 | 3 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -87,6 +88,9 @@ Recent decisions affecting current work:
 - [Phase 08-prompt-aware-tier-2-injection]: token_limit=TOKEN_BUDGET_CHARS (2000) passed to get_crystallized_for_context overriding engine default to respect hook budget
 - [Phase 09-thompson-sampling-selection]: Thompson sampling re-orders ranked list, does not replace ranking - exploration layered on top of RRF or static sort
 - [Phase 09-thompson-sampling-selection]: Existing deterministic-order tests patched with thompson_sampling=False via monkeypatch to isolate static code path
+- [Phase 10-provenance-signals]: Provenance computed after injection logging so current session is included in session count - reflects actual retrieval history
+- [Phase 10-provenance-signals]: Batch query uses peewee fn.COUNT(field.distinct()) + fn.MIN in single SELECT GROUP BY - avoids N+1 queries for provenance computation
+- [Phase 10-provenance-signals]: Memory.created_at used as fallback for single/zero-session memories; week phrase is floor(days/7) with 'over less than a week' when 0
 
 ### Pending Todos
 
@@ -100,6 +104,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T22:58:58.040Z
-Stopped at: Completed 09-thompson-sampling-selection-01-PLAN.md
+Last session: 2026-03-29T23:13:52.297Z
+Stopped at: Completed 10-provenance-signals-01-PLAN.md
 Resume file: None
