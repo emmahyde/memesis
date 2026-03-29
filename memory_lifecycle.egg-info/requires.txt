@@ -1,0 +1,9 @@
+anthropic>=0.40.0
+
+[dev]
+pytest>=8.0
+
+[eval]
+inspect-ai
+ragas
+deepeval

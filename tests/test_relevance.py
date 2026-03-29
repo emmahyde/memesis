@@ -1,0 +1,403 @@
+"""
+Tests for the RelevanceEngine — scoring, archival, and rehydration.
+"""
+
+import sqlite3
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from core.relevance import RelevanceEngine, ARCHIVE_THRESHOLD, REHYDRATE_THRESHOLD
+from core.storage import MemoryStore
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_store(tmp_path):
+    return MemoryStore(base_dir=str(tmp_path / "memory"))
+
+
+@pytest.fixture
+def engine(tmp_store):
+    return RelevanceEngine(store=tmp_store)
+
+
+def _create_memory(store, title, stage="consolidated", importance=0.5,
+                    days_ago=0, usage_count=0, injection_count=0,
+                    project_context=None):
+    """Helper to create a memory with specific age and usage."""
+    memory_id = store.create(
+        path=f"{title.replace(' ', '_').lower()}.md",
+        content=f"Content about {title}",
+        metadata={
+            "stage": stage,
+            "title": title,
+            "summary": f"Summary of {title}",
+            "tags": [title.split()[0].lower()],
+            "importance": importance,
+        },
+    )
+
+    # Always apply overrides via raw SQL so we can set fields that
+    # store.create() doesn't accept (usage_count, injection_count, etc.)
+    past = (datetime.now() - timedelta(days=days_ago)).isoformat()
+    updates = {"updated_at": past, "created_at": past}
+    if days_ago > 0:
+        updates["last_injected_at"] = past
+        updates["last_used_at"] = past if usage_count > 0 else None
+    if usage_count > 0:
+        updates["usage_count"] = usage_count
+    if injection_count > 0:
+        updates["injection_count"] = injection_count
+    if project_context:
+        updates["project_context"] = project_context
+
+    with sqlite3.connect(store.db_path) as conn:
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [memory_id]
+        conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+
+    return memory_id
+
+
+# ---------------------------------------------------------------------------
+# Relevance scoring
+# ---------------------------------------------------------------------------
+
+class TestComputeRelevance:
+    def test_fresh_high_importance_scores_high(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Important Fresh", importance=0.9, days_ago=1)
+        memory = tmp_store.get(mid)
+        score = engine.compute_relevance(memory)
+        assert score > 0.7
+
+    def test_old_low_importance_scores_low(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Old Boring", importance=0.15, days_ago=180)
+        memory = tmp_store.get(mid)
+        score = engine.compute_relevance(memory)
+        assert score < 0.3
+
+    def test_recency_decays_over_time(self, engine, tmp_store):
+        mid1 = _create_memory(tmp_store, "Fresh One", importance=0.5, days_ago=1)
+        mid2 = _create_memory(tmp_store, "Old One", importance=0.5, days_ago=120)
+
+        score_fresh = engine.compute_relevance(tmp_store.get(mid1))
+        score_old = engine.compute_relevance(tmp_store.get(mid2))
+        assert score_fresh > score_old
+
+    def test_usage_boosts_relevance(self, engine, tmp_store):
+        mid_used = _create_memory(tmp_store, "Used Memory", importance=0.5,
+                                   usage_count=5, injection_count=10)
+        mid_unused = _create_memory(tmp_store, "Unused Memory", importance=0.5,
+                                     usage_count=0, injection_count=10)
+
+        score_used = engine.compute_relevance(tmp_store.get(mid_used))
+        score_unused = engine.compute_relevance(tmp_store.get(mid_unused))
+        assert score_used > score_unused
+
+    def test_context_match_boosts_relevance(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Project Mem", importance=0.5,
+                              project_context="/home/user/myproject")
+        memory = tmp_store.get(mid)
+
+        score_match = engine.compute_relevance(memory, project_context="/home/user/myproject")
+        score_nomatch = engine.compute_relevance(memory, project_context="/other/project")
+        assert score_match > score_nomatch
+
+    def test_score_is_bounded_zero_one(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Extreme", importance=1.0, days_ago=0,
+                              usage_count=100, injection_count=1)
+        memory = tmp_store.get(mid)
+        score = engine.compute_relevance(memory, project_context="match")
+        assert 0.0 <= score <= 1.0
+
+    def test_very_old_memory_has_low_but_nonzero_score(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Ancient", importance=0.5, days_ago=365)
+        memory = tmp_store.get(mid)
+        score = engine.compute_relevance(memory)
+        assert 0.0 < score < 0.3
+
+
+# ---------------------------------------------------------------------------
+# Archival
+# ---------------------------------------------------------------------------
+
+class TestArchival:
+    def test_stale_memory_is_archival_candidate(self, engine, tmp_store):
+        _create_memory(tmp_store, "Stale Mem", importance=0.05, days_ago=300)
+        candidates = engine.get_archival_candidates()
+        assert len(candidates) >= 1
+        assert candidates[0]["title"] == "Stale Mem"
+
+    def test_fresh_memory_is_not_archival_candidate(self, engine, tmp_store):
+        _create_memory(tmp_store, "Fresh Mem", importance=0.8, days_ago=1)
+        candidates = engine.get_archival_candidates()
+        assert len(candidates) == 0
+
+    def test_archive_stale_sets_archived_at(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "To Archive", importance=0.05, days_ago=300)
+        archived = engine.archive_stale()
+        assert len(archived) == 1
+
+        # Verify it's actually archived in the DB
+        with sqlite3.connect(tmp_store.db_path) as conn:
+            row = conn.execute(
+                "SELECT archived_at FROM memories WHERE id = ?", (mid,)
+            ).fetchone()
+        assert row[0] is not None
+
+    def test_archived_excluded_from_list_by_stage(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Hidden", importance=0.05, days_ago=300)
+        engine.archive_stale()
+
+        active = tmp_store.list_by_stage("consolidated")
+        assert not any(m["id"] == mid for m in active)
+
+    def test_archived_included_with_flag(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Hidden But Findable", importance=0.05, days_ago=300)
+        engine.archive_stale()
+
+        all_memories = tmp_store.list_by_stage("consolidated", include_archived=True)
+        assert any(m["id"] == mid for m in all_memories)
+
+    def test_archive_logs_consolidation(self, engine, tmp_store):
+        _create_memory(tmp_store, "Log Test", importance=0.05, days_ago=300)
+        engine.archive_stale()
+
+        with sqlite3.connect(tmp_store.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM consolidation_log WHERE to_stage = 'archived'"
+            ).fetchone()
+        assert row is not None
+
+    def test_instinctive_memories_not_archived(self, engine, tmp_store):
+        """Instinctive memories should never be archival candidates."""
+        _create_memory(tmp_store, "Core Behavior", stage="instinctive",
+                        importance=0.05, days_ago=300)
+        candidates = engine.get_archival_candidates()
+        assert len(candidates) == 0
+
+    def test_ephemeral_memories_not_archived(self, engine, tmp_store):
+        """Ephemeral memories are handled by consolidation, not archival."""
+        _create_memory(tmp_store, "Scratch", stage="ephemeral",
+                        importance=0.05, days_ago=300)
+        candidates = engine.get_archival_candidates()
+        assert len(candidates) == 0
+
+
+# ---------------------------------------------------------------------------
+# Rehydration
+# ---------------------------------------------------------------------------
+
+class TestRehydration:
+    def test_rehydrate_for_matching_context(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Project Specific", importance=0.7,
+                              days_ago=10, project_context="/my/project")
+        tmp_store.archive(mid)
+
+        rehydrated = engine.rehydrate_for_context(project_context="/my/project")
+        assert len(rehydrated) >= 1
+        assert rehydrated[0]["id"] == mid
+
+    def test_rehydrated_memory_is_active_again(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Revived", importance=0.7,
+                              days_ago=10, project_context="/my/project")
+        tmp_store.archive(mid)
+
+        engine.rehydrate_for_context(project_context="/my/project")
+
+        active = tmp_store.list_by_stage("consolidated")
+        assert any(m["id"] == mid for m in active)
+
+    def test_irrelevant_archived_not_rehydrated(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Wrong Project", importance=0.15,
+                              days_ago=150, project_context="/other/project")
+        tmp_store.archive(mid)
+
+        rehydrated = engine.rehydrate_for_context(project_context="/my/project")
+        assert len(rehydrated) == 0
+
+    def test_unarchive_clears_archived_at(self, tmp_store):
+        mid = _create_memory(tmp_store, "Clear Test", importance=0.5)
+        tmp_store.archive(mid)
+        tmp_store.unarchive(mid)
+
+        with sqlite3.connect(tmp_store.db_path) as conn:
+            row = conn.execute(
+                "SELECT archived_at FROM memories WHERE id = ?", (mid,)
+            ).fetchone()
+        assert row[0] is None
+
+    def test_list_archived_returns_only_archived(self, tmp_store):
+        mid1 = _create_memory(tmp_store, "Active", importance=0.5)
+        mid2 = _create_memory(tmp_store, "Archived", importance=0.5)
+        tmp_store.archive(mid2)
+
+        archived = tmp_store.list_archived()
+        assert len(archived) == 1
+        assert archived[0]["id"] == mid2
+
+    def test_rehydration_by_observation(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Payment Pipeline Locking",
+                              importance=0.6, days_ago=30)
+        tmp_store.archive(mid)
+
+        matches = engine.find_rehydration_by_observation(
+            "We need to fix the payment pipeline deadlock issue"
+        )
+        assert any(m["id"] == mid for m in matches)
+
+    def test_rehydration_by_observation_ignores_active(self, engine, tmp_store):
+        _create_memory(tmp_store, "Active Payment", importance=0.6)
+        # Not archived — should not appear
+        matches = engine.find_rehydration_by_observation("payment processing update")
+        assert len(matches) == 0
+
+
+# ---------------------------------------------------------------------------
+# Inhibition (retrieval-induced forgetting)
+# ---------------------------------------------------------------------------
+
+class TestInhibition:
+    """Subsumed memories should be inhibited from rehydration."""
+
+    def test_subsumed_memory_not_rehydrated(self, engine, tmp_store):
+        """A memory with subsumed_by set should never be a rehydration candidate."""
+        mid = _create_memory(tmp_store, "Source Episode", importance=0.9,
+                              days_ago=5, project_context="/my/project")
+        # Mark as subsumed by a crystallized insight
+        tmp_store.update(mid, metadata={"subsumed_by": "crystal-123"})
+        tmp_store.archive(mid)
+
+        candidates = engine.get_rehydration_candidates(project_context="/my/project")
+        assert not any(c["id"] == mid for c in candidates)
+
+    def test_non_subsumed_archived_still_rehydrates(self, engine, tmp_store):
+        """Regular archived memories (no subsumed_by) should still rehydrate."""
+        mid = _create_memory(tmp_store, "Normally Archived", importance=0.7,
+                              days_ago=10, project_context="/my/project")
+        tmp_store.archive(mid)
+
+        candidates = engine.get_rehydration_candidates(project_context="/my/project")
+        assert any(c["id"] == mid for c in candidates)
+
+    def test_subsumed_memory_not_found_by_observation(self, engine, tmp_store):
+        """Subsumed memories should not match observation-based rehydration."""
+        mid = _create_memory(tmp_store, "Payment Pipeline Locking",
+                              importance=0.6, days_ago=30)
+        tmp_store.update(mid, metadata={"subsumed_by": "crystal-456"})
+        tmp_store.archive(mid)
+
+        matches = engine.find_rehydration_by_observation(
+            "We need to fix the payment pipeline deadlock issue"
+        )
+        assert not any(m["id"] == mid for m in matches)
+
+    def test_rehydrate_for_context_skips_subsumed(self, engine, tmp_store):
+        """Full rehydration cycle should skip subsumed memories."""
+        mid = _create_memory(tmp_store, "Subsumed Context", importance=0.8,
+                              days_ago=5, project_context="/my/project")
+        tmp_store.update(mid, metadata={"subsumed_by": "crystal-789"})
+        tmp_store.archive(mid)
+
+        rehydrated = engine.rehydrate_for_context(project_context="/my/project")
+        assert not any(r["id"] == mid for r in rehydrated)
+
+        # Verify it's still archived
+        with sqlite3.connect(tmp_store.db_path) as conn:
+            row = conn.execute(
+                "SELECT archived_at FROM memories WHERE id = ?", (mid,)
+            ).fetchone()
+        assert row[0] is not None
+
+    def test_maintenance_does_not_rehydrate_subsumed(self, engine, tmp_store):
+        """run_maintenance should not rehydrate subsumed memories."""
+        mid = _create_memory(tmp_store, "Subsumed Maintenance", importance=0.8,
+                              days_ago=5, project_context="/my/project")
+        tmp_store.update(mid, metadata={"subsumed_by": "crystal-abc"})
+        tmp_store.archive(mid)
+
+        result = engine.run_maintenance(project_context="/my/project")
+        rehydrated_ids = [r["id"] for r in result["rehydrated"]]
+        assert mid not in rehydrated_ids
+
+
+# ---------------------------------------------------------------------------
+# Maintenance cycle
+# ---------------------------------------------------------------------------
+
+class TestMaintenance:
+    def test_run_maintenance_archives_and_rehydrates(self, engine, tmp_store):
+        # Create one stale memory (will be archived — very low relevance)
+        _create_memory(tmp_store, "Stale One", importance=0.05, days_ago=300)
+
+        # Create and archive one relevant memory (will be rehydrated —
+        # high importance, recent, matching project context)
+        mid = _create_memory(tmp_store, "Relevant Archived", importance=0.7,
+                              days_ago=5, project_context="/my/project")
+        tmp_store.archive(mid)
+
+        result = engine.run_maintenance(project_context="/my/project")
+        assert len(result["archived"]) >= 1
+        assert len(result["rehydrated"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Score all
+# ---------------------------------------------------------------------------
+
+class TestScoreAll:
+    def test_score_all_returns_sorted_by_relevance(self, engine, tmp_store):
+        _create_memory(tmp_store, "High", importance=0.9, days_ago=1)
+        _create_memory(tmp_store, "Low", importance=0.2, days_ago=100)
+
+        scored = engine.score_all()
+        assert len(scored) == 2
+        assert scored[0]["relevance"] >= scored[1]["relevance"]
+
+    def test_score_all_excludes_ephemeral(self, engine, tmp_store):
+        _create_memory(tmp_store, "Ephemeral", stage="ephemeral")
+        _create_memory(tmp_store, "Consolidated", stage="consolidated")
+
+        scored = engine.score_all()
+        assert all(s["stage"] != "ephemeral" for s in scored)
+
+    def test_score_all_excludes_archived(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Archived", importance=0.5)
+        tmp_store.archive(mid)
+
+        scored = engine.score_all()
+        assert not any(s["id"] == mid for s in scored)
+
+
+# ---------------------------------------------------------------------------
+# Days since last activity
+# ---------------------------------------------------------------------------
+
+class TestDaysSinceActivity:
+    def test_uses_most_recent_timestamp(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Multi Timestamp", days_ago=0)
+        memory = tmp_store.get(mid)
+
+        # Should be very recent
+        days = engine._days_since_last_activity(memory)
+        assert days < 1.0
+
+    def test_old_memory_reports_many_days(self, engine, tmp_store):
+        mid = _create_memory(tmp_store, "Old", days_ago=90)
+        memory = tmp_store.get(mid)
+        days = engine._days_since_last_activity(memory)
+        assert 89 < days < 91
+
+    def test_no_timestamps_returns_365(self, engine):
+        memory = {}  # no timestamp fields
+        days = engine._days_since_last_activity(memory)
+        assert days == 365.0
