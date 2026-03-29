@@ -7,6 +7,7 @@ while preserving human-readable memory format.
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -15,6 +16,14 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+try:
+    import sqlite_vec
+    _SQLITE_VEC_AVAILABLE = True
+except ImportError:
+    _SQLITE_VEC_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
@@ -94,12 +103,14 @@ class MemoryStore:
 
     def _init_db(self) -> None:
         """Initialize SQLite database with schema and WAL mode."""
+        self._vec_available = False
         self.init_dirs()
 
         with sqlite3.connect(self.db_path) as conn:
             # Enable WAL mode for concurrent read safety
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA busy_timeout=5000')
 
             # Main memories table
             conn.execute('''
@@ -214,6 +225,27 @@ class MemoryStore:
 
             conn.commit()
 
+        # sqlite-vec setup — requires enable_load_extension (guaranteed by
+        # the plugin venv which uses a Python compiled with extension support).
+        if _SQLITE_VEC_AVAILABLE:
+            try:
+                with sqlite3.connect(self.db_path) as vec_conn:
+                    vec_conn.enable_load_extension(True)
+                    sqlite_vec.load(vec_conn)
+                    vec_conn.enable_load_extension(False)
+                    vec_conn.execute('''
+                        CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
+                            memory_id TEXT PRIMARY KEY,
+                            embedding float[512]
+                        )
+                    ''')
+                    vec_conn.commit()
+                self._vec_available = True
+            except (AttributeError, Exception) as e:
+                # AttributeError: enable_load_extension not available on this Python
+                # Other: sqlite-vec load failure
+                logger.warning("sqlite-vec unavailable (need Python with extension loading): %s", e)
+
     def _fts_insert(self, conn, rowid: int, title: str, summary: str, tags: str, content: str) -> None:
         """Insert a row into the FTS5 index."""
         conn.execute(
@@ -233,6 +265,16 @@ class MemoryStore:
         cursor = conn.execute('SELECT rowid FROM memories WHERE id = ?', (memory_id,))
         row = cursor.fetchone()
         return row[0] if row else None
+
+    def _vec_connect(self):
+        """Open a sqlite3 connection with sqlite-vec loaded. Caller must close."""
+        if not self._vec_available:
+            return None
+        conn = sqlite3.connect(self.db_path)
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return conn
 
     def _compute_content_hash(self, content: str) -> str:
         """Compute MD5 hash of content for deduplication."""
@@ -558,6 +600,24 @@ class MemoryStore:
                 results.append(result)
 
             return results
+
+    @staticmethod
+    def sanitize_fts_term(term: str) -> str:
+        """
+        Sanitize a term for safe use in FTS5 queries.
+
+        Wraps the term in double-quotes so FTS5 treats it as a literal
+        phrase, neutralizing operators (AND, OR, NOT, NEAR, *, ^, etc.).
+        Internal double-quotes are escaped by doubling them.
+
+        Args:
+            term: Raw search term from user input or observation text.
+
+        Returns:
+            Quoted term safe for FTS5 MATCH.
+        """
+        escaped = term.replace('"', '""')
+        return f'"{escaped}"'
 
     def search_fts(self, query: str, limit: int = 10) -> list[dict]:
         """
@@ -1018,3 +1078,101 @@ class MemoryStore:
             conn.execute('DELETE FROM thread_members WHERE thread_id = ?', (thread_id,))
             conn.execute('DELETE FROM narrative_threads WHERE id = ?', (thread_id,))
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Vector embedding operations (sqlite-vec)
+    # ------------------------------------------------------------------
+
+    def store_embedding(self, memory_id: str, embedding: bytes) -> None:
+        """
+        Store a vector embedding for a memory.
+
+        Args:
+            memory_id: Memory UUID.
+            embedding: Raw float32 bytes (512 dimensions = 2048 bytes).
+        """
+        if not self._vec_available:
+            return
+        conn = self._vec_connect()
+        if conn is None:
+            return
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO vec_memories(memory_id, embedding) VALUES (?, ?)",
+                (memory_id, embedding),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def search_vector(
+        self,
+        query_embedding: bytes,
+        k: int = 10,
+        exclude_ids: set = None,
+    ) -> list[dict]:
+        """
+        KNN search against stored embeddings.
+
+        Uses a JOIN against vec_memories and memories in the same index.db.
+
+        Args:
+            query_embedding: Raw float32 bytes to search against.
+            k: Number of nearest neighbours to retrieve.
+            exclude_ids: Optional set of memory IDs to exclude from results.
+
+        Returns:
+            List of memory dicts with 'distance' key, ordered by ascending distance.
+        """
+        if not self._vec_available or query_embedding is None:
+            return []
+        conn = self._vec_connect()
+        if conn is None:
+            return []
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT m.*, knn.distance
+                FROM (
+                    SELECT memory_id, distance
+                    FROM vec_memories
+                    WHERE embedding MATCH ? AND k = ?
+                ) knn
+                JOIN memories m ON m.id = knn.memory_id
+                ORDER BY knn.distance
+                """,
+                (query_embedding, k),
+            ).fetchall()
+            results = []
+            for row in rows:
+                d = dict(row)
+                if exclude_ids and d.get("id") in exclude_ids:
+                    continue
+                results.append(d)
+            return results
+        finally:
+            conn.close()
+
+    def get_embedding(self, memory_id: str) -> bytes | None:
+        """
+        Get stored embedding for a memory from index.db.
+
+        Args:
+            memory_id: Memory UUID.
+
+        Returns:
+            Raw float32 bytes, or None if not stored or vec is unavailable.
+        """
+        if not self._vec_available:
+            return None
+        conn = self._vec_connect()
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT embedding FROM vec_memories WHERE memory_id = ?", (memory_id,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
