@@ -12,6 +12,10 @@ Twenty focused phases moving from tech debt cleanup through retrieval foundation
 
 Decimal phases appear between their surrounding integers in numeric order.
 
+### v1 — Eval Framework
+
+- [ ] **Phase 0.5: AI Eval Harness** *(INSERTED)* - Build eval framework FIRST so every subsequent phase has a measurable baseline
+
 ### v1 — Cleanup
 
 - [ ] **Phase 1: Commit ORM Migration** - Commit Peewee migration with atomic commits and research files on disk
@@ -57,6 +61,18 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 26: Constitutive Memory Tagging** - Identity/preference memories resist crystallization freezing
 
 ## Phase Details
+
+### Phase 0.5: AI Eval Harness *(INSERTED)*
+**Goal**: Build the measurement system before changing anything — so every subsequent phase has a baseline to improve against
+**Depends on**: Nothing (first phase)
+**Requirements**: EVAL-01
+**Success Criteria** (what must be TRUE):
+  1. LongMemEval 500-question benchmark is integrated and runnable against our retrieval pipeline
+  2. Internal metrics harness computes: precision@k, MRR, consolidation prune accuracy, injection utility rate
+  3. Baseline scores are captured against current FTS-only retrieval and logged to `.planning/eval-baseline.json`
+  4. A verifier hook exists that runs the eval suite after each phase and logs the delta from baseline
+  5. `pytest eval/ -q` runs the full suite in under 60 seconds
+**Plans**: TBD
 
 ### Phase 1: Commit ORM Migration
 **Goal**: The Peewee ORM migration is committed to git in clean, atomic commits, and the agent output transcripts exist as research files on disk
@@ -320,6 +336,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
+| 0.5. AI Eval Harness (INSERTED) | 0/? | Not started | - |
 | 1. Commit ORM Migration | 0/? | Not started | - |
 | 2. Write Research Files | 0/? | Not started | - |
 | 3. Remove file_path Field | 0/? | Not started | - |
