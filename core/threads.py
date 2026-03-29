@@ -23,28 +23,23 @@ from .llm import call_llm
 from .storage import MemoryStore
 
 
-def _get_embeddings(texts: list[str]):
-    """
-    Encode texts with sentence-transformers (all-MiniLM-L6-v2).
-
-    Returns numpy array of shape (len(texts), 384), or None if
-    sentence-transformers is unavailable. Caller falls back to tag-overlap.
-
-    Per D-06: lazy call-site import — no top-level sentence_transformers import.
-    Per D-05: only called from PreCompact/cron contexts (threads.py is invoked
-    only from build_threads, which is called from those contexts).
-    """
+def _get_embeddings(store, memories: list[dict]):
+    """Retrieve stored embeddings from vec_memories."""
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        return model.encode(texts)
-    except Exception:
-        import sys
-        print(
-            "[threads] sentence-transformers unavailable, falling back to tag-overlap",
-            file=sys.stderr,
-        )
+        import struct
+        import numpy as np
+    except ImportError:
         return None
+
+    embeddings = []
+    for m in memories:
+        raw = store.get_embedding(m["id"])
+        if raw is None:
+            return None
+        vec = struct.unpack(f"{len(raw)//4}f", raw)
+        embeddings.append(vec)
+
+    return np.array(embeddings, dtype=np.float32)
 
 # ---------------------------------------------------------------------------
 # Narrative synthesis prompt
@@ -163,11 +158,7 @@ class ThreadDetector:
 
         # Try embedding-based clustering first (D-09: threshold 0.70 — topical
         # overlap, not content convergence). Fall back to tag overlap.
-        texts = [
-            f"{m.get('title', '')} {m.get('content', '')[:200]}"
-            for m in full_candidates
-        ]
-        embeddings = _get_embeddings(texts)
+        embeddings = _get_embeddings(self.store, full_candidates)
 
         if embeddings is not None:
             clusters = self._cluster_by_embeddings(full_candidates, embeddings, threshold=0.70)
@@ -255,7 +246,7 @@ class ThreadDetector:
     def _cluster_by_embeddings(
         self,
         memories: list[dict],
-        embeddings,  # numpy array (N, 384)
+        embeddings,  # numpy array (N, 512)
         threshold: float,
     ) -> list[list[dict]]:
         """

@@ -68,24 +68,28 @@ Respond ONLY with valid JSON:
 
 
 
-def _get_embeddings(texts: list[str]):
+def _get_embeddings(store, candidates: list[dict]):
     """
-    Encode texts with sentence-transformers (all-MiniLM-L6-v2).
+    Retrieve stored embeddings for candidates from vec_memories.
 
-    Returns numpy array of shape (len(texts), 384), or None if
-    sentence-transformers is unavailable. Caller falls back to tag-overlap.
+    Returns numpy array of shape (N, 512), or None if embeddings
+    are not available for all candidates.
     """
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        return model.encode(texts)
-    except Exception:
-        import sys
-        print(
-            "[crystallizer] sentence-transformers unavailable, falling back to tag-overlap",
-            file=sys.stderr,
-        )
+        import struct
+        import numpy as np
+    except ImportError:
         return None
+
+    embeddings = []
+    for c in candidates:
+        raw = store.get_embedding(c["id"])
+        if raw is None:
+            return None  # Missing embedding — fall back to tag-overlap
+        vec = struct.unpack(f"{len(raw)//4}f", raw)
+        embeddings.append(vec)
+
+    return np.array(embeddings, dtype=np.float32)
 
 
 class Crystallizer:
@@ -139,7 +143,7 @@ class Crystallizer:
         """
         Group related candidates by theme.
 
-        Phase 1: tries embedding cosine similarity (sentence-transformers).
+        Phase 1: tries embedding cosine similarity (stored vector embeddings).
         Phase 2: falls back to tag-overlap if embeddings are unavailable.
         Ungrouped candidates form singleton groups (still get synthesized).
         """
@@ -152,7 +156,7 @@ class Crystallizer:
         # (degenerate inputs like single-character titles would cluster incorrectly)
         texts = [f"{c.get('title', '')} {c.get('content', '')[:200]}" for c in candidates]
         min_text_len = min(len(t.strip()) for t in texts)
-        embeddings = _get_embeddings(texts) if min_text_len >= 10 else None
+        embeddings = _get_embeddings(self.store, candidates) if min_text_len >= 10 else None
 
         if embeddings is not None:
             return self._group_by_embeddings(candidates, embeddings, threshold=0.75)
@@ -234,7 +238,7 @@ class Crystallizer:
     def _group_by_embeddings(
         self,
         candidates: list[dict],
-        embeddings,  # numpy array (N, 384)
+        embeddings,  # numpy array (N, 512)
         threshold: float,
     ) -> list[list[dict]]:
         """
