@@ -7,7 +7,7 @@
 
 ### Eval Framework
 
-- [ ] **EVAL-01**: Build eval harness with LongMemEval integration (500-question retrieval benchmark), internal metrics (precision@k, MRR, prune accuracy, injection utility rate), baseline capture against current FTS-only system, and verifier hook that runs suite after each phase and logs delta
+- [x] **EVAL-01**: Build eval harness with LongMemEval integration (500-question retrieval benchmark), internal metrics (precision@k, MRR, prune accuracy, injection utility rate), baseline capture against current FTS-only system, and verifier hook that runs suite after each phase and logs delta
 
 ### Cleanup
 
@@ -73,7 +73,7 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| EVAL-01 | Phase 0.5 | Pending |
+| EVAL-01 | Phase 0.5 | Complete |
 | CLEAN-01 | Phase 1 | Pending |
 | CLEAN-02 | Phase 2 | Pending |
 | CLEAN-03 | Phase 3 | Pending |
