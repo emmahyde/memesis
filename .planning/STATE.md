@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 08-prompt-aware-tier-2-injection-01-PLAN.md
-last_updated: "2026-03-29T22:40:12.700Z"
+stopped_at: Completed 09-thompson-sampling-selection-01-PLAN.md
+last_updated: "2026-03-29T22:58:58.042Z"
 last_activity: 2026-03-29 — Phases 1-6 (cleanup) complete, gold set eval wired into report
 progress:
   total_phases: 27
-  completed_phases: 2
-  total_plans: 3
-  completed_plans: 3
+  completed_phases: 3
+  total_plans: 4
+  completed_plans: 4
   percent: 33
 ---
 
@@ -56,6 +56,7 @@ Progress: [███░░░░░░░] 33%
 | Phase 07-hybrid-rrf-retrieval P01 | 15 | 1 tasks | 2 files |
 | Phase 07-hybrid-rrf-retrieval P02 | 5 | 2 tasks | 4 files |
 | Phase 08-prompt-aware-tier-2-injection P01 | 2 | 1 tasks | 2 files |
+| Phase 09-thompson-sampling-selection P01 | 12 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -84,6 +85,8 @@ Recent decisions affecting current work:
 - [Phase 08-prompt-aware-tier-2-injection]: Embedding computed once in search_and_inject, reused by both Tier 2 get_crystallized_for_context and Tier 3 hybrid_search — no extra latency
 - [Phase 08-prompt-aware-tier-2-injection]: Tier 2 results prioritised before Tier 3 JIT in merged candidates; Tier 2 IDs excluded from Tier 3 to prevent duplication
 - [Phase 08-prompt-aware-tier-2-injection]: token_limit=TOKEN_BUDGET_CHARS (2000) passed to get_crystallized_for_context overriding engine default to respect hook budget
+- [Phase 09-thompson-sampling-selection]: Thompson sampling re-orders ranked list, does not replace ranking - exploration layered on top of RRF or static sort
+- [Phase 09-thompson-sampling-selection]: Existing deterministic-order tests patched with thompson_sampling=False via monkeypatch to isolate static code path
 
 ### Pending Todos
 
@@ -97,6 +100,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T22:37:22.013Z
-Stopped at: Completed 08-prompt-aware-tier-2-injection-01-PLAN.md
+Last session: 2026-03-29T22:58:58.040Z
+Stopped at: Completed 09-thompson-sampling-selection-01-PLAN.md
 Resume file: None
