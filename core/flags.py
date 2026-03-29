@@ -30,6 +30,7 @@ DEFAULTS = {
     "somatic_markers": True,
     "replay_priority": True,
     "sm2_spaced_injection": True,
+    "reconsolidation": True,
     "affect_awareness": True,
 }
 
