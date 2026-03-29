@@ -27,7 +27,7 @@
 
 ### Observation Quality
 
-- [ ] **OBSV-01**: Create OrientingDetector — rule-based patterns catching corrections ("no, that's wrong"), emphasis ("remember this"), error spikes, pacing breaks
+- [x] **OBSV-01**: Create OrientingDetector — rule-based patterns catching corrections ("no, that's wrong"), emphasis ("remember this"), error spikes, pacing breaks
 - [ ] **OBSV-02**: Create habituation baseline — per-project event frequency model suppressing routine events (habituation_factor = 1.0 - expected_frequency)
 - [ ] **OBSV-03**: Implement somatic markers — emotional valence classification (neutral/friction/surprise/delight) at observation time with importance bump
 - [ ] **OBSV-04**: Add replay priority — sort observations by salience (correction > pushback > novelty > recency) before presenting to consolidation LLM
@@ -84,7 +84,7 @@
 | FOUND-02 | Phase 8 | Complete |
 | FOUND-03 | Phase 9 | Complete |
 | FOUND-04 | Phase 10 | Complete |
-| OBSV-01 | Phase 11 | Pending |
+| OBSV-01 | Phase 11 | Complete |
 | OBSV-02 | Phase 12 | Pending |
 | OBSV-03 | Phase 13 | Pending |
 | OBSV-04 | Phase 14 | Pending |
