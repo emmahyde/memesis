@@ -115,6 +115,18 @@ def main():
                 usage_text = conversation_text + "\n" + content
                 feedback.track_usage(session_id, injected_ids, usage_text)
 
+                # Reconsolidate: check if session confirms/contradicts/refines memories
+                try:
+                    from core.reconsolidation import reconsolidate
+                    recon = reconsolidate(injected_ids, usage_text, session_id)
+                    if any(recon.values()):
+                        logger.info(
+                            "Reconsolidation: %d confirmed, %d contradicted, %d refined",
+                            len(recon["confirmed"]), len(recon["contradicted"]), len(recon["refined"]),
+                        )
+                except Exception as e:
+                    logger.warning("Reconsolidation error (non-fatal): %s", e)
+
             result = consolidator.consolidate_session(str(snapshot_path), session_id)
             feedback.update_importance_scores(session_id)
 
