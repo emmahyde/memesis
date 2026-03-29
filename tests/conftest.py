@@ -14,7 +14,7 @@ os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.storage import MemoryStore
+from core.database import init_db, close_db, get_base_dir
 
 
 @pytest.fixture
@@ -27,23 +27,24 @@ def temp_dir():
 
 @pytest.fixture
 def memory_store(temp_dir):
-    """Create a MemoryStore instance with temporary storage."""
-    store = MemoryStore(base_dir=str(temp_dir))
-    yield store
-    store.close()
+    """Initialize the Peewee database with temporary storage."""
+    init_db(base_dir=str(temp_dir))
+    yield temp_dir  # yield the base_dir path
+    close_db()
 
 
 @pytest.fixture
 def project_memory_store(temp_dir):
-    """Create a MemoryStore instance with project context."""
+    """Initialize the Peewee database with project context."""
     # Override home to use temp_dir
     original_home = os.environ.get('HOME')
     os.environ['HOME'] = str(temp_dir)
 
     try:
-        store = MemoryStore(project_context='/Users/test/my-project')
-        yield store
+        init_db(project_context='/Users/test/my-project')
+        yield temp_dir
     finally:
+        close_db()
         if original_home:
             os.environ['HOME'] = original_home
         else:

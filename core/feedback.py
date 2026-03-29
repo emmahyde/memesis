@@ -218,28 +218,10 @@ class FeedbackLoop:
         """
         session_map = self._session_usage.get(session_id, {})
 
-        # Query memories with their recent injection/usage stats
-        rows = (
-            Memory.select(
-                Memory.id,
-                Memory.importance,
-                Memory.usage_count,
-                fn.COUNT(RetrievalLog.id).alias('recent_injections'),
-                fn.SUM(RetrievalLog.was_used).alias('recent_usages'),
-            )
-            .join(
-                RetrievalLog,
-                on=(RetrievalLog.memory_id == Memory.id),
-                join_type='LEFT',
-            )
-            .where(
-                Memory.stage != 'ephemeral',
-                (RetrievalLog.retrieval_type == 'injected') | (RetrievalLog.id.is_null()),
-            )
-            .group_by(Memory.id)
-        )
+        # Query non-ephemeral memories
+        memories = Memory.select().where(Memory.stage != 'ephemeral')
 
-        for row in rows:
+        for row in memories:
             memory_id = row.id
             old_importance = row.importance or 0.5
             new_importance = old_importance

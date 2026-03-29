@@ -148,22 +148,18 @@ class Memory(BaseModel):
     # -- Save / Delete with FTS sync -----------------------------------
 
     def save(self, force_insert=False, only=None):
-        """Override save to keep FTS index in sync."""
+        """Override save to keep FTS index in sync (atomic)."""
         self.updated_at = datetime.now().isoformat()
-        if self.content_hash is None and self.content:
+        if self.content:
             self.content_hash = self.compute_hash(self.content)
 
-        # Determine if this is an update (existing row) or insert
         is_update = not force_insert and self.id and self._pk_exists()
 
-        if is_update:
-            # Delete old FTS entry before updating
-            self._fts_delete()
-
-        result = super().save(force_insert=force_insert, only=only)
-
-        # Insert new FTS entry
-        self._fts_insert()
+        with db.atomic():
+            if is_update:
+                self._fts_delete_from_db()
+            result = super().save(force_insert=force_insert, only=only)
+            self._fts_insert()
         return result
 
     def delete_instance(self, recursive=False, delete_nullable=False):
@@ -199,7 +195,7 @@ class Memory(BaseModel):
         )
 
     def _fts_delete(self):
-        """Delete a row from the FTS5 index."""
+        """Delete a row from the FTS5 index using in-memory values."""
         rowid = self._get_rowid()
         if rowid is None:
             return
@@ -212,6 +208,28 @@ class Memory(BaseModel):
                 self.summary or "",
                 self.tags or "",
                 self.content or "",
+            ),
+        )
+
+    def _fts_delete_from_db(self):
+        """Delete a row from the FTS5 index using current DB values (not in-memory)."""
+        cursor = db.execute_sql(
+            "SELECT rowid, title, summary, tags, content FROM memories WHERE id = ?",
+            (self.id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return
+        rowid, title, summary, tags, content = row
+        db.execute_sql(
+            "INSERT INTO memories_fts(memories_fts, rowid, title, summary, tags, content) "
+            "VALUES('delete', ?, ?, ?, ?, ?)",
+            (
+                rowid,
+                title or "",
+                summary or "",
+                tags or "",
+                content or "",
             ),
         )
 

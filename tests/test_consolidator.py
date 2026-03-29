@@ -5,22 +5,19 @@ All Anthropic API calls are mocked; no real network requests are made.
 """
 
 import json
-import shutil
-import sqlite3
 import sys
-import tempfile
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import patch
 
 import pytest
 
-# Ensure the memesis package root is on sys.path so that
-# `from core.xxx import ...` works when running pytest directly.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.consolidator import Consolidator
+from core.database import init_db, close_db
 from core.lifecycle import LifecycleManager
-from core.storage import MemoryStore
+from core.models import Memory, ConsolidationLog, db
 
 
 # ---------------------------------------------------------------------------
@@ -28,19 +25,21 @@ from core.storage import MemoryStore
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def tmp_store(tmp_path):
-    """MemoryStore backed by a throwaway temp directory."""
-    return MemoryStore(base_dir=str(tmp_path / "memory"))
+def base(tmp_path):
+    """Initialize DB in a throwaway temp directory."""
+    base_dir = init_db(base_dir=str(tmp_path / "memory"))
+    yield base_dir
+    close_db()
 
 
 @pytest.fixture
-def lifecycle(tmp_store):
-    return LifecycleManager(tmp_store)
+def lifecycle(base):
+    return LifecycleManager()
 
 
 @pytest.fixture
-def consolidator(tmp_store, lifecycle):
-    return Consolidator(store=tmp_store, lifecycle=lifecycle, model="claude-sonnet-4-6")
+def consolidator(base, lifecycle):
+    return Consolidator(lifecycle=lifecycle, model="claude-sonnet-4-6")
 
 
 @pytest.fixture
@@ -56,11 +55,23 @@ def ephemeral_file(tmp_path):
     return str(p)
 
 
-def _llm_response(decisions: list[dict]) -> MagicMock:
-    """Build a mock Anthropic messages.create() return value."""
-    mock_msg = MagicMock()
-    mock_msg.content = [MagicMock(text=json.dumps({"decisions": decisions}))]
-    return mock_msg
+def _llm_response_text(decisions: list[dict]) -> str:
+    return json.dumps({"decisions": decisions})
+
+
+def _create_memory(stage='consolidated', title='Test', content='Content', **kwargs):
+    now = datetime.now().isoformat()
+    return Memory.create(
+        stage=stage,
+        title=title,
+        summary=kwargs.get('summary', content[:100]),
+        content=content,
+        tags=json.dumps(kwargs.get('tags', [])),
+        importance=kwargs.get('importance', 0.5),
+        reinforcement_count=kwargs.get('reinforcement_count', 0),
+        created_at=now,
+        updated_at=now,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,10 +148,7 @@ class TestEstimateTokenBudget:
         assert consolidator.estimate_token_budget([]) == 0
 
     def test_single_memory(self, consolidator):
-        # 40 chars → 10 tokens
         m = {"title": "x" * 40}
-        # str(m) will be longer than 40 due to dict repr overhead;
-        # just assert it's chars // 4
         total = len(str(m))
         assert consolidator.estimate_token_budget([m]) == total // 4
 
@@ -159,7 +167,7 @@ class TestEstimateTokenBudget:
 # ---------------------------------------------------------------------------
 
 class TestConsolidateKeep:
-    def test_keep_calls_store_create(self, consolidator, tmp_store, ephemeral_file):
+    def test_keep_calls_store_create(self, consolidator, base, ephemeral_file):
         decisions = [
             {
                 "observation": "Prefers snake_case for Python variable names.",
@@ -173,8 +181,8 @@ class TestConsolidateKeep:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-001")
 
         assert len(result["kept"]) == 1
@@ -182,14 +190,13 @@ class TestConsolidateKeep:
         assert result["promoted"] == []
         assert result["conflicts"] == []
 
-        # Memory must exist in consolidated stage
         memory_id = result["kept"][0]
-        memory = tmp_store.get(memory_id)
-        assert memory["stage"] == "consolidated"
-        assert memory["title"] == "Python snake_case preference"
-        assert memory["source_session"] == "sess-001"
+        memory = Memory.get_by_id(memory_id)
+        assert memory.stage == "consolidated"
+        assert memory.title == "Python snake_case preference"
+        assert memory.source_session == "sess-001"
 
-    def test_keep_strips_consolidated_prefix_from_target_path(self, consolidator, tmp_store, ephemeral_file):
+    def test_keep_strips_consolidated_prefix_from_target_path(self, consolidator, base, ephemeral_file):
         decisions = [
             {
                 "observation": "Use pytest fixtures for setup.",
@@ -203,15 +210,15 @@ class TestConsolidateKeep:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-002")
 
         assert len(result["kept"]) == 1
-        memory = tmp_store.get(result["kept"][0])
-        assert memory["stage"] == "consolidated"
+        memory = Memory.get_by_id(result["kept"][0])
+        assert memory.stage == "consolidated"
 
-    def test_keep_records_consolidation_log(self, consolidator, tmp_store, ephemeral_file):
+    def test_keep_records_consolidation_log(self, consolidator, base, ephemeral_file):
         decisions = [
             {
                 "observation": "Always use context managers for file I/O.",
@@ -225,22 +232,19 @@ class TestConsolidateKeep:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-003")
 
         memory_id = result["kept"][0]
-        with sqlite3.connect(tmp_store.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT * FROM consolidation_log WHERE memory_id = ? AND action = 'kept'",
-                (memory_id,),
-            ).fetchone()
-
+        row = ConsolidationLog.get(
+            (ConsolidationLog.memory_id == memory_id) &
+            (ConsolidationLog.action == 'kept')
+        )
         assert row is not None
-        assert row["from_stage"] == "ephemeral"
-        assert row["to_stage"] == "consolidated"
-        assert row["session_id"] == "sess-003"
+        assert row.from_stage == "ephemeral"
+        assert row.to_stage == "consolidated"
+        assert row.session_id == "sess-003"
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +252,7 @@ class TestConsolidateKeep:
 # ---------------------------------------------------------------------------
 
 class TestConsolidatePrune:
-    def test_prune_logged_not_stored(self, consolidator, tmp_store, ephemeral_file):
+    def test_prune_logged_not_stored(self, consolidator, base, ephemeral_file):
         decisions = [
             {
                 "observation": "Session started at 10am.",
@@ -262,8 +266,8 @@ class TestConsolidatePrune:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-004")
 
         assert result["pruned"] == [
@@ -273,17 +277,13 @@ class TestConsolidatePrune:
             }
         ]
         assert result["kept"] == []
-
-        # Confirm nothing landed in consolidated stage
-        consolidated = tmp_store.list_by_stage("consolidated")
+        consolidated = list(Memory.by_stage("consolidated"))
         assert consolidated == []
 
-        # Confirm prune was logged
-        with sqlite3.connect(tmp_store.db_path) as conn:
-            row = conn.execute(
-                "SELECT * FROM consolidation_log WHERE action = 'pruned' AND session_id = ?",
-                ("sess-004",),
-            ).fetchone()
+        row = ConsolidationLog.get_or_none(
+            (ConsolidationLog.action == 'pruned') &
+            (ConsolidationLog.session_id == "sess-004")
+        )
         assert row is not None
 
     def test_multiple_prunes(self, consolidator, ephemeral_file):
@@ -303,8 +303,8 @@ class TestConsolidatePrune:
                 "target_path": None, "reinforces": None, "contradicts": None,
             },
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-005")
 
         assert len(result["pruned"]) == 2
@@ -315,17 +315,12 @@ class TestConsolidatePrune:
 # ---------------------------------------------------------------------------
 
 class TestConsolidatePromote:
-    def test_promote_increments_reinforcement_count(self, consolidator, tmp_store, lifecycle, ephemeral_file):
-        # Create an existing consolidated memory to reinforce
-        memory_id = tmp_store.create(
-            path="python/snake_case.md",
+    def test_promote_increments_reinforcement_count(self, consolidator, base, lifecycle, ephemeral_file):
+        mem = _create_memory(
+            title="Python snake_case",
             content="User prefers snake_case.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Python snake_case",
-                "summary": "Prefers snake_case.",
-                "reinforcement_count": 1,
-            },
+            summary="Prefers snake_case.",
+            reinforcement_count=1,
         )
 
         decisions = [
@@ -333,53 +328,19 @@ class TestConsolidatePromote:
                 "observation": "Again confirmed: snake_case for Python vars.",
                 "action": "promote",
                 "rationale": "Consistent reinforcement of existing preference.",
-                "title": None,
-                "summary": None,
-                "tags": [],
-                "target_path": None,
-                "reinforces": memory_id,
-                "contradicts": None,
-            }
-        ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
-            result = consolidator.consolidate_session(ephemeral_file, "sess-006")
-
-        assert result["promoted"] == [memory_id]
-        updated = tmp_store.get(memory_id)
-        assert updated["reinforcement_count"] == 2
-
-    def test_promote_calls_store_update(self, consolidator, tmp_store, ephemeral_file):
-        memory_id = tmp_store.create(
-            path="preferences/editor.md",
-            content="Prefers VS Code.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Editor preference",
-                "reinforcement_count": 0,
-            },
-        )
-
-        decisions = [
-            {
-                "observation": "Uses VS Code with vim keybindings.",
-                "action": "promote",
-                "rationale": "Reinforces editor preference.",
                 "title": None, "summary": None, "tags": [],
                 "target_path": None,
-                "reinforces": memory_id,
+                "reinforces": mem.id,
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
-            with patch.object(tmp_store, "update", wraps=tmp_store.update) as mock_update:
-                consolidator.consolidate_session(ephemeral_file, "sess-007")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            result = consolidator.consolidate_session(ephemeral_file, "sess-006")
 
-        mock_update.assert_called_once_with(
-            memory_id,
-            metadata={"reinforcement_count": 1},
-        )
+        assert result["promoted"] == [mem.id]
+        updated = Memory.get_by_id(mem.id)
+        assert updated.reinforcement_count == 2
 
     def test_promote_missing_reinforces_id_skipped(self, consolidator, ephemeral_file):
         decisions = [
@@ -389,12 +350,12 @@ class TestConsolidatePromote:
                 "rationale": "Reinforces something.",
                 "title": None, "summary": None, "tags": [],
                 "target_path": None,
-                "reinforces": None,  # missing
+                "reinforces": None,
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-008")
 
         assert result["promoted"] == []
@@ -411,8 +372,8 @@ class TestConsolidatePromote:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-009")
 
         assert result["promoted"] == []
@@ -423,15 +384,11 @@ class TestConsolidatePromote:
 # ---------------------------------------------------------------------------
 
 class TestConsolidateConflicts:
-    def test_contradicts_added_to_conflicts(self, consolidator, tmp_store, ephemeral_file):
-        memory_id = tmp_store.create(
-            path="style/imports.md",
+    def test_contradicts_added_to_conflicts(self, consolidator, base, ephemeral_file):
+        mem = _create_memory(
+            title="Import style",
             content="Always use absolute imports.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Import style",
-                "summary": "Absolute imports only.",
-            },
+            summary="Absolute imports only.",
         )
 
         decisions = [
@@ -444,15 +401,15 @@ class TestConsolidateConflicts:
                 "tags": ["python", "imports"],
                 "target_path": "style/imports_update.md",
                 "reinforces": None,
-                "contradicts": memory_id,
+                "contradicts": mem.id,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-010")
 
         assert len(result["conflicts"]) == 1
-        assert result["conflicts"][0]["contradicts"] == memory_id
+        assert result["conflicts"][0]["contradicts"] == mem.id
         assert "relative imports" in result["conflicts"][0]["observation"]
 
     def test_no_contradicts_means_no_conflicts(self, consolidator, ephemeral_file):
@@ -469,8 +426,8 @@ class TestConsolidateConflicts:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-011")
 
         assert result["conflicts"] == []
@@ -482,7 +439,6 @@ class TestConsolidateConflicts:
 
 class TestPrivacyFilterIntegration:
     def test_emotional_lines_removed_before_prompt(self, consolidator, tmp_path):
-        """The LLM prompt must not contain emotional state language."""
         ephemeral = tmp_path / "obs.md"
         ephemeral.write_text(
             "User seemed frustrated with the CI pipeline.\n"
@@ -506,12 +462,12 @@ class TestPrivacyFilterIntegration:
 
         captured_prompt = []
 
-        def capture_create(**kwargs):
-            captured_prompt.append(kwargs["messages"][0]["content"])
-            return _llm_response(decisions)
+        def capture_transport(prompt, **kwargs):
+            captured_prompt.append(prompt)
+            return _llm_response_text(decisions)
 
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = capture_create
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = capture_transport
             consolidator.consolidate_session(str(ephemeral), "sess-012")
 
         assert len(captured_prompt) == 1
@@ -526,8 +482,7 @@ class TestPrivacyFilterIntegration:
 
 class TestMalformedJsonHandling:
     def test_retry_on_malformed_json(self, consolidator, ephemeral_file):
-        """First call returns garbage; second call returns valid JSON."""
-        good_response = _llm_response(
+        good_text = _llm_response_text(
             [
                 {
                     "observation": "Uses mypy.",
@@ -542,28 +497,22 @@ class TestMalformedJsonHandling:
                 }
             ]
         )
-        bad_response = MagicMock()
-        bad_response.content = [MagicMock(text="This is not JSON at all.")]
+        bad_text = "This is not JSON at all."
 
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = [bad_response, good_response]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = [bad_text, good_text]
             result = consolidator.consolidate_session(ephemeral_file, "sess-013")
 
-        # Should have succeeded on second attempt
         assert len(result["kept"]) == 1
-        assert mock_cls.return_value.messages.create.call_count == 2
+        assert mock_transport.call_count == 2
 
     def test_raises_on_two_consecutive_bad_responses(self, consolidator, ephemeral_file):
-        """Both attempts return garbage → ValueError raised."""
-        bad_response = MagicMock()
-        bad_response.content = [MagicMock(text="not json")]
-
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = bad_response
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = "not json"
             with pytest.raises(ValueError, match="malformed JSON on both attempts"):
                 consolidator.consolidate_session(ephemeral_file, "sess-014")
 
-        assert mock_cls.return_value.messages.create.call_count == 2
+        assert mock_transport.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +520,7 @@ class TestMalformedJsonHandling:
 # ---------------------------------------------------------------------------
 
 class TestMixedDecisions:
-    def test_keep_and_prune_in_same_session(self, consolidator, tmp_store, ephemeral_file):
+    def test_keep_and_prune_in_same_session(self, consolidator, base, ephemeral_file):
         decisions = [
             {
                 "observation": "Prefers functional style in Python.",
@@ -592,8 +541,8 @@ class TestMixedDecisions:
                 "target_path": None, "reinforces": None, "contradicts": None,
             },
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-015")
 
         assert len(result["kept"]) == 1
@@ -601,15 +550,11 @@ class TestMixedDecisions:
         assert result["promoted"] == []
         assert result["conflicts"] == []
 
-    def test_all_three_actions_in_same_session(self, consolidator, tmp_store, ephemeral_file):
-        existing_id = tmp_store.create(
-            path="preferences/indent.md",
+    def test_all_three_actions_in_same_session(self, consolidator, base, ephemeral_file):
+        existing = _create_memory(
+            title="Indentation preference",
             content="Uses 4-space indentation.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Indentation preference",
-                "reinforcement_count": 0,
-            },
+            reinforcement_count=0,
         )
         decisions = [
             {
@@ -636,33 +581,29 @@ class TestMixedDecisions:
                 "rationale": "Reinforces indentation preference.",
                 "title": None, "summary": None, "tags": [],
                 "target_path": None,
-                "reinforces": existing_id,
+                "reinforces": existing.id,
                 "contradicts": None,
             },
         ]
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-016")
 
         assert len(result["kept"]) == 1
         assert len(result["pruned"]) == 1
         assert len(result["promoted"]) == 1
-        assert result["promoted"][0] == existing_id
+        assert result["promoted"][0] == existing.id
 
-        # Reinforcement count incremented
-        updated = tmp_store.get(existing_id)
-        assert updated["reinforcement_count"] == 1
+        updated = Memory.get_by_id(existing.id)
+        assert updated.reinforcement_count == 1
 
 
 # ---------------------------------------------------------------------------
 # Contradiction resolution
 # ---------------------------------------------------------------------------
 
-def _resolution_response(result: dict) -> MagicMock:
-    """Build a mock Anthropic messages.create() return for resolution LLM."""
-    mock_msg = MagicMock()
-    mock_msg.content = [MagicMock(text=json.dumps(result))]
-    return mock_msg
+def _resolution_response_text(result: dict) -> str:
+    return json.dumps(result)
 
 
 MOCK_RESOLUTION = {
@@ -674,16 +615,11 @@ MOCK_RESOLUTION = {
 
 
 class TestContradictionResolution:
-    def test_conflict_refines_original_memory(self, consolidator, tmp_store, ephemeral_file):
-        """When a conflict is detected, the original memory gets refined."""
-        memory_id = tmp_store.create(
-            path="style/imports.md",
+    def test_conflict_refines_original_memory(self, consolidator, base, ephemeral_file):
+        mem = _create_memory(
+            title="Import style",
             content="Always use absolute imports.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Import style",
-                "summary": "Absolute imports only.",
-            },
+            summary="Absolute imports only.",
         )
 
         decisions = [
@@ -696,40 +632,30 @@ class TestContradictionResolution:
                 "tags": ["python"],
                 "target_path": "style/imports_v2.md",
                 "reinforces": None,
-                "contradicts": memory_id,
+                "contradicts": mem.id,
             }
         ]
 
-        # Two LLM calls: consolidation then resolution
-        consolidation_response = _llm_response(decisions)
-        resolution_response = _resolution_response(MOCK_RESOLUTION)
-
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = [
-                consolidation_response,
-                resolution_response,
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = [
+                _llm_response_text(decisions),
+                _resolution_response_text(MOCK_RESOLUTION),
             ]
             result = consolidator.consolidate_session(ephemeral_file, "sess-020")
 
         assert len(result["resolved"]) == 1
-        assert result["resolved"][0]["memory_id"] == memory_id
+        assert result["resolved"][0]["memory_id"] == mem.id
         assert result["resolved"][0]["resolution_type"] == "scoped"
 
-        # Original memory content was updated
-        updated = tmp_store.get(memory_id)
-        assert "relative" in updated["content"].lower()
-        assert updated["title"] == "Import style: absolute for cross-package, relative within"
+        updated = Memory.get_by_id(mem.id)
+        assert "relative" in updated.content.lower()
+        assert updated.title == "Import style: absolute for cross-package, relative within"
 
-    def test_low_confidence_resolution_skipped(self, consolidator, tmp_store, ephemeral_file):
-        """Resolution with confidence < 0.4 is not applied."""
-        memory_id = tmp_store.create(
-            path="tools/db.md",
+    def test_low_confidence_resolution_skipped(self, consolidator, base, ephemeral_file):
+        mem = _create_memory(
+            title="Database choice",
             content="Always use PostgreSQL.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Database choice",
-                "summary": "PostgreSQL for everything.",
-            },
+            summary="PostgreSQL for everything.",
         )
 
         decisions = [
@@ -742,37 +668,30 @@ class TestContradictionResolution:
                 "tags": ["database"],
                 "target_path": "tools/sqlite.md",
                 "reinforces": None,
-                "contradicts": memory_id,
+                "contradicts": mem.id,
             }
         ]
 
         low_confidence = {**MOCK_RESOLUTION, "confidence": 0.2}
 
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = [
-                _llm_response(decisions),
-                _resolution_response(low_confidence),
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = [
+                _llm_response_text(decisions),
+                _resolution_response_text(low_confidence),
             ]
             result = consolidator.consolidate_session(ephemeral_file, "sess-021")
 
-        # Conflict detected but not resolved
         assert len(result["conflicts"]) == 1
         assert len(result["resolved"]) == 0
 
-        # Original memory unchanged
-        original = tmp_store.get(memory_id)
-        assert "PostgreSQL" in original["content"]
+        original = Memory.get_by_id(mem.id)
+        assert "PostgreSQL" in original.content
 
-    def test_resolution_logs_merged_action(self, consolidator, tmp_store, ephemeral_file):
-        """Resolution creates a 'merged' consolidation log entry."""
-        memory_id = tmp_store.create(
-            path="style/naming.md",
+    def test_resolution_logs_merged_action(self, consolidator, base, ephemeral_file):
+        mem = _create_memory(
+            title="Naming convention",
             content="Use camelCase everywhere.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Naming convention",
-                "summary": "camelCase.",
-            },
+            summary="camelCase.",
         )
 
         decisions = [
@@ -785,28 +704,28 @@ class TestContradictionResolution:
                 "tags": ["naming"],
                 "target_path": "style/snake.md",
                 "reinforces": None,
-                "contradicts": memory_id,
+                "contradicts": mem.id,
             }
         ]
 
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = [
-                _llm_response(decisions),
-                _resolution_response(MOCK_RESOLUTION),
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = [
+                _llm_response_text(decisions),
+                _resolution_response_text(MOCK_RESOLUTION),
             ]
             result = consolidator.consolidate_session(ephemeral_file, "sess-022")
 
-        with sqlite3.connect(tmp_store.db_path) as conn:
-            rows = conn.execute(
-                "SELECT action, rationale FROM consolidation_log WHERE memory_id = ? AND action = 'merged'",
-                (memory_id,),
-            ).fetchall()
-
+        rows = list(
+            ConsolidationLog.select()
+            .where(
+                (ConsolidationLog.memory_id == mem.id) &
+                (ConsolidationLog.action == 'merged')
+            )
+        )
         assert len(rows) == 1
-        assert "Contradiction resolved" in rows[0][1]
+        assert "Contradiction resolved" in rows[0].rationale
 
-    def test_missing_contradict_target_skipped(self, consolidator, tmp_store, ephemeral_file):
-        """If the contradicted memory doesn't exist, resolution is skipped."""
+    def test_missing_contradict_target_skipped(self, consolidator, base, ephemeral_file):
         decisions = [
             {
                 "observation": "Something contradictory.",
@@ -821,23 +740,18 @@ class TestContradictionResolution:
             }
         ]
 
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-023")
 
         assert len(result["conflicts"]) == 1
         assert len(result["resolved"]) == 0
 
-    def test_resolution_llm_failure_skipped(self, consolidator, tmp_store, ephemeral_file):
-        """If the resolution LLM call fails, the conflict is logged but not resolved."""
-        memory_id = tmp_store.create(
-            path="tools/editor.md",
+    def test_resolution_llm_failure_skipped(self, consolidator, base, ephemeral_file):
+        mem = _create_memory(
+            title="Editor",
             content="Uses vim.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Editor",
-                "summary": "vim user.",
-            },
+            summary="vim user.",
         )
 
         decisions = [
@@ -850,17 +764,14 @@ class TestContradictionResolution:
                 "tags": ["editor"],
                 "target_path": "tools/vscode.md",
                 "reinforces": None,
-                "contradicts": memory_id,
+                "contradicts": mem.id,
             }
         ]
 
-        bad_resolution = MagicMock()
-        bad_resolution.content = [MagicMock(text="not json at all")]
-
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = [
-                _llm_response(decisions),
-                bad_resolution,
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = [
+                _llm_response_text(decisions),
+                "not json at all",
             ]
             result = consolidator.consolidate_session(ephemeral_file, "sess-024")
 
@@ -868,7 +779,6 @@ class TestContradictionResolution:
         assert len(result["resolved"]) == 0
 
     def test_no_conflicts_means_no_resolution(self, consolidator, ephemeral_file):
-        """When there are no conflicts, no resolution LLM calls are made."""
         decisions = [
             {
                 "observation": "Uses black for formatting.",
@@ -883,24 +793,18 @@ class TestContradictionResolution:
             }
         ]
 
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.return_value = _llm_response(decisions)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
             result = consolidator.consolidate_session(ephemeral_file, "sess-025")
 
         assert result["resolved"] == []
-        # Only one LLM call (consolidation), no resolution call
-        assert mock_cls.return_value.messages.create.call_count == 1
+        assert mock_transport.call_count == 1
 
-    def test_superseded_archives_old_memory(self, consolidator, tmp_store, ephemeral_file):
-        """When resolution_type is superseded, the old memory is archived."""
-        memory_id = tmp_store.create(
-            path="prefs/pr_style.md",
+    def test_superseded_archives_old_memory(self, consolidator, base, ephemeral_file):
+        mem = _create_memory(
+            title="PR style",
             content="Always use single PRs.",
-            metadata={
-                "stage": "consolidated",
-                "title": "PR style",
-                "summary": "Single PRs preferred.",
-            },
+            summary="Single PRs preferred.",
         )
 
         decisions = [
@@ -913,7 +817,7 @@ class TestContradictionResolution:
                 "tags": ["workflow"],
                 "target_path": "prefs/pr_split.md",
                 "reinforces": None,
-                "contradicts": memory_id,
+                "contradicts": mem.id,
             }
         ]
 
@@ -924,47 +828,35 @@ class TestContradictionResolution:
             "confidence": 0.9,
         }
 
-        consolidation_response = _llm_response(decisions)
-        resolution_response = _resolution_response(superseded_resolution)
-
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = [
-                consolidation_response,
-                resolution_response,
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = [
+                _llm_response_text(decisions),
+                _resolution_response_text(superseded_resolution),
             ]
             result = consolidator.consolidate_session(ephemeral_file, "sess-030")
 
         assert len(result["resolved"]) == 1
         assert result["resolved"][0]["resolution_type"] == "superseded"
 
-        # Memory should be archived
-        updated = tmp_store.get(memory_id)
-        assert updated.get("archived_at") is not None
-        assert "[Superseded]" in updated["title"]
+        updated = Memory.get_by_id(mem.id)
+        assert updated.archived_at is not None
+        assert "[Superseded]" in updated.title
 
-        # Consolidation log should show "archived" action
-        import sqlite3
-        with sqlite3.connect(tmp_store.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT action, rationale FROM consolidation_log WHERE memory_id = ?",
-                (memory_id,),
-            ).fetchall()
-        deprecated_logs = [r for r in rows if r["action"] == "deprecated"]
+        deprecated_logs = list(
+            ConsolidationLog.select().where(
+                (ConsolidationLog.memory_id == mem.id) &
+                (ConsolidationLog.action == 'deprecated')
+            )
+        )
         assert len(deprecated_logs) == 1
-        assert "superseded" in deprecated_logs[0]["rationale"].lower()
+        assert "superseded" in deprecated_logs[0].rationale.lower()
 
-    def test_scoped_adds_scope_tag(self, consolidator, tmp_store, ephemeral_file):
-        """When resolution_type is scoped, the memory gets a scope: tag."""
-        memory_id = tmp_store.create(
-            path="style/imports.md",
+    def test_scoped_adds_scope_tag(self, consolidator, base, ephemeral_file):
+        mem = _create_memory(
+            title="Import style",
             content="Always use absolute imports.",
-            metadata={
-                "stage": "consolidated",
-                "title": "Import style",
-                "summary": "Absolute imports only.",
-                "tags": ["python"],
-            },
+            summary="Absolute imports only.",
+            tags=["python"],
         )
 
         decisions = [
@@ -977,7 +869,7 @@ class TestContradictionResolution:
                 "tags": ["python"],
                 "target_path": "style/imports_v2.md",
                 "reinforces": None,
-                "contradicts": memory_id,
+                "contradicts": mem.id,
             }
         ]
 
@@ -988,26 +880,18 @@ class TestContradictionResolution:
             "confidence": 0.85,
         }
 
-        consolidation_response = _llm_response(decisions)
-        resolution_response = _resolution_response(scoped_resolution)
-
-        with patch("core.consolidator.anthropic.Anthropic") as mock_cls:
-            mock_cls.return_value.messages.create.side_effect = [
-                consolidation_response,
-                resolution_response,
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.side_effect = [
+                _llm_response_text(decisions),
+                _resolution_response_text(scoped_resolution),
             ]
             result = consolidator.consolidate_session(ephemeral_file, "sess-031")
 
         assert len(result["resolved"]) == 1
         assert result["resolved"][0]["resolution_type"] == "scoped"
 
-        # Memory should have scope tag added
-        updated = tmp_store.get(memory_id)
-        tags = updated.get("tags", [])
-        if isinstance(tags, str):
-            import json as _json
-            tags = _json.loads(tags)
+        updated = Memory.get_by_id(mem.id)
+        tags = updated.tag_list
         assert any(t.startswith("scope:") for t in tags)
-        assert "relative" in updated["content"].lower()
-        # Should NOT be archived
-        assert updated.get("archived_at") is None
+        assert "relative" in updated.content.lower()
+        assert updated.archived_at is None

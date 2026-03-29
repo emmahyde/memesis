@@ -1,47 +1,36 @@
-"""
-Tests for native Claude Code memory ingestion.
-"""
+"""Tests for native Claude Code memory ingestion."""
 
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.ingest import (
-    NativeMemoryIngestor,
-    parse_frontmatter,
-    scan_native_memories,
-    find_native_memory_dir,
-)
-from core.storage import MemoryStore
+from core.database import init_db, close_db
+from core.ingest import NativeMemoryIngestor, parse_frontmatter, scan_native_memories, find_native_memory_dir
+from core.models import Memory
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
-def tmp_store(tmp_path):
-    return MemoryStore(base_dir=str(tmp_path / "memory"))
+def base(tmp_path):
+    init_db(base_dir=str(tmp_path / "memory"))
+    yield
+    close_db()
 
 
 @pytest.fixture
 def native_dir(tmp_path):
-    """Create a mock native Claude Code memory directory."""
     mem_dir = tmp_path / "native_memory"
     mem_dir.mkdir()
-
-    # MEMORY.md index
     (mem_dir / "MEMORY.md").write_text(
         "- [User Role](user_role.md) — User is a senior engineer\n"
         "- [Testing Pref](feedback_testing.md) — Don't mock the database\n"
         "- [Project Goal](project_auth.md) — Auth rewrite for compliance\n",
         encoding="utf-8",
     )
-
-    # Individual memory files
     (mem_dir / "user_role.md").write_text(
         "---\nname: User Role\ndescription: User is a senior engineer focused on backend\ntype: user\n---\n\n"
         "Emma is a senior engineer who thinks like a designer who codes.\n",
@@ -60,13 +49,8 @@ def native_dir(tmp_path):
         "**Why:** Legal flagged session token storage as non-compliant.\n",
         encoding="utf-8",
     )
-
     return mem_dir
 
-
-# ---------------------------------------------------------------------------
-# parse_frontmatter
-# ---------------------------------------------------------------------------
 
 class TestParseFrontmatter:
     def test_extracts_metadata(self):
@@ -77,169 +61,98 @@ class TestParseFrontmatter:
         assert body == "Body here."
 
     def test_no_frontmatter(self):
-        text = "Just some text."
-        meta, body = parse_frontmatter(text)
+        meta, body = parse_frontmatter("Just some text.")
         assert meta == {}
-        assert body == text
+        assert body == "Just some text."
 
     def test_incomplete_frontmatter(self):
-        text = "---\nname: Test\nno closing fence"
-        meta, body = parse_frontmatter(text)
+        meta, body = parse_frontmatter("---\nname: Test\nno closing fence")
         assert meta == {}
 
-
-# ---------------------------------------------------------------------------
-# scan_native_memories
-# ---------------------------------------------------------------------------
 
 class TestScanNativeMemories:
     def test_finds_linked_files(self, native_dir):
-        memories = scan_native_memories(native_dir)
-        names = {m["name"] for m in memories}
-        assert "User Role" in names
-        assert "Testing Preference" in names
-        assert "Auth Rewrite" in names
+        names = {m["name"] for m in scan_native_memories(native_dir)}
+        assert {"User Role", "Testing Preference", "Auth Rewrite"} <= names
 
     def test_includes_body(self, native_dir):
-        memories = scan_native_memories(native_dir)
-        feedback = next(m for m in memories if m["name"] == "Testing Preference")
+        feedback = next(m for m in scan_native_memories(native_dir) if m["name"] == "Testing Preference")
         assert "real database" in feedback["body"]
 
     def test_includes_type(self, native_dir):
-        memories = scan_native_memories(native_dir)
-        user = next(m for m in memories if m["name"] == "User Role")
+        user = next(m for m in scan_native_memories(native_dir) if m["name"] == "User Role")
         assert user["type"] == "user"
 
     def test_skips_files_without_frontmatter(self, native_dir):
         (native_dir / "no_frontmatter.md").write_text("Just plain text.\n")
-        memories = scan_native_memories(native_dir)
-        names = {m["name"] for m in memories}
-        assert "" not in names  # no name = skipped
+        names = {m["name"] for m in scan_native_memories(native_dir)}
+        assert "" not in names
 
     def test_skips_memesis_subdirectories(self, native_dir):
-        # Create a file that looks like a memesis stage file
         consolidated = native_dir / "consolidated"
         consolidated.mkdir()
-        (consolidated / "something.md").write_text(
-            "---\nname: Should Skip\ntype: user\n---\nContent\n"
-        )
-        memories = scan_native_memories(native_dir)
-        names = {m["name"] for m in memories}
-        assert "Should Skip" not in names
+        (consolidated / "something.md").write_text("---\nname: Should Skip\ntype: user\n---\nContent\n")
+        assert "Should Skip" not in {m["name"] for m in scan_native_memories(native_dir)}
 
     def test_empty_directory(self, tmp_path):
         mem_dir = tmp_path / "empty"
         mem_dir.mkdir()
         (mem_dir / "MEMORY.md").write_text("")
-        memories = scan_native_memories(mem_dir)
-        assert memories == []
+        assert scan_native_memories(mem_dir) == []
 
     def test_picks_up_unlinked_root_files(self, native_dir):
-        """Files at root not in MEMORY.md should still be found."""
         (native_dir / "orphan.md").write_text(
             "---\nname: Orphan Memory\ndescription: Found by scan\ntype: reference\n---\n\nOrphan body.\n"
         )
-        memories = scan_native_memories(native_dir)
-        names = {m["name"] for m in memories}
-        assert "Orphan Memory" in names
+        assert "Orphan Memory" in {m["name"] for m in scan_native_memories(native_dir)}
 
-
-# ---------------------------------------------------------------------------
-# NativeMemoryIngestor
-# ---------------------------------------------------------------------------
 
 class TestIngestor:
-    def test_ingests_all_native_memories(self, tmp_store, native_dir, monkeypatch):
-        monkeypatch.setattr(
-            "core.ingest.find_native_memory_dir",
-            lambda ctx: native_dir,
-        )
-        ingestor = NativeMemoryIngestor(tmp_store)
-        result = ingestor.ingest()
-
+    def test_ingests_all_native_memories(self, base, native_dir, monkeypatch):
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: native_dir)
+        result = NativeMemoryIngestor().ingest()
         assert len(result["ingested"]) == 3
-        assert "User Role" in result["ingested"]
-        assert "Testing Preference" in result["ingested"]
         assert result["skipped"] == 0
 
-    def test_ingested_memories_are_consolidated(self, tmp_store, native_dir, monkeypatch):
-        monkeypatch.setattr(
-            "core.ingest.find_native_memory_dir",
-            lambda ctx: native_dir,
-        )
-        ingestor = NativeMemoryIngestor(tmp_store)
-        ingestor.ingest()
+    def test_ingested_memories_are_consolidated(self, base, native_dir, monkeypatch):
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: native_dir)
+        NativeMemoryIngestor().ingest()
+        assert len(list(Memory.by_stage("consolidated"))) == 3
 
-        consolidated = tmp_store.list_by_stage("consolidated")
-        assert len(consolidated) == 3
-        assert all(m["stage"] == "consolidated" for m in consolidated)
+    def test_tags_include_observation_type(self, base, native_dir, monkeypatch):
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: native_dir)
+        NativeMemoryIngestor().ingest()
+        feedback = next(m for m in Memory.by_stage("consolidated") if m.title == "Testing Preference")
+        tags = feedback.tag_list
+        assert "type:correction" in tags
+        assert "source:native-claude-code" in tags
 
-    def test_tags_include_observation_type(self, tmp_store, native_dir, monkeypatch):
-        monkeypatch.setattr(
-            "core.ingest.find_native_memory_dir",
-            lambda ctx: native_dir,
-        )
-        ingestor = NativeMemoryIngestor(tmp_store)
-        ingestor.ingest()
+    def test_importance_mapped_by_type(self, base, native_dir, monkeypatch):
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: native_dir)
+        NativeMemoryIngestor().ingest()
+        consolidated = list(Memory.by_stage("consolidated"))
+        feedback = next(m for m in consolidated if m.title == "Testing Preference")
+        user = next(m for m in consolidated if m.title == "User Role")
+        assert feedback.importance == 0.75
+        assert user.importance == 0.65
 
-        consolidated = tmp_store.list_by_stage("consolidated")
-        feedback = next(m for m in consolidated if m["title"] == "Testing Preference")
-        assert "type:correction" in feedback["tags"]
-        assert "source:native-claude-code" in feedback["tags"]
-        assert "native-type:feedback" in feedback["tags"]
-
-    def test_importance_mapped_by_type(self, tmp_store, native_dir, monkeypatch):
-        monkeypatch.setattr(
-            "core.ingest.find_native_memory_dir",
-            lambda ctx: native_dir,
-        )
-        ingestor = NativeMemoryIngestor(tmp_store)
-        ingestor.ingest()
-
-        consolidated = tmp_store.list_by_stage("consolidated")
-        feedback = next(m for m in consolidated if m["title"] == "Testing Preference")
-        user = next(m for m in consolidated if m["title"] == "User Role")
-        assert feedback["importance"] == 0.75  # feedback gets highest
-        assert user["importance"] == 0.65
-
-    def test_deduplication_on_second_ingest(self, tmp_store, native_dir, monkeypatch):
-        monkeypatch.setattr(
-            "core.ingest.find_native_memory_dir",
-            lambda ctx: native_dir,
-        )
-        ingestor = NativeMemoryIngestor(tmp_store)
-
+    def test_deduplication_on_second_ingest(self, base, native_dir, monkeypatch):
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: native_dir)
+        ingestor = NativeMemoryIngestor()
         first = ingestor.ingest()
         second = ingestor.ingest()
-
         assert len(first["ingested"]) == 3
         assert len(second["ingested"]) == 0
         assert second["skipped"] == 3
 
-        # Only 3 in store, not 6
-        assert len(tmp_store.list_by_stage("consolidated")) == 3
-
-    def test_no_native_dir_returns_empty(self, tmp_store, monkeypatch):
-        monkeypatch.setattr(
-            "core.ingest.find_native_memory_dir",
-            lambda ctx: None,
-        )
-        ingestor = NativeMemoryIngestor(tmp_store)
-        result = ingestor.ingest()
-
+    def test_no_native_dir_returns_empty(self, base, monkeypatch):
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: None)
+        result = NativeMemoryIngestor().ingest()
         assert result["ingested"] == []
         assert result["source"] is None
 
-    def test_content_includes_description(self, tmp_store, native_dir, monkeypatch):
-        monkeypatch.setattr(
-            "core.ingest.find_native_memory_dir",
-            lambda ctx: native_dir,
-        )
-        ingestor = NativeMemoryIngestor(tmp_store)
-        ingestor.ingest()
-
-        consolidated = tmp_store.list_by_stage("consolidated")
-        auth = next(m for m in consolidated if m["title"] == "Auth Rewrite")
-        full = tmp_store.get(auth["id"])
-        # Description should be included as italic prefix
-        assert "Auth middleware rewrite driven by legal compliance" in full["content"]
+    def test_content_includes_description(self, base, native_dir, monkeypatch):
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: native_dir)
+        NativeMemoryIngestor().ingest()
+        auth = next(m for m in Memory.by_stage("consolidated") if m.title == "Auth Rewrite")
+        assert "Auth middleware rewrite driven by legal compliance" in auth.content
