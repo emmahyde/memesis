@@ -89,12 +89,21 @@
 | LIFE-04 | Phase 18 | Pending |
 | RETR-01 | Phase 19 | Pending |
 | RETR-02 | Phase 20 | Pending |
+| PROS-01 | Phase 21 (v2) | Future |
+| PROS-02 | Phase 22 (v2) | Future |
+| SENS-01 | Phase 23 (v2) | Future |
+| SENS-02 | Phase 24 (v2) | Future |
+| LEARN-01 | Phase 25 (v2) | Future |
+| LEARN-02 | Phase 26 (v2) | Future |
 
 **Coverage:**
 - v1 requirements: 20 total
-- Mapped to phases: 20
-- Unmapped: 0
+- v1 mapped to phases: 20
+- v1 unmapped: 0
+- v2 requirements: 6 total
+- v2 mapped to future phases: 6
+- v2 unmapped: 0
 
 ---
 *Requirements defined: 2026-03-29*
-*Last updated: 2026-03-29 after initial definition*
+*Last updated: 2026-03-29 after roadmap creation — v2 traceability added*
