@@ -1,6 +1,6 @@
 ---
 name: recall
-description: Use when the user asks "what do you know about X", "recall X", "search memories for X", "look up X", or wants to retrieve information from memory. This skill searches memories and returns results. Does NOT overlap with memory stats or health diagnostics — use /memory for those.
+description: Use when the user asks "what do you know about X", "recall X", "search memories for X", "look up X", or wants to retrieve information from memory. This skill searches memories and returns results. Does NOT overlap with memory stats (/stats), health diagnostics (/health), or usage analytics (/usage).
 ---
 
 # Recall — Search Memories and Synthesize Results
