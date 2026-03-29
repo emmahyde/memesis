@@ -27,6 +27,7 @@ DEFAULTS = {
     "provenance_signals": True,
     "orienting_detector": True,
     "habituation_baseline": True,
+    "somatic_markers": True,
 }
 
 _cache: dict | None = None
