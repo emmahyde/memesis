@@ -21,6 +21,9 @@ OBSERVATION_TYPES = {
     "workflow_pattern": "How the user thinks and works. 'Uses vim' is trivial. 'Sketches architecture before filling in details' is gold.",
     "self_observation": "Something I notice about my own tendencies or failure modes. Self-awareness compounds.",
     "decision_context": "The reasoning behind a decision, not just the outcome. Constraints and trade-offs that produced it.",
+    "personality": "Who this person IS — values, opinions, energy, directness, aesthetic sense. 'Prefers clean code' is generic. 'Values angular/precise design, provides reference screenshots as specs, pushes back bluntly when quality is off' has texture.",
+    "aesthetic": "Visual taste, quality standards, design sensibility. What they find beautiful, ugly, or acceptable.",
+    "collaboration_dynamic": "How we work together — trust patterns, delegation style, feedback style, when they hand off control vs engage deeply.",
 }
 
 
@@ -66,6 +69,9 @@ SESSION OBSERVATIONS:
 EXISTING MEMORY MANIFEST:
 {manifest_summary}
 
+MANDATORY KEEP:
+- Observations prefixed with [PRIORITY] were explicitly stored by the user via /learn. ALWAYS keep these — the user decided they matter. Do not second-guess.
+
 KEEP ONLY IF it passes one of these gates (in priority order):
 1. CORRECTIONS — You were wrong. What pattern caused it? Would you make the same mistake without this memory? Keep only if the pattern is non-obvious.
 2. PREFERENCE SIGNALS — The user pushed back. But ONLY keep if the preference is surprising or counter-intuitive. "Prefers clean code" fails. "Prefers angular connectors over curved because she reads data flow direction from angles" passes.
@@ -106,7 +112,7 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "summary": "~150 char summary (keep only)",
       "tags": ["tag1", "tag2"],
       "target_path": "category/filename.md (keep only)",
-      "observation_type": "correction|preference_signal|shared_insight|domain_knowledge|workflow_pattern|self_observation|decision_context|null",
+      "observation_type": "correction|preference_signal|shared_insight|domain_knowledge|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic|null",
       "reinforces": "memory_id or null",
       "contradicts": "memory_id or null"
     }}
