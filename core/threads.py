@@ -15,12 +15,36 @@ This module:
 """
 
 import json
-import os
 import re
 from datetime import datetime, timedelta
 from typing import Optional
 
+from .llm import call_llm
 from .storage import MemoryStore
+
+
+def _get_embeddings(texts: list[str]):
+    """
+    Encode texts with sentence-transformers (all-MiniLM-L6-v2).
+
+    Returns numpy array of shape (len(texts), 384), or None if
+    sentence-transformers is unavailable. Caller falls back to tag-overlap.
+
+    Per D-06: lazy call-site import — no top-level sentence_transformers import.
+    Per D-05: only called from PreCompact/cron contexts (threads.py is invoked
+    only from build_threads, which is called from those contexts).
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        return model.encode(texts)
+    except Exception:
+        import sys
+        print(
+            "[threads] sentence-transformers unavailable, falling back to tag-overlap",
+            file=sys.stderr,
+        )
+        return None
 
 # ---------------------------------------------------------------------------
 # Narrative synthesis prompt
@@ -73,32 +97,6 @@ Respond ONLY with valid JSON:
   "arc_type": "correction_chain|preference_evolution|knowledge_building|pattern_discovery",
   "confidence": 0.0-1.0
 }}"""
-
-
-def _call_llm(prompt: str) -> dict:
-    """Call the LLM for narrative synthesis."""
-    import anthropic
-
-    if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-        client = anthropic.AnthropicBedrock()
-        model = "us.anthropic.claude-sonnet-4-6"
-    else:
-        client = anthropic.Anthropic()
-        model = "claude-sonnet-4-6"
-
-    response = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        temperature=0.3,  # Slightly creative for narrative voice
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    return json.loads(text)
 
 
 class ThreadDetector:
@@ -163,8 +161,18 @@ class ThreadDetector:
             except (KeyError, ValueError):
                 continue
 
-        # Cluster by tag overlap + temporal proximity
-        clusters = self._cluster_by_tags(full_candidates)
+        # Try embedding-based clustering first (D-09: threshold 0.70 — topical
+        # overlap, not content convergence). Fall back to tag overlap.
+        texts = [
+            f"{m.get('title', '')} {m.get('content', '')[:200]}"
+            for m in full_candidates
+        ]
+        embeddings = _get_embeddings(texts)
+
+        if embeddings is not None:
+            clusters = self._cluster_by_embeddings(full_candidates, embeddings, threshold=0.70)
+        else:
+            clusters = self._cluster_by_tags(full_candidates)
 
         # Filter clusters that are too small or too spread
         valid_clusters = []
@@ -244,6 +252,49 @@ class ThreadDetector:
 
         return list(groups.values())
 
+    def _cluster_by_embeddings(
+        self,
+        memories: list[dict],
+        embeddings,  # numpy array (N, 384)
+        threshold: float,
+    ) -> list[list[dict]]:
+        """
+        Group memories using cosine similarity on embeddings with union-find.
+
+        Two memories are placed in the same cluster if their cosine similarity
+        is >= threshold. Same union-find structure as _cluster_by_tags.
+        """
+        import numpy as np
+
+        n = len(memories)
+        if n == 0:
+            return []
+
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        normed = embeddings / np.maximum(norms, 1e-9)
+        sims = normed @ normed.T  # (N, N) cosine similarity matrix
+
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if sims[i, j] >= threshold:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+        groups: dict[int, list[dict]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(memories[i])
+
+        return list(groups.values())
+
     def _has_temporal_spread(self, sorted_cluster: list[dict]) -> bool:
         """
         Check that a cluster spans multiple sessions (not all from one burst).
@@ -313,7 +364,8 @@ class ThreadNarrator:
         prompt = NARRATIVE_PROMPT.format(memories=memories_text)
 
         try:
-            result = _call_llm(prompt)
+            raw = call_llm(prompt, max_tokens=1024, temperature=0.3)
+            result = json.loads(raw)
         except Exception:
             return None
 

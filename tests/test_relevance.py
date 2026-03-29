@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -445,3 +446,70 @@ class TestDaysSinceActivity:
         memory = {}  # no timestamp fields
         days = engine._days_since_last_activity(memory)
         assert days == 365.0
+
+
+# ---------------------------------------------------------------------------
+# Semantic rehydration (D-09, D-10)
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticRehydration:
+    """Tests for _find_semantic_matches supplementing FTS in find_rehydration_by_observation."""
+
+    def test_semantic_match_supplements_fts(self, engine, tmp_store):
+        """A memory that FTS would miss is found via the semantic path."""
+        # "Zymurgical Process" contains no software-related FTS tokens —
+        # FTS will not match a query like "software deployment pipeline".
+        # We patch _find_semantic_matches to return this memory directly,
+        # simulating what a real embedding model would do.
+        mid = _create_memory(tmp_store, "Zymurgical Process", importance=0.6, days_ago=30)
+        tmp_store.archive(mid)
+        archived_mem = tmp_store.get(mid)
+
+        with patch.object(
+            engine,
+            "_find_semantic_matches",
+            return_value=[archived_mem],
+        ):
+            matches = engine.find_rehydration_by_observation("software deployment pipeline")
+
+        assert any(m["id"] == mid for m in matches), (
+            "The archived memory should be found via the semantic supplement path"
+        )
+
+    def test_semantic_match_deduplicates_fts_results(self, engine, tmp_store):
+        """A memory returned by both FTS and semantic paths appears exactly once."""
+        mid = _create_memory(tmp_store, "Payment Pipeline Locking", importance=0.6, days_ago=30)
+        tmp_store.archive(mid)
+        archived_mem = tmp_store.get(mid)
+
+        # Patch _find_semantic_matches to return the same memory that FTS will also find.
+        # The FTS query for "payment pipeline" should match the title above.
+        with patch.object(
+            engine,
+            "_find_semantic_matches",
+            return_value=[archived_mem],
+        ):
+            matches = engine.find_rehydration_by_observation(
+                "We need to fix the payment pipeline deadlock issue"
+            )
+
+        ids = [m["id"] for m in matches]
+        assert ids.count(mid) == 1, (
+            "Memory returned by both FTS and semantic paths should appear only once"
+        )
+
+    def test_semantic_rehydration_fallback_when_unavailable(self, engine, tmp_store):
+        """When _find_semantic_matches returns [], FTS results are still returned."""
+        mid = _create_memory(tmp_store, "Payment Pipeline Locking", importance=0.6, days_ago=30)
+        tmp_store.archive(mid)
+
+        with patch.object(engine, "_find_semantic_matches", return_value=[]):
+            matches = engine.find_rehydration_by_observation(
+                "We need to fix the payment pipeline deadlock issue"
+            )
+
+        # FTS should still find this memory regardless of semantic being unavailable.
+        assert any(m["id"] == mid for m in matches), (
+            "FTS path should work independently of semantic availability"
+        )

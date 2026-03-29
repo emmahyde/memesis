@@ -272,7 +272,9 @@ class RelevanceEngine:
         observation is about a topic that has archived memories, those
         memories should be rehydrated.
 
-        Uses FTS search against archived memories only.
+        Uses FTS search against archived memories first, then supplements with
+        semantic similarity matching via sentence-transformers (D-09). The
+        semantic path is additive — FTS results are preserved and deduplicated.
 
         Args:
             observation: The text of the new observation.
@@ -301,7 +303,7 @@ class RelevanceEngine:
         try:
             fts_results = self.store.search_fts(query, limit=REHYDRATION_FTS_LIMIT)
         except Exception:
-            return []
+            fts_results = []
 
         # Filter to archived only, excluding subsumed memories (inhibition)
         matches = []
@@ -309,6 +311,92 @@ class RelevanceEngine:
             if memory.get("archived_at") and not memory.get("subsumed_by"):
                 relevance = self.compute_relevance(memory)
                 memory["relevance"] = relevance
+                matches.append(memory)
+
+        # Supplement with semantic matches — find archived memories not already
+        # returned by FTS that are semantically similar to the observation.
+        seen_ids = {m["id"] for m in matches}
+        archived_pool = [
+            m for m in self.store.list_archived()
+            if not m.get("subsumed_by") and m["id"] not in seen_ids
+        ]
+        semantic = self._find_semantic_matches(observation, archived_pool)
+        for m in semantic:
+            if m["id"] not in seen_ids:
+                relevance = self.compute_relevance(m)
+                m["relevance"] = relevance
+                matches.append(m)
+                seen_ids.add(m["id"])
+
+        return matches
+
+    def _find_semantic_matches(
+        self,
+        observation: str,
+        archived_memories: list[dict],
+        threshold: float = 0.65,
+    ) -> list[dict]:
+        """
+        Find archived memories semantically similar to the observation.
+
+        Uses sentence-transformers (all-MiniLM-L6-v2) with lazy call-site
+        import (D-06). Returns [] if embeddings are unavailable or the
+        archived list is empty.
+
+        Only called from find_rehydration_by_observation as a supplement
+        to FTS results. Caller deduplicates by memory ID.
+
+        Per D-05: safe to use here because find_rehydration_by_observation is
+        only called from Consolidator.consolidate_session, which runs in
+        PreCompact (30s budget) or cron (no budget).
+
+        Args:
+            observation: The text of the new observation.
+            archived_memories: Pool of archived memories to compare against
+                (already excluding FTS matches and subsumed memories).
+            threshold: Cosine similarity threshold (default 0.65 — lower than
+                crystallizer's 0.75; rehydration needs topical relevance, not
+                content convergence).
+
+        Returns:
+            List of matching memory dicts with 'semantic_similarity' key added.
+        """
+        if not archived_memories:
+            return []
+
+        try:
+            from sentence_transformers import SentenceTransformer
+            import numpy as np
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            import sys
+            print(
+                "[relevance] sentence-transformers unavailable, skipping semantic rehydration",
+                file=sys.stderr,
+            )
+            return []
+
+        texts = [f"{m.get('title', '')} {m.get('summary', '')}" for m in archived_memories]
+        try:
+            all_texts = [observation] + texts
+            embeddings = model.encode(all_texts)
+            obs_vec = embeddings[0:1]
+            mem_vecs = embeddings[1:]
+
+            norms_obs = np.linalg.norm(obs_vec, axis=1, keepdims=True)
+            norms_mem = np.linalg.norm(mem_vecs, axis=1, keepdims=True)
+            sims = (obs_vec / np.maximum(norms_obs, 1e-9)) @ (
+                mem_vecs / np.maximum(norms_mem, 1e-9)
+            ).T
+            sims = sims.flatten()
+        except Exception:
+            return []
+
+        matches = []
+        for i, sim in enumerate(sims):
+            if sim >= threshold:
+                memory = archived_memories[i]
+                memory["semantic_similarity"] = float(sim)
                 matches.append(memory)
 
         return matches

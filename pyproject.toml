@@ -14,6 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+nlp = [
+    "sentence-transformers>=2.7",
+]
 eval = [
     "inspect-ai",
     "ragas",
