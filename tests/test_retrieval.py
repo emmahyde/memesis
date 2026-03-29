@@ -10,7 +10,7 @@ Covers:
 
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1257,3 +1257,218 @@ class TestThompsonSampling:
         assert len(result) == 1
         assert result[0].id == mem.id
         # Verify the Beta params would be valid: a=6, b=max(3-5,0)+1=1 (not 0 or negative)
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 -- Provenance Signals
+# ---------------------------------------------------------------------------
+
+
+class TestProvenanceSignals:
+    """Tests for _compute_provenance_batch and inject_for_session provenance formatting."""
+
+    def _make_crystallized(self, title, content="Content", summary=None, created_at=None):
+        """Helper to create a crystallized memory with optional created_at."""
+        now = datetime.now().isoformat()
+        ca = created_at.isoformat() if created_at else now
+        mem = Memory.create(
+            stage="crystallized",
+            title=title,
+            summary=summary or f"Summary of {title}",
+            content=content,
+            tags="[]",
+            importance=0.7,
+            created_at=ca,
+            updated_at=now,
+        )
+        return mem
+
+    def test_multi_session_provenance(self, base, engine):
+        """Test 1: 5 RetrievalLog entries across 3 distinct session_ids spanning 21 days
+        produces 'Established across 3 sessions over 3 weeks'."""
+        now = datetime.now()
+        mem = self._make_crystallized("Multi Session Memory", created_at=now - timedelta(days=30))
+
+        # 3 distinct sessions, earliest entry 21 days ago
+        earliest = now - timedelta(days=21)
+        RetrievalLog.create(timestamp=earliest.isoformat(), session_id="s1", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=(now - timedelta(days=14)).isoformat(), session_id="s1", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=(now - timedelta(days=10)).isoformat(), session_id="s2", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=(now - timedelta(days=5)).isoformat(), session_id="s3", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=(now - timedelta(days=1)).isoformat(), session_id="s3", memory_id=mem.id, retrieval_type="injected")
+
+        result = engine._compute_provenance_batch([mem.id])
+
+        assert mem.id in result
+        assert "Established across 3 sessions" in result[mem.id]
+        assert "3 weeks" in result[mem.id]
+
+    def test_single_session_provenance(self, base, engine):
+        """Test 2: Memory with RetrievalLog entries from only 1 session_id and created_at 2
+        days ago produces 'First observed 2 days ago'."""
+        now = datetime.now()
+        created = now - timedelta(days=2)
+        mem = self._make_crystallized("Single Session Memory", created_at=created)
+
+        RetrievalLog.create(timestamp=(now - timedelta(days=1)).isoformat(), session_id="only_session", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=now.isoformat(), session_id="only_session", memory_id=mem.id, retrieval_type="injected")
+
+        result = engine._compute_provenance_batch([mem.id])
+
+        assert mem.id in result
+        assert "First observed" in result[mem.id]
+        assert "2 days ago" in result[mem.id]
+
+    def test_zero_session_provenance(self, base, engine):
+        """Test 3: Memory with zero RetrievalLog entries and created_at 1 hour ago
+        produces 'First observed recently'."""
+        now = datetime.now()
+        created = now - timedelta(hours=1)
+        mem = self._make_crystallized("Zero Session Memory", created_at=created)
+
+        result = engine._compute_provenance_batch([mem.id])
+
+        assert mem.id in result
+        assert "First observed" in result[mem.id]
+        assert "recently" in result[mem.id]
+
+    def test_week_rounding_ten_days(self, base, engine):
+        """Test 4a: A memory spanning 10 days shows 'over 1 week' (floor division by 7)."""
+        now = datetime.now()
+        mem = self._make_crystallized("Ten Day Memory", created_at=now - timedelta(days=30))
+
+        earliest = now - timedelta(days=10)
+        RetrievalLog.create(timestamp=earliest.isoformat(), session_id="sessA", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=now.isoformat(), session_id="sessB", memory_id=mem.id, retrieval_type="injected")
+
+        result = engine._compute_provenance_batch([mem.id])
+
+        assert mem.id in result
+        assert "1 week" in result[mem.id]
+
+    def test_week_rounding_less_than_week(self, base, engine):
+        """Test 4b: A memory spanning 0-6 days shows 'over less than a week'."""
+        now = datetime.now()
+        mem = self._make_crystallized("Short Span Memory", created_at=now - timedelta(days=30))
+
+        earliest = now - timedelta(days=5)
+        RetrievalLog.create(timestamp=earliest.isoformat(), session_id="sessX", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=now.isoformat(), session_id="sessY", memory_id=mem.id, retrieval_type="injected")
+
+        result = engine._compute_provenance_batch([mem.id])
+
+        assert mem.id in result
+        assert "less than a week" in result[mem.id]
+
+    def test_injection_format_provenance_between_title_and_summary(self, base, engine, monkeypatch):
+        """Test 5: inject_for_session output contains the provenance line as italic text
+        between the title line and the summary line for each Tier 2 memory."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {
+            "hybrid_rrf": False,
+            "thompson_sampling": False,
+            "provenance_signals": True,
+        })
+
+        now = datetime.now()
+        mem = self._make_crystallized(
+            "Provenance Format Test",
+            content="Some content",
+            summary="A useful summary",
+            created_at=now - timedelta(days=30),
+        )
+
+        # Multi-session: provenance should appear
+        RetrievalLog.create(timestamp=(now - timedelta(days=20)).isoformat(), session_id="sA", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=(now - timedelta(days=10)).isoformat(), session_id="sB", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=now.isoformat(), session_id="sC", memory_id=mem.id, retrieval_type="injected")
+
+        output = engine.inject_for_session(session_id="fmt_test")
+
+        lines = output.splitlines()
+        title_idx = next(i for i, l in enumerate(lines) if "Provenance Format Test" in l)
+        # Line after title should be a provenance italic line
+        assert title_idx + 1 < len(lines)
+        provenance_line = lines[title_idx + 1]
+        assert provenance_line.startswith("*")
+        assert provenance_line.endswith("*")
+        assert "Established across" in provenance_line or "First observed" in provenance_line
+
+        # The summary line should appear after the provenance line
+        summary_idx = next(i for i, l in enumerate(lines) if "A useful summary" in l)
+        assert summary_idx > title_idx + 1
+
+    def test_flag_disabled_no_provenance(self, base, engine, monkeypatch):
+        """Test 6: When provenance_signals flag is False, inject_for_session output does NOT
+        contain any provenance line — formatting identical to pre-Phase 10 behavior."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {
+            "hybrid_rrf": False,
+            "thompson_sampling": False,
+            "provenance_signals": False,
+        })
+
+        now = datetime.now()
+        mem = self._make_crystallized(
+            "Flag Disabled Test",
+            content="Some content here",
+            summary="Summary text",
+            created_at=now - timedelta(days=30),
+        )
+
+        # Multi-session retrieval history
+        RetrievalLog.create(timestamp=(now - timedelta(days=14)).isoformat(), session_id="pA", memory_id=mem.id, retrieval_type="injected")
+        RetrievalLog.create(timestamp=(now - timedelta(days=7)).isoformat(), session_id="pB", memory_id=mem.id, retrieval_type="injected")
+
+        output = engine.inject_for_session(session_id="flag_off_test")
+
+        assert "Established across" not in output
+        assert "First observed" not in output
+
+        # Verify the format still has title + summary without provenance
+        assert "Flag Disabled Test" in output
+        assert "Summary text" in output
+
+        lines = output.splitlines()
+        title_idx = next(i for i, l in enumerate(lines) if "Flag Disabled Test" in l)
+        # The line immediately after title should be the summary (or content), not a provenance line
+        # We verify no "Established" or "First observed" in the vicinity
+        next_non_empty_idx = next(
+            i for i in range(title_idx + 1, len(lines)) if lines[i].strip()
+        )
+        next_line = lines[next_non_empty_idx]
+        assert "Established" not in next_line
+        assert "First observed" not in next_line
+
+    def test_batch_query_single_query_for_multiple_ids(self, base, engine, monkeypatch):
+        """Test 7: _compute_provenance_batch called with a batch of memory IDs issues
+        a single query, not N individual queries."""
+        import core.models as models_module
+
+        now = datetime.now()
+        mems = []
+        for i in range(4):
+            mem = self._make_crystallized(f"Batch Memory {i}", created_at=now - timedelta(days=30))
+            mems.append(mem)
+            # Give each memory 2 distinct sessions
+            RetrievalLog.create(timestamp=(now - timedelta(days=10 + i)).isoformat(), session_id=f"bsA{i}", memory_id=mem.id, retrieval_type="injected")
+            RetrievalLog.create(timestamp=(now - timedelta(days=i)).isoformat(), session_id=f"bsB{i}", memory_id=mem.id, retrieval_type="injected")
+
+        query_count = [0]
+        original_select = RetrievalLog.select
+
+        def counting_select(*args, **kwargs):
+            query_count[0] += 1
+            return original_select(*args, **kwargs)
+
+        monkeypatch.setattr(RetrievalLog, "select", counting_select)
+
+        memory_ids = [m.id for m in mems]
+        result = engine._compute_provenance_batch(memory_ids)
+
+        # Should have issued at most 2 queries (one for RetrievalLog batch, one for Memory created_at fallback)
+        assert query_count[0] <= 2, f"Expected at most 2 queries, got {query_count[0]}"
+        # All 4 memories should have provenance strings
+        assert len(result) == 4
+        for mem in mems:
+            assert mem.id in result
