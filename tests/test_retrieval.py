@@ -528,3 +528,284 @@ def test_inject_for_session_multiple_tiers_both_logged(store, engine):
     # Both logged as 'injected' type
     for entry in log:
         assert entry["retrieval_type"] == "injected"
+
+
+# ---------------------------------------------------------------------------
+# D3 — Thread budget (THREAD_BUDGET_CHARS = 8_000)
+# ---------------------------------------------------------------------------
+
+
+class TestThreadBudget:
+    """Tests for the greedy THREAD_BUDGET_CHARS packing in _get_thread_narratives."""
+
+    def test_short_threads_fit_within_budget(self, store, engine):
+        """Three threads with ~200-char narratives each all fit within the 8 000-char budget."""
+        narrative = "Short narrative sentence. " * 8  # ~208 chars
+
+        mem_ids = []
+        for i in range(3):
+            mid = _make_memory(
+                store,
+                path=f"cryst_short_{i}.md",
+                content=f"Crystallized content {i}",
+                stage="crystallized",
+                title=f"Crystal Short {i}",
+            )
+            mem_ids.append(mid)
+
+        tids = []
+        for i, mid in enumerate(mem_ids):
+            tid = store.create_thread(
+                title=f"Thread Short {i}",
+                summary=f"Summary {i}",
+                narrative=narrative,
+                member_ids=[mid],
+            )
+            tids.append(tid)
+
+        result = engine.inject_for_session(session_id="budget_short_sess")
+
+        for i in range(3):
+            assert f"Thread Short {i}" in result
+
+    def test_threads_over_budget_excluded(self, store, engine, monkeypatch):
+        """Threads whose total narrative exceeds the budget are partially excluded.
+
+        Budget is patched to 1 500 so arithmetic is tractable without interfering
+        with the 1 000-char narrative cap.  Narratives are all under 1 000 chars:
+          C = 200, A = 600, B = 800 (sorted shortest-first)
+          200 + 600 = 800 (fits); 800 more would reach 1 600 > 1 500 — excluded.
+        """
+        import core.retrieval as retrieval_module
+
+        monkeypatch.setattr(retrieval_module, "THREAD_BUDGET_CHARS", 1_500)
+
+        mem_a = _make_memory(store, "cryst_a.md", "Content A", "crystallized", "Crystal A")
+        mem_b = _make_memory(store, "cryst_b.md", "Content B", "crystallized", "Crystal B")
+        mem_c = _make_memory(store, "cryst_c.md", "Content C", "crystallized", "Crystal C")
+
+        store.create_thread(
+            title="Thread Over Budget A",
+            summary="Medium thread A",
+            narrative="X" * 600,
+            member_ids=[mem_a],
+        )
+        store.create_thread(
+            title="Thread Over Budget B",
+            summary="Large thread B",
+            narrative="Y" * 800,
+            member_ids=[mem_b],
+        )
+        store.create_thread(
+            title="Thread Over Budget C",
+            summary="Small thread C",
+            narrative="Z" * 200,
+            member_ids=[mem_c],
+        )
+
+        result = engine.inject_for_session(session_id="budget_over_sess")
+
+        # C (200) + A (600) = 800 fit; B (800) would push total to 1 600 > 1 500
+        assert "Thread Over Budget C" in result
+        assert "Thread Over Budget A" in result
+        assert "Thread Over Budget B" not in result
+
+    def test_single_thread_over_narrative_cap_is_truncated(self, store, engine):
+        """A thread with a 1 200-char narrative is truncated to <= 1 000 chars ending with '.'."""
+        # Build a narrative just over the 1 000-char cap with clear sentence boundaries.
+        sentence = "Sentence one about async patterns. "
+        # ~35 chars per sentence; 35 repetitions = 1 225 chars
+        long_narrative = sentence * 35
+
+        assert len(long_narrative) > 1_000, "precondition: narrative must exceed cap"
+
+        mid = _make_memory(
+            store,
+            path="cryst_cap.md",
+            content="Crystallized content for cap test",
+            stage="crystallized",
+            title="Crystal Cap",
+        )
+        store.create_thread(
+            title="Thread Cap Test",
+            summary="Thread with long narrative",
+            narrative=long_narrative,
+            member_ids=[mid],
+        )
+
+        result = engine.inject_for_session(session_id="cap_test_sess")
+
+        assert "Thread Cap Test" in result
+
+        # Extract the narrative from the output (lines after "### Thread Cap Test")
+        lines = result.splitlines()
+        thread_header_idx = next(
+            i for i, line in enumerate(lines) if "Thread Cap Test" in line
+        )
+        # Collect narrative lines until next section or end
+        narrative_lines = []
+        for line in lines[thread_header_idx + 1:]:
+            if line.startswith("##") or line.startswith("---"):
+                break
+            narrative_lines.append(line)
+        injected_narrative = "\n".join(narrative_lines).strip()
+
+        assert len(injected_narrative) <= 1_000
+        assert injected_narrative.endswith(".")
+
+    def test_shortest_first_maximises_arc_count(self, store, engine, monkeypatch):
+        """Greedy shortest-first packing picks 3 short threads over 1 long one.
+
+        Budget is patched to 1 800.  Long thread narrative (900 chars) is
+        under the 1 000-char cap, as are the short ones (400 chars each).
+        Sorted shortest-first: 400, 400, 400, 900.
+        Budget: 400+400+400=1 200 (remaining=600); long (900) cannot fit — excluded.
+        If greedy were NOT shortest-first and the long thread were selected first,
+        remaining=900, and only one 400-char short could follow (total=1 300<1 800),
+        meaning only 2 arcs total vs 3 with shortest-first.
+        """
+        import core.retrieval as retrieval_module
+
+        monkeypatch.setattr(retrieval_module, "THREAD_BUDGET_CHARS", 1_800)
+
+        mem_long = _make_memory(
+            store, "cryst_long.md", "Long content", "crystallized", "Crystal Long"
+        )
+        store.create_thread(
+            title="Thread Long Arc",
+            summary="Very long arc",
+            narrative="L" * 900,
+            member_ids=[mem_long],
+        )
+
+        short_titles = []
+        for i in range(3):
+            mid = _make_memory(
+                store,
+                path=f"cryst_short_max_{i}.md",
+                content=f"Short content {i}",
+                stage="crystallized",
+                title=f"Crystal Short Max {i}",
+            )
+            title = f"Thread Short Arc {i}"
+            short_titles.append(title)
+            store.create_thread(
+                title=title,
+                summary=f"Short arc {i}",
+                narrative="S" * 400,
+                member_ids=[mid],
+            )
+
+        result = engine.inject_for_session(session_id="greedy_sess")
+
+        for title in short_titles:
+            assert title in result, f"Expected short thread '{title}' in output"
+        assert "Thread Long Arc" not in result
+
+    def test_budget_zero_excludes_all(self, store, engine, monkeypatch):
+        """When THREAD_BUDGET_CHARS is 0, no Narrative Threads section appears."""
+        import core.retrieval as retrieval_module
+
+        monkeypatch.setattr(retrieval_module, "THREAD_BUDGET_CHARS", 0)
+
+        mid = _make_memory(
+            store,
+            path="cryst_zero.md",
+            content="Crystallized content zero budget",
+            stage="crystallized",
+            title="Crystal Zero",
+        )
+        store.create_thread(
+            title="Thread Zero Budget",
+            summary="Should not appear",
+            narrative="Narrative that should be excluded.",
+            member_ids=[mid],
+        )
+
+        result = engine.inject_for_session(session_id="zero_budget_sess")
+
+        assert "Narrative Threads" not in result
+
+
+# ---------------------------------------------------------------------------
+# D4 — last_surfaced_at tracking
+# ---------------------------------------------------------------------------
+
+
+class TestLastSurfacedAtTracking:
+    """Tests for lazy last_surfaced_at updates in _get_thread_narratives."""
+
+    def test_surfaced_threads_get_timestamp(self, store, engine):
+        """After inject_for_session, a surfaced thread has last_surfaced_at set."""
+        mid = _make_memory(
+            store,
+            path="cryst_surf.md",
+            content="Crystallized surfaced content",
+            stage="crystallized",
+            title="Crystal Surfaced",
+        )
+        tid = store.create_thread(
+            title="Thread Surfaced",
+            summary="Will be surfaced",
+            narrative="A short narrative that will be surfaced.",
+            member_ids=[mid],
+        )
+
+        # Confirm timestamp is None before injection
+        assert store.get_thread(tid)["last_surfaced_at"] is None
+
+        engine.inject_for_session(session_id="surf_sess")
+
+        assert store.get_thread(tid)["last_surfaced_at"] is not None
+
+    def test_non_surfaced_threads_unchanged(self, store, engine, monkeypatch):
+        """A thread not surfaced (memory excluded from tier2) keeps last_surfaced_at=None.
+
+        The tier2 token budget is monkeypatched to 200 chars on the engine.
+        mem_a content with frontmatter is ~106 chars (fits).
+        mem_b content ("B"×500 + frontmatter) is ~590 chars (excluded).
+        Only tid_a's thread enters _get_thread_narratives and gets a timestamp.
+        """
+        # mem_a: small content — fits in patched 200-char tier2 budget
+        mem_a = _make_memory(
+            store,
+            path="cryst_in.md",
+            content="Small content fits",
+            stage="crystallized",
+            title="Crystal In Budget",
+            importance=0.9,
+        )
+        # mem_b: large content — exceeds 200-char budget, excluded from tier2
+        mem_b = _make_memory(
+            store,
+            path="cryst_out.md",
+            content="B" * 500,
+            stage="crystallized",
+            title="Crystal Out Budget",
+            importance=0.1,
+        )
+
+        tid_a = store.create_thread(
+            title="Thread In Budget",
+            summary="Should be surfaced",
+            narrative="Narrative for in-budget thread.",
+            member_ids=[mem_a],
+        )
+        tid_b = store.create_thread(
+            title="Thread Out Budget",
+            summary="Should not be surfaced",
+            narrative="Narrative for out-budget thread.",
+            member_ids=[mem_b],
+        )
+
+        # Patch token_limit to 200 chars: mem_a (~106 chars) fits; mem_b (~590 chars) does not.
+        monkeypatch.setattr(engine, "token_limit", 200)
+        engine.inject_for_session(session_id="non_surf_sess")
+
+        assert store.get_thread(tid_a)["last_surfaced_at"] is not None
+        assert store.get_thread(tid_b)["last_surfaced_at"] is None
+
+    def test_update_threads_last_surfaced_noop_on_empty(self, store):
+        """Calling update_threads_last_surfaced with an empty list raises no error."""
+        # Should complete silently
+        store.update_threads_last_surfaced([], "2026-03-28T00:00:00")
