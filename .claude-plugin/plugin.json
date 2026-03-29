@@ -1,0 +1,5 @@
+{
+  "name": "memesis",
+  "version": "0.2.0",
+  "description": "Self-driven memory lifecycle with autonomous curation for Claude Code"
+}

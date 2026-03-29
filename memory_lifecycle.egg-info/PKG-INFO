@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: memory-lifecycle
+Version: 0.1.0
+Summary: Self-driven memory lifecycle with autonomous curation for Claude Code
+Requires-Python: >=3.10
+Requires-Dist: anthropic>=0.40.0
+Provides-Extra: eval
+Requires-Dist: inspect-ai; extra == "eval"
+Requires-Dist: ragas; extra == "eval"
+Requires-Dist: deepeval; extra == "eval"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
