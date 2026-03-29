@@ -7,6 +7,7 @@ D-09 (demotion: injected 10+ times, never used).
 """
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,10 @@ class FeedbackLoop:
 
     # Usage score threshold — calibrated so 2 title-keyword hits still trigger
     # (3+3 = 6 ≥ 4) while requiring 4+ short content-only hits to trigger.
+    # Re-validated after switching from substring (`w in response_lower`) to
+    # word-boundary regex (`re.search(r'\b...\b', ...)`). The stricter match
+    # eliminates false positives where e.g. "test" matched "testing", but the
+    # threshold value of 4.0 still holds: behavioral tests pass unchanged.
     _USAGE_THRESHOLD = 4.0
 
     def track_usage(self, session_id: str, injected_ids: list[str], response_text: str) -> dict:
@@ -143,7 +148,7 @@ class FeedbackLoop:
             for w in words:
                 if len(w) >= min_len and w not in seen:
                     seen.add(w)
-                    if w in response_lower:
+                    if re.search(rf'\b{re.escape(w)}\b', response_lower):
                         score += source_weight * cls._term_specificity(w)
 
         return score
@@ -261,14 +266,6 @@ class FeedbackLoop:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_keywords(title: str, summary: str) -> list[str]:
-        """
-        Split title and summary into lowercased words, keeping only len >= 4.
-        """
-        words = (title + ' ' + summary).lower().split()
-        return [w for w in words if len(w) >= 4]
 
     def _has_three_consecutive_unused(self, memory_id: str) -> bool:
         """

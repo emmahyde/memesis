@@ -56,6 +56,12 @@ def init_db(reset: bool = False):
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed_sessions (
+            session_id TEXT PRIMARY KEY,
+            processed_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     return conn
 
@@ -115,6 +121,11 @@ def apply_operations(conn: sqlite3.Connection, result: dict, session_id: str):
                 (json.dumps(sources), oid),
             )
 
+    conn.commit()
+    conn.execute(
+        "INSERT OR IGNORE INTO processed_sessions (session_id) VALUES (?)",
+        (session_id,),
+    )
     conn.commit()
 
 
@@ -298,11 +309,16 @@ def main():
         summaries = summaries[:limit]
 
     # Skip already-processed sessions
-    processed = set()
-    rows = conn.execute("SELECT sources FROM observations").fetchall()
-    for r in rows:
-        for s in json.loads(r[0]):
-            processed.add(s)
+    try:
+        processed = set(
+            row[0] for row in conn.execute("SELECT session_id FROM processed_sessions").fetchall()
+        )
+    except sqlite3.OperationalError:
+        # Legacy DB without processed_sessions table — fall back to sources scan
+        processed = set()
+        for r in conn.execute("SELECT sources FROM observations").fetchall():
+            for s in json.loads(r[0]):
+                processed.add(s)
 
     remaining = [s for s in summaries if s["session_id"] not in processed]
     if not remaining:

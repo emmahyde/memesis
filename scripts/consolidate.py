@@ -50,6 +50,12 @@ FREQUENCY SIGNAL:
 - Low frequency (1) = weaker signal. Apply the gate strictly.
 - Frequency is evidence, not proof. A bad observation seen 10 times is still bad.
 
+FREQUENCY FLOOR:
+- Observations seen only once (freq=1) must pass a strict gate: "Would I actively do
+  something wrong next session if I didn't have this?" If the answer is not a clear yes,
+  PRUNE. Single-session observations are hypotheses, not patterns.
+- Do not keep freq=1 observations for completeness, hedging, or "might be useful" reasons.
+
 MERGE GUIDANCE:
 - If multiple observations describe the same underlying pattern, MERGE them into one.
 - The merged observation should be denser and more general than any source.
