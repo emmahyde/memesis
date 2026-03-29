@@ -13,8 +13,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from core.database import close_db, get_vec_store, init_db
 from core.embeddings import embed_for_memory
-from core.storage import MemoryStore
+from core.models import Memory
 
 
 def main():
@@ -30,9 +31,10 @@ def main():
         else:
             print(f"Unknown: {args[i]}", file=sys.stderr); sys.exit(1)
 
-    store = MemoryStore(project_context=project_context)
+    init_db(project_context=project_context)
+    vec_store = get_vec_store()
 
-    if not store._vec_available:
+    if vec_store is None or not vec_store.available:
         print("sqlite-vec not available. Run from plugin venv.", file=sys.stderr)
         sys.exit(1)
 
@@ -40,10 +42,10 @@ def main():
     total = 0
     need_embedding = []
     for stage in ("consolidated", "crystallized", "instinctive"):
-        memories = store.list_by_stage(stage)
+        memories = list(Memory.by_stage(stage))
         for mem in memories:
             total += 1
-            existing = store.get_embedding(mem["id"])
+            existing = vec_store.get_embedding(mem.id)
             if existing is None:
                 need_embedding.append(mem)
 
@@ -51,22 +53,21 @@ def main():
     print(f"Need embedding: {len(need_embedding)}", file=sys.stderr)
 
     if dry_run:
-        store.close()
+        close_db()
         return
 
     embedded = 0
     failed = 0
     for i, mem in enumerate(need_embedding):
-        full = store.get(mem["id"])
-        title = full.get("title", "")
-        summary = full.get("summary", "")
-        content = full.get("content", "")
+        title = mem.title or ""
+        summary = mem.summary or ""
+        content = mem.content or ""
 
         print(f"  [{i+1}/{len(need_embedding)}] {title[:50]}... ", end="", file=sys.stderr, flush=True)
 
         embedding = embed_for_memory(title, summary, content)
         if embedding:
-            store.store_embedding(mem["id"], embedding)
+            vec_store.store_embedding(mem.id, embedding)
             embedded += 1
             print("OK", file=sys.stderr)
         else:
@@ -76,7 +77,7 @@ def main():
         time.sleep(0.1)  # Light rate limiting
 
     print(f"\nEmbedded: {embedded}, Failed: {failed}", file=sys.stderr)
-    store.close()
+    close_db()
 
 
 if __name__ == "__main__":

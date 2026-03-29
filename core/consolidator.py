@@ -9,17 +9,16 @@ to the memory store.
 import hashlib
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
-
+from .database import get_base_dir, get_vec_store
 from .lifecycle import LifecycleManager
+from .llm import call_llm as _call_llm_transport
+from .models import ConsolidationLog, Memory, db
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT, EMOTIONAL_STATE_PATTERNS
 from .relevance import RelevanceEngine
-from .storage import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +34,9 @@ class Consolidator:
 
     def __init__(
         self,
-        store: MemoryStore,
         lifecycle: LifecycleManager,
         model: str = "claude-sonnet-4-6",
     ):
-        self.store = store
         self.lifecycle = lifecycle
         self.model = model
         self._privacy_patterns = [re.compile(p, re.IGNORECASE) for p in EMOTIONAL_STATE_PATTERNS]
@@ -143,14 +140,14 @@ class Consolidator:
             "rehydrated": rehydrated,
         }
 
-    def estimate_token_budget(self, memories: list[dict]) -> int:
+    def estimate_token_budget(self, memories: list) -> int:
         """
-        Rough token estimate for a list of memory dicts.
+        Rough token estimate for a list of memory objects.
 
         Uses the common heuristic of chars / 4.
 
         Args:
-            memories: List of memory dicts (any shape).
+            memories: List of memory objects or dicts.
 
         Returns:
             Estimated token count (int).
@@ -198,14 +195,14 @@ class Consolidator:
         """
         sections = []
         for stage in ("consolidated", "crystallized", "instinctive"):
-            memories = self.store.list_by_stage(stage)
+            memories = list(Memory.by_stage(stage))
             if not memories:
                 continue
             lines = [f"## {stage.capitalize()} ({len(memories)} memories)"]
             for m in memories:
-                title = m.get("title") or "(untitled)"
-                summary = m.get("summary") or ""
-                mid = m.get("id", "")
+                title = m.title or "(untitled)"
+                summary = m.summary or ""
+                mid = m.id
                 lines.append(f"- [{mid}] {title}: {summary}")
             sections.append("\n".join(lines))
 
@@ -224,19 +221,7 @@ class Consolidator:
         Returns:
             List of decision dicts from the LLM.
         """
-        if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-            client = anthropic.AnthropicBedrock()
-            model = "us.anthropic.claude-sonnet-4-6"
-        else:
-            client = anthropic.Anthropic()
-            model = self.model
-        response = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.content[0].text
+        raw = _call_llm_transport(prompt, max_tokens=2048, temperature=0)
 
         try:
             return self._parse_decisions(raw)
@@ -249,13 +234,7 @@ class Consolidator:
                 "Respond ONLY with a valid JSON object starting with { and ending with }. "
                 "No markdown fences, no explanation, no preamble."
             )
-            retry_response = client.messages.create(
-                model=model,
-                max_tokens=2048,
-                temperature=0,
-                messages=[{"role": "user", "content": retry_prompt}],
-            )
-            retry_raw = retry_response.content[0].text
+            retry_raw = _call_llm_transport(retry_prompt, max_tokens=2048, temperature=0)
 
             try:
                 return self._parse_decisions(retry_raw)
@@ -317,29 +296,56 @@ class Consolidator:
             tags.append(f"type:{obs_type}")
 
         # Normalise path: strip any leading "consolidated/" prefix since
-        # store.create() prepends the stage directory itself.
+        # the file path is built from base_dir + stage.
         if target_path.startswith("consolidated/"):
             target_path = target_path[len("consolidated/"):]
 
         try:
-            memory_id = self.store.create(
-                path=target_path,
-                content=observation,
-                metadata={
-                    "stage": "consolidated",
-                    "title": title,
-                    "summary": summary,
-                    "tags": tags,
-                    "source_session": session_id,
-                },
+            base_dir = get_base_dir()
+            file_path = base_dir / "consolidated" / target_path
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Build full content with frontmatter
+            frontmatter = {
+                'name': title,
+                'description': summary,
+                'type': 'memory',
+            }
+            full_content = _format_markdown(frontmatter, observation)
+            content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+
+            # Dedup check
+            if Memory.select().where(Memory.content_hash == content_hash).exists():
+                raise ValueError(f"Duplicate content detected (hash: {content_hash})")
+
+            now = datetime.now().isoformat()
+            mem = Memory.create(
+                file_path=str(file_path),
+                stage="consolidated",
+                title=title,
+                summary=summary,
+                content=full_content,
+                tags=json.dumps(tags),
+                importance=0.5,
+                reinforcement_count=0,
+                created_at=now,
+                updated_at=now,
+                source_session=session_id,
+                content_hash=content_hash,
             )
-            self.store.log_consolidation(
+            memory_id = mem.id
+
+            # Write file
+            file_path.write_text(full_content, encoding="utf-8")
+
+            ConsolidationLog.create(
+                timestamp=now,
+                session_id=session_id,
                 action="kept",
                 memory_id=memory_id,
                 from_stage="ephemeral",
                 to_stage="consolidated",
                 rationale=decision.get("rationale", ""),
-                session_id=session_id,
             )
             return memory_id
         except ValueError as exc:
@@ -358,13 +364,14 @@ class Consolidator:
         # Observations that are pruned were never persisted, so we generate a
         # deterministic pseudo-id from the observation content for audit tracing.
         pseudo_id = f"pruned-{hashlib.md5(observation.encode()).hexdigest()[:8]}"
-        self.store.log_consolidation(
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
+            session_id=session_id,
             action="pruned",
             memory_id=pseudo_id,
             from_stage="ephemeral",
             to_stage="ephemeral",
             rationale=rationale,
-            session_id=session_id,
         )
         logger.debug("PRUNE: %s — %s", observation[:80], rationale)
 
@@ -386,25 +393,24 @@ class Consolidator:
             return None
 
         try:
-            memory = self.store.get(memory_id)
-        except ValueError:
+            memory = Memory.get_by_id(memory_id)
+        except Memory.DoesNotExist:
             logger.warning("PROMOTE target memory not found: %s", memory_id)
             return None
 
-        current_count = memory.get("reinforcement_count", 0)
-        self.store.update(
-            memory_id,
-            metadata={"reinforcement_count": current_count + 1},
-        )
+        current_count = memory.reinforcement_count or 0
+        memory.reinforcement_count = current_count + 1
+        memory.save()
 
         # Log the promotion attempt
-        self.store.log_consolidation(
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
+            session_id=session_id,
             action="promoted",
             memory_id=memory_id,
-            from_stage=memory["stage"],
-            to_stage=memory["stage"],
+            from_stage=memory.stage,
+            to_stage=memory.stage,
             rationale=decision.get("rationale", "Reinforced by new observation"),
-            session_id=session_id,
         )
 
         # Check if memory now qualifies for lifecycle stage advancement
@@ -442,13 +448,13 @@ class Consolidator:
                 continue
 
             try:
-                memory = self.store.get(memory_id)
-            except ValueError:
+                memory = Memory.get_by_id(memory_id)
+            except Memory.DoesNotExist:
                 logger.warning("Conflict target memory not found: %s", memory_id)
                 continue
 
             # Strip frontmatter from content for cleaner prompt
-            content = memory.get("content", "")
+            content = memory.content or ""
             if content.startswith("---"):
                 lines = content.split("\n")
                 for i in range(1, len(lines)):
@@ -457,7 +463,7 @@ class Consolidator:
                         break
 
             prompt = CONTRADICTION_RESOLUTION_PROMPT.format(
-                memory_title=memory.get("title", "Untitled"),
+                memory_title=memory.title or "Untitled",
                 memory_content=content,
                 observation=observation,
             )
@@ -474,7 +480,7 @@ class Consolidator:
                 continue
 
             resolution_type = result.get("resolution_type", "scoped")
-            refined_title = result.get("refined_title", memory.get("title"))
+            refined_title = result.get("refined_title", memory.title)
             refined_content = result.get("refined_content", "")
 
             if resolution_type == "superseded":
@@ -483,57 +489,40 @@ class Consolidator:
                     f"[Superseded] {refined_content}\n\n"
                     f"---\nSuperseded by observation: {observation[:200]}"
                 )
-                self.store.update(
-                    memory_id,
-                    content=superseded_note,
-                    metadata={
-                        "title": f"[Superseded] {refined_title}",
-                        "summary": f"Superseded: {refined_content[:120]}",
-                    },
-                )
-                self.store.archive(memory_id)
+                memory.content = superseded_note
+                memory.title = f"[Superseded] {refined_title}"
+                memory.summary = f"Superseded: {refined_content[:120]}"
+                memory.save()
+                Memory.update(archived_at=datetime.now().isoformat()).where(Memory.id == memory_id).execute()
                 log_action = "deprecated"
             elif resolution_type == "scoped":
                 # Both memories survive with clarified scope
-                existing_tags = memory.get("tags", [])
-                if isinstance(existing_tags, str):
-                    import json as _json
-                    try:
-                        existing_tags = _json.loads(existing_tags)
-                    except (ValueError, TypeError):
-                        existing_tags = []
+                existing_tags = memory.tag_list
                 scope_tags = [t for t in existing_tags if t.startswith("scope:")]
                 if not scope_tags:
                     existing_tags.append("scope:narrowed")
-                self.store.update(
-                    memory_id,
-                    content=refined_content,
-                    metadata={
-                        "title": refined_title,
-                        "summary": refined_content[:150],
-                        "tags": existing_tags,
-                    },
-                )
+                memory.content = refined_content
+                memory.title = refined_title
+                memory.summary = refined_content[:150]
+                memory.tag_list = existing_tags
+                memory.save()
                 log_action = "merged"
             else:
                 # Coexist — refine content, both memories valid as-is
-                self.store.update(
-                    memory_id,
-                    content=refined_content,
-                    metadata={
-                        "title": refined_title,
-                        "summary": refined_content[:150],
-                    },
-                )
+                memory.content = refined_content
+                memory.title = refined_title
+                memory.summary = refined_content[:150]
+                memory.save()
                 log_action = "merged"
 
-            self.store.log_consolidation(
+            ConsolidationLog.create(
+                timestamp=datetime.now().isoformat(),
+                session_id=session_id,
                 action=log_action,
                 memory_id=memory_id,
-                from_stage=memory["stage"],
-                to_stage=memory["stage"],
+                from_stage=memory.stage,
+                to_stage=memory.stage,
                 rationale=f"Contradiction resolved ({resolution_type}): {observation[:100]}",
-                session_id=session_id,
             )
 
             resolved.append({
@@ -545,32 +534,14 @@ class Consolidator:
 
             logger.info(
                 "Resolved contradiction for '%s' (%s, confidence=%.2f)",
-                memory.get("title", "?"), resolution_type, confidence,
+                memory.title or "?", resolution_type, confidence,
             )
 
         return resolved
 
     def _call_resolution_llm(self, prompt: str) -> dict:
         """Call the LLM for contradiction resolution and parse JSON response."""
-        if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-            client = anthropic.AnthropicBedrock()
-            model = "us.anthropic.claude-sonnet-4-6"
-        else:
-            client = anthropic.Anthropic()
-            model = self.model
-
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
+        text = _call_llm_transport(prompt, max_tokens=1024, temperature=0)
         return json.loads(text)
 
     def _check_rehydration(self, kept_ids: list[str], exclude_ids: set = None) -> list[str]:
@@ -589,38 +560,53 @@ class Consolidator:
         """
         if exclude_ids is None:
             exclude_ids = set()
-        relevance_engine = RelevanceEngine(self.store)
+        relevance_engine = RelevanceEngine()
         rehydrated = []
 
         for memory_id in kept_ids:
             try:
-                memory = self.store.get(memory_id)
-            except ValueError:
+                memory = Memory.get_by_id(memory_id)
+            except Memory.DoesNotExist:
                 continue
 
             # Use title + summary as the search text
-            search_text = f"{memory.get('title', '')} {memory.get('summary', '')}"
+            search_text = f"{memory.title or ''} {memory.summary or ''}"
             matches = relevance_engine.find_rehydration_by_observation(search_text)
 
             for match in matches:
-                if match["id"] in exclude_ids:
+                match_id = match.id if hasattr(match, 'id') and not isinstance(match, dict) else match.get("id") if isinstance(match, dict) else match.id
+                match_stage = match.stage if hasattr(match, 'stage') and not isinstance(match, dict) else match.get("stage") if isinstance(match, dict) else match.stage
+                if match_id in exclude_ids:
                     continue
                 try:
-                    self.store.unarchive(match["id"])
-                    self.store.log_consolidation(
+                    Memory.update(archived_at=None, updated_at=datetime.now().isoformat()).where(Memory.id == match_id).execute()
+                    ConsolidationLog.create(
+                        timestamp=datetime.now().isoformat(),
                         action="promoted",
-                        memory_id=match["id"],
+                        memory_id=match_id,
                         from_stage="archived",
-                        to_stage=match["stage"],
-                        rationale=f"Rehydrated by new observation: {memory.get('title', 'untitled')}",
+                        to_stage=match_stage,
+                        rationale=f"Rehydrated by new observation: {memory.title or 'untitled'}",
                     )
-                    rehydrated.append(match["id"])
+                    rehydrated.append(match_id)
                     logger.info(
                         "Rehydrated archived memory %s triggered by new observation %s",
-                        match["id"],
+                        match_id,
                         memory_id,
                     )
-                except ValueError as e:
-                    logger.warning("Rehydration failed for %s: %s", match["id"], e)
+                except Exception as e:
+                    logger.warning("Rehydration failed for %s: %s", match_id, e)
 
         return rehydrated
+
+
+def _format_markdown(metadata: dict, content: str) -> str:
+    """Format metadata and content as markdown with YAML frontmatter."""
+    lines = ['---']
+    for key in ['name', 'description', 'type']:
+        if key in metadata:
+            lines.append(f'{key}: {metadata[key]}')
+    lines.append('---')
+    lines.append('')
+    lines.append(content)
+    return '\n'.join(lines)

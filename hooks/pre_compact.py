@@ -18,22 +18,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.consolidator import Consolidator
 from core.crystallizer import Crystallizer
+from core.database import close_db, get_base_dir, get_vec_store, init_db
 from core.embeddings import embed_for_memory
 from core.feedback import FeedbackLoop
 from core.lifecycle import LifecycleManager
 from core.manifest import ManifestGenerator
+from core.models import Memory, RetrievalLog
 from core.relevance import RelevanceEngine
 from core.self_reflection import SelfReflector
-from core.storage import MemoryStore
 from core.threads import build_threads
 
 # Run self-reflection every N consolidations.
 REFLECTION_INTERVAL = 5
 
 
-def _get_consolidation_count(store: MemoryStore) -> int:
+def _get_consolidation_count(base_dir: Path) -> int:
     """Read the consolidation counter from meta/consolidation-count.json."""
-    counter_path = store.base_dir / "meta" / "consolidation-count.json"
+    counter_path = base_dir / "meta" / "consolidation-count.json"
     if counter_path.exists():
         try:
             data = json.loads(counter_path.read_text())
@@ -43,10 +44,10 @@ def _get_consolidation_count(store: MemoryStore) -> int:
     return 0
 
 
-def _increment_consolidation_count(store: MemoryStore) -> int:
+def _increment_consolidation_count(base_dir: Path) -> int:
     """Increment and persist the consolidation counter. Returns new count."""
-    counter_path = store.base_dir / "meta" / "consolidation-count.json"
-    count = _get_consolidation_count(store) + 1
+    counter_path = base_dir / "meta" / "consolidation-count.json"
+    count = _get_consolidation_count(base_dir) + 1
     counter_path.write_text(json.dumps({"count": count}))
     return count
 
@@ -57,17 +58,17 @@ def main():
         project_context = os.getcwd()
         today = datetime.now().strftime("%Y-%m-%d")
 
-        store = MemoryStore(project_context=project_context)
-        lifecycle = LifecycleManager(store)
-        consolidator = Consolidator(store, lifecycle)
-        manifest = ManifestGenerator(store)
-        feedback = FeedbackLoop(store, lifecycle)
+        base_dir = init_db(project_context=project_context)
+        lifecycle = LifecycleManager()
+        consolidator = Consolidator(lifecycle)
+        manifest = ManifestGenerator()
+        feedback = FeedbackLoop(lifecycle)
 
         # Ensure instinctive layer is seeded (self-model + observation habit)
-        reflector = SelfReflector(store)
+        reflector = SelfReflector()
         reflector.ensure_instinctive_layer()
 
-        ephemeral_path = store.base_dir / "ephemeral" / f"session-{today}.md"
+        ephemeral_path = base_dir / "ephemeral" / f"session-{today}.md"
         if not ephemeral_path.exists():
             print("", flush=True)
             return
@@ -102,7 +103,12 @@ def main():
 
         try:
             # Track usage BEFORE consolidation so importance scores reflect it
-            injected_ids = store.get_session_injections(session_id)
+            injected_ids = [
+                r.memory_id for r in
+                RetrievalLog.select(RetrievalLog.memory_id)
+                .where(RetrievalLog.session_id == session_id)
+                .distinct()
+            ]
             if injected_ids:
                 # Use conversation text + ephemeral content as usage signal
                 usage_text = conversation_text + "\n" + content
@@ -111,24 +117,26 @@ def main():
             result = consolidator.consolidate_session(str(snapshot_path), session_id)
             feedback.update_importance_scores(session_id)
 
+            vec_store = get_vec_store()
+
             # Embed newly kept memories
             for memory_id in result.get("kept", []):
                 try:
-                    mem = store.get(memory_id)
+                    mem = Memory.get_by_id(memory_id)
                     embedding = embed_for_memory(
-                        mem.get("title", ""),
-                        mem.get("summary", ""),
-                        mem.get("content", ""),
+                        mem.title or "",
+                        mem.summary or "",
+                        mem.content or "",
                     )
-                    if embedding:
-                        store.store_embedding(memory_id, embedding)
+                    if embedding and vec_store:
+                        vec_store.store_embedding(memory_id, embedding)
                 except Exception as e:
                     print(f"Embedding error (non-fatal): {e}", file=sys.stderr)
 
             # Crystallization: synthesize promotion candidates into higher-level insights
             crystallized = []
             try:
-                crystallizer = Crystallizer(store, lifecycle)
+                crystallizer = Crystallizer(lifecycle)
                 crystallized = crystallizer.crystallize_candidates()
             except Exception as e:
                 print(f"Crystallization error (non-fatal): {e}", file=sys.stderr)
@@ -137,40 +145,40 @@ def main():
                 try:
                     cid = crystal.get("crystallized_id")
                     if cid:
-                        mem = store.get(cid)
+                        mem = Memory.get_by_id(cid)
                         embedding = embed_for_memory(
-                            mem.get("title", ""),
+                            mem.title or "",
                             crystal.get("insight", ""),
                         )
-                        if embedding:
-                            store.store_embedding(cid, embedding)
+                        if embedding and vec_store:
+                            vec_store.store_embedding(cid, embedding)
                 except Exception as e:
                     print(f"Crystal embedding error (non-fatal): {e}", file=sys.stderr)
 
             # Narrative threads: detect and synthesize episodic arcs
             threads_built = []
             try:
-                threads_built = build_threads(store)
+                threads_built = build_threads()
             except Exception as e:
                 print(f"Thread building error (non-fatal): {e}", file=sys.stderr)
 
             # Instinctive promotion: crystallized memories that earned it
             instinctive_promoted = 0
-            for mem in store.list_by_stage("crystallized"):
-                can, reason = lifecycle.can_promote(mem["id"])
+            for mem in Memory.by_stage("crystallized"):
+                can, reason = lifecycle.can_promote(mem.id)
                 if can:
                     try:
-                        lifecycle.promote(mem["id"], f"Auto-promoted to instinctive: {reason}")
+                        lifecycle.promote(mem.id, f"Auto-promoted to instinctive: {reason}")
                         instinctive_promoted += 1
                     except ValueError:
                         pass
 
             # Run relevance maintenance — archive stale, rehydrate relevant
-            relevance = RelevanceEngine(store)
+            relevance = RelevanceEngine()
             maint = relevance.run_maintenance(project_context)
 
             # Periodic self-reflection
-            count = _increment_consolidation_count(store)
+            count = _increment_consolidation_count(base_dir)
             reflected = False
             if count % REFLECTION_INTERVAL == 0:
                 try:
@@ -193,7 +201,7 @@ def main():
             if threads_built:
                 summary += f", {len(threads_built)} threads"
             if instinctive_promoted:
-                summary += f", {instinctive_promoted} → instinctive"
+                summary += f", {instinctive_promoted} -> instinctive"
             if maint["archived"]:
                 summary += f", {len(maint['archived'])} archived"
             if maint["rehydrated"]:
@@ -203,7 +211,7 @@ def main():
             print(summary, file=sys.stderr)
         finally:
             snapshot_path.unlink(missing_ok=True)
-            store.close()
+            close_db()
 
         print("", flush=True)  # stdout must be empty for Claude Code
 

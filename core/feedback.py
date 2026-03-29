@@ -8,16 +8,17 @@ D-09 (demotion: injected 10+ times, never used).
 
 import json
 import re
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
+from peewee import fn
 
+from .database import get_base_dir
 from .lifecycle import LifecycleManager
-from .storage import MemoryStore
+from .models import Memory, RetrievalLog, db
 
 
 def _ensure_nltk_data():
@@ -56,8 +57,7 @@ class FeedbackLoop:
     Drives promotion/demotion signals based on usage patterns per D-08 and D-09.
     """
 
-    def __init__(self, store: MemoryStore, lifecycle: LifecycleManager):
-        self.store = store
+    def __init__(self, lifecycle: LifecycleManager):
         self.lifecycle = lifecycle
         # Accumulates {session_id: {memory_id: was_used}} across track_usage calls
         self._session_usage: dict[str, dict[str, bool]] = {}
@@ -72,13 +72,13 @@ class FeedbackLoop:
     _SUMMARY_WEIGHT = 2.0
     _CONTENT_WEIGHT = 1.0
 
-    # Usage score threshold — calibrated so 2 title-keyword hits still trigger
-    # (3+3 = 6 ≥ 4) while requiring 4+ short content-only hits to trigger.
-    # Re-validated after switching from substring (`w in response_lower`) to
-    # word-boundary regex (`re.search(r'\b...\b', ...)`). The stricter match
-    # eliminates false positives where e.g. "test" matched "testing", but the
-    # threshold value of 4.0 still holds: behavioral tests pass unchanged.
-    _USAGE_THRESHOLD = 4.0
+    # Usage score threshold — lowered from 4.0 to 2.5. The original 4.0 required
+    # 2 title-keyword hits for short words (3+3=6), but in practice this meant
+    # memories with short titles ("Self-Model", "Compaction Guidance") were NEVER
+    # marked as used — production showed 0% usage across 40 injections. A single
+    # title keyword match with a specific term (3.0 * 1.5 = 4.5) should trigger;
+    # a single short title keyword (3.0 * 1.0 = 3.0) should also trigger.
+    _USAGE_THRESHOLD = 2.5
 
     def track_usage(self, session_id: str, injected_ids: list[str], response_text: str) -> dict:
         """
@@ -90,7 +90,7 @@ class FeedbackLoop:
         terms in memory content that the old title-only heuristic missed.
 
         Side effects:
-        - Calls store.record_usage() for each memory marked as used.
+        - Calls record_usage for each memory marked as used.
         - Logs a 'memory_used' event for each used memory.
 
         Returns:
@@ -101,15 +101,15 @@ class FeedbackLoop:
 
         for memory_id in injected_ids:
             try:
-                memory = self.store.get(memory_id)
-            except ValueError:
+                memory = Memory.get_by_id(memory_id)
+            except Memory.DoesNotExist:
                 usage_map[memory_id] = False
                 continue
 
             score = self._compute_usage_score(
-                title=memory.get('title') or '',
-                summary=memory.get('summary') or '',
-                content=memory.get('content') or '',
+                title=memory.title or '',
+                summary=memory.summary or '',
+                content=memory.content or '',
                 response_lower=response_lower,
             )
             was_used = score >= self._USAGE_THRESHOLD
@@ -117,7 +117,7 @@ class FeedbackLoop:
             usage_map[memory_id] = was_used
 
             if was_used:
-                self.store.record_usage(memory_id, session_id)
+                _record_usage(memory_id, session_id)
                 # Normalize confidence to [0, 1] — score of 4 = 0 confidence,
                 # score of 20+ = 1.0 confidence.
                 confidence = min(1.0, max(0.0, (score - self._USAGE_THRESHOLD) / 16))
@@ -161,7 +161,7 @@ class FeedbackLoop:
 
         Extracts keywords from title, summary, and content with decreasing
         source weight. Each matched keyword contributes:
-            source_weight × term_specificity(word)
+            source_weight x term_specificity(word)
 
         Returns:
             Additive score (higher = stronger evidence of usage).
@@ -169,7 +169,7 @@ class FeedbackLoop:
         score = 0.0
 
         # Pre-stem all response tokens once so we can do O(S + R) stem
-        # lookups rather than O(S × R) individual stem comparisons.
+        # lookups rather than O(S x R) individual stem comparisons.
         stop_words, stemmer = _get_nltk_tools()
         if stemmer:
             response_words = re.findall(r'\b[a-z]{4,}\b', response_lower)
@@ -218,36 +218,42 @@ class FeedbackLoop:
         """
         session_map = self._session_usage.get(session_id, {})
 
-        with sqlite3.connect(self.store.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute("""
-                SELECT m.id, m.importance, m.usage_count,
-                       COUNT(rl.id) as recent_injections,
-                       SUM(rl.was_used) as recent_usages
-                FROM memories m
-                LEFT JOIN retrieval_log rl ON rl.memory_id = m.id
-                    AND rl.retrieval_type = 'injected'
-                    AND rl.timestamp >= datetime('now', '-30 days')
-                WHERE m.stage != 'ephemeral'
-                GROUP BY m.id
-            """)
-            rows = cursor.fetchall()
+        # Query memories with their recent injection/usage stats
+        rows = (
+            Memory.select(
+                Memory.id,
+                Memory.importance,
+                Memory.usage_count,
+                fn.COUNT(RetrievalLog.id).alias('recent_injections'),
+                fn.SUM(RetrievalLog.was_used).alias('recent_usages'),
+            )
+            .join(
+                RetrievalLog,
+                on=(RetrievalLog.memory_id == Memory.id),
+                join_type='LEFT',
+            )
+            .where(
+                Memory.stage != 'ephemeral',
+                (RetrievalLog.retrieval_type == 'injected') | (RetrievalLog.id.is_null()),
+            )
+            .group_by(Memory.id)
+        )
 
         for row in rows:
-            memory_id = row['id']
-            old_importance = row['importance']
+            memory_id = row.id
+            old_importance = row.importance or 0.5
             new_importance = old_importance
 
-            # Rule 1: used this session → bump up
+            # Rule 1: used this session -> bump up
             if session_map.get(memory_id) is True:
                 new_importance = min(1.0, old_importance + 0.05)
 
-            # Rule 2: 3+ consecutive injections with no usage → nudge down
+            # Rule 2: 3+ consecutive injections with no usage -> nudge down
             elif self._has_three_consecutive_unused(memory_id):
                 new_importance = max(0.1, old_importance - 0.1)
 
             if new_importance != old_importance:
-                self.store.update(memory_id, metadata={'importance': new_importance})
+                Memory.update(importance=new_importance).where(Memory.id == memory_id).execute()
                 self.log_event('importance_updated', {
                     'memory_id': memory_id,
                     'old': old_importance,
@@ -280,16 +286,16 @@ class FeedbackLoop:
         at least 3 different project_context values — the correct implementation
         of the "3+ distinct projects" criterion from D-08.
         """
-        with sqlite3.connect(self.store.db_path) as conn:
-            cursor = conn.execute("""
-                SELECT memory_id
-                FROM retrieval_log
-                WHERE retrieval_type = 'injected'
-                  AND project_context IS NOT NULL
-                GROUP BY memory_id
-                HAVING COUNT(DISTINCT project_context) >= 3
-            """)
-            return [row[0] for row in cursor.fetchall()]
+        rows = (
+            RetrievalLog.select(RetrievalLog.memory_id)
+            .where(
+                RetrievalLog.retrieval_type == 'injected',
+                RetrievalLog.project_context.is_null(False),
+            )
+            .group_by(RetrievalLog.memory_id)
+            .having(fn.COUNT(fn.DISTINCT(RetrievalLog.project_context)) >= 3)
+        )
+        return [row.memory_id for row in rows]
 
     # ------------------------------------------------------------------
     # Event logging
@@ -302,7 +308,8 @@ class FeedbackLoop:
         Format:
             {"event": "<type>", "timestamp": "<iso>", ...data fields}
         """
-        log_path = self.store.base_dir / 'meta' / 'retrieval-log.jsonl'
+        base_dir = get_base_dir()
+        log_path = base_dir / 'meta' / 'retrieval-log.jsonl'
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         record = {'event': event_type, 'timestamp': datetime.now().isoformat()}
@@ -319,18 +326,41 @@ class FeedbackLoop:
         """
         Return True if the last 3 injections for this memory all have was_used=0.
         """
-        with sqlite3.connect(self.store.db_path) as conn:
-            cursor = conn.execute("""
-                SELECT was_used
-                FROM retrieval_log
-                WHERE memory_id = ?
-                  AND retrieval_type = 'injected'
-                ORDER BY timestamp DESC
-                LIMIT 3
-            """, (memory_id,))
-            rows = cursor.fetchall()
+        rows = (
+            RetrievalLog.select(RetrievalLog.was_used)
+            .where(
+                RetrievalLog.memory_id == memory_id,
+                RetrievalLog.retrieval_type == 'injected',
+            )
+            .order_by(RetrievalLog.timestamp.desc())
+            .limit(3)
+        )
+        usage_vals = [r.was_used for r in rows]
 
-        if len(rows) < 3:
+        if len(usage_vals) < 3:
             return False
 
-        return all(row[0] == 0 for row in rows)
+        return all(v == 0 for v in usage_vals)
+
+
+def _record_usage(memory_id: str, session_id: str) -> None:
+    """Record that a memory was actively used (not just injected)."""
+    now = datetime.now().isoformat()
+    Memory.update(
+        last_used_at=now,
+        usage_count=Memory.usage_count + 1,
+    ).where(Memory.id == memory_id).execute()
+
+    # Update most recent retrieval log entry
+    subq = (
+        RetrievalLog.select(fn.MAX(RetrievalLog.timestamp))
+        .where(
+            RetrievalLog.memory_id == memory_id,
+            RetrievalLog.session_id == session_id,
+        )
+    )
+    RetrievalLog.update(was_used=1).where(
+        RetrievalLog.memory_id == memory_id,
+        RetrievalLog.session_id == session_id,
+        RetrievalLog.timestamp == subq,
+    ).execute()

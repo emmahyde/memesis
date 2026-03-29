@@ -26,11 +26,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.crystallizer import Crystallizer
+from core.database import close_db, get_base_dir, get_db_path, init_db
 from core.lifecycle import LifecycleManager
 from core.manifest import ManifestGenerator
+from core.models import Memory, db
 from core.relevance import RelevanceEngine
 from core.self_reflection import SelfReflector
-from core.storage import MemoryStore
 from core.threads import build_threads
 
 logging.basicConfig(
@@ -44,26 +45,13 @@ logger = logging.getLogger(__name__)
 # Bootstrap: fix reinforcement counts for backfill memories
 # ---------------------------------------------------------------------------
 
-def bootstrap_reinforcements(store: MemoryStore, dry_run: bool = False) -> dict:
+def bootstrap_reinforcements(dry_run: bool = False) -> dict:
     """
     Fix reinforcement_count for backfill memories.
-
-    The backfill pipeline (scan -> reduce -> consolidate -> seed) extracted
-    memories from dozens of sessions.  A title mismatch between consolidation
-    stages caused all reinforcement_counts to be seeded at 0.
-
-    Strategy: try to match memories against the observations.db frequency
-    counts using content keyword overlap.  For backfill memories that can't
-    be matched, set a baseline of 3 (they earned it by surviving the full
-    quality pipeline).
-
-    Returns:
-        {"matched": N, "baseline": N, "skipped": N}
     """
     observations_db = Path(__file__).parent.parent / "backfill-output" / "observations.db"
 
-    # Load frequency counts from observations.db if available
-    obs_keywords = {}  # {set_of_keywords: count}
+    obs_keywords = {}
     obs_by_title = {}
     if observations_db.exists():
         with sqlite3.connect(observations_db) as conn:
@@ -76,28 +64,25 @@ def bootstrap_reinforcements(store: MemoryStore, dry_run: bool = False) -> dict:
                 if words:
                     obs_keywords[frozenset(words)] = count
 
-    # Load all consolidated memories
-    consolidated = store.list_by_stage("consolidated")
+    consolidated = list(Memory.by_stage("consolidated"))
     matched = baseline = skipped = 0
 
     for memory in consolidated:
-        if memory.get("reinforcement_count", 0) > 0:
+        if (memory.reinforcement_count or 0) > 0:
             skipped += 1
             continue
 
-        # Try direct title match first
-        title = memory.get("title", "")
+        title = memory.title or ""
         if title in obs_by_title:
             count = obs_by_title[title]
             if not dry_run:
-                store.update(memory["id"], metadata={"reinforcement_count": count})
+                memory.reinforcement_count = count
+                memory.save()
             matched += 1
             logger.info("Matched '%s' -> reinforcement_count=%d", title[:50], count)
             continue
 
-        # Try keyword overlap match
-        full = store.get(memory["id"])
-        mem_words = _significant_words(title + " " + (full.get("content") or ""))
+        mem_words = _significant_words(title + " " + (memory.content or ""))
         best_count = 0
         best_overlap = 0
 
@@ -109,14 +94,15 @@ def bootstrap_reinforcements(store: MemoryStore, dry_run: bool = False) -> dict:
 
         if best_count > 0:
             if not dry_run:
-                store.update(memory["id"], metadata={"reinforcement_count": best_count})
+                memory.reinforcement_count = best_count
+                memory.save()
             matched += 1
             logger.info("Fuzzy matched '%s' -> reinforcement_count=%d (overlap=%d)",
                         title[:50], best_count, best_overlap)
         else:
-            # Baseline: survived the full pipeline, deserves promotion eligibility
             if not dry_run:
-                store.update(memory["id"], metadata={"reinforcement_count": 3})
+                memory.reinforcement_count = 3
+                memory.save()
             baseline += 1
             logger.info("Baseline '%s' -> reinforcement_count=3", title[:50])
 
@@ -133,19 +119,10 @@ def _significant_words(text: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 def run_crystallization(
-    store: MemoryStore,
     lifecycle: LifecycleManager,
     dry_run: bool = False,
 ) -> list[dict]:
-    """
-    Find promotion candidates and run them through crystallization.
-
-    The crystallizer groups related memories, synthesizes them into denser
-    insights via LLM, and archives the source memories.
-
-    Returns:
-        List of crystallization results.
-    """
+    """Find promotion candidates and run them through crystallization."""
     candidates = lifecycle.get_promotion_candidates()
     if not candidates:
         logger.info("No promotion candidates (need reinforcement_count >= 3)")
@@ -159,7 +136,7 @@ def run_crystallization(
                         c.get("title", "?")[:60], c.get("reinforcement_count", 0))
         return []
 
-    crystallizer = Crystallizer(store, lifecycle)
+    crystallizer = Crystallizer(lifecycle)
     results = crystallizer.crystallize_candidates()
 
     for r in results:
@@ -170,17 +147,11 @@ def run_crystallization(
 
 
 def run_relevance_maintenance(
-    store: MemoryStore,
     project_context: str = None,
     dry_run: bool = False,
 ) -> dict:
-    """
-    Archive stale memories and rehydrate relevant archived ones.
-
-    Returns:
-        {"archived": [...], "rehydrated": [...]}
-    """
-    engine = RelevanceEngine(store)
+    """Archive stale memories and rehydrate relevant archived ones."""
+    engine = RelevanceEngine()
 
     if dry_run:
         archival = engine.get_archival_candidates(project_context)
@@ -188,36 +159,25 @@ def run_relevance_maintenance(
         logger.info("Would archive %d memories, rehydrate %d", len(archival), len(rehydration))
         for a in archival[:5]:
             logger.info("  Archive: '%s' (relevance=%.3f)",
-                        a.get("title", "?")[:50], a.get("relevance", 0))
+                        (a.title or "?")[:50], getattr(a, '_relevance', 0))
         for r in rehydration[:5]:
             logger.info("  Rehydrate: '%s' (relevance=%.3f)",
-                        r.get("title", "?")[:50], r.get("relevance", 0))
+                        (r.title or "?")[:50], getattr(r, '_relevance', 0))
         return {"archived": archival, "rehydrated": rehydration}
 
     return engine.run_maintenance(project_context)
 
 
 def run_self_reflection(
-    store: MemoryStore,
     force: bool = False,
     dry_run: bool = False,
 ) -> dict | None:
-    """
-    Run self-reflection if enough consolidation cycles have elapsed.
-
-    Self-reflection runs every 5 consolidation cycles (checked via a
-    counter file).  Pass force=True to run regardless.
-
-    Returns:
-        Reflection result dict, or None if skipped.
-    """
-    reflector = SelfReflector(store)
-
-    # Ensure instinctive layer exists
+    """Run self-reflection if enough consolidation cycles have elapsed."""
+    reflector = SelfReflector()
     reflector.ensure_instinctive_layer()
 
-    # Check counter
-    counter_path = store.base_dir / "meta" / "consolidation-count.json"
+    base_dir = get_base_dir()
+    counter_path = base_dir / "meta" / "consolidation-count.json"
     count = 0
     if counter_path.exists():
         try:
@@ -248,9 +208,9 @@ def run_self_reflection(
     return reflection
 
 
-def regenerate_manifest(store: MemoryStore, dry_run: bool = False) -> None:
+def regenerate_manifest(dry_run: bool = False) -> None:
     """Regenerate MEMORY.md from current store state."""
-    manifest = ManifestGenerator(store)
+    manifest = ManifestGenerator()
 
     if dry_run:
         token_count, fraction = manifest.estimate_token_budget()
@@ -268,10 +228,11 @@ def regenerate_manifest(store: MemoryStore, dry_run: bool = False) -> None:
 # Health report
 # ---------------------------------------------------------------------------
 
-def print_health(store: MemoryStore, project_context: str = None):
+def print_health(project_context: str = None):
     """Print a concise lifecycle health report."""
-    relevance = RelevanceEngine(store)
-    lifecycle = LifecycleManager(store)
+    relevance = RelevanceEngine()
+    lifecycle = LifecycleManager()
+    base_dir = get_base_dir()
 
     print(f"\n{'=' * 55}")
     print(f"  LIFECYCLE HEARTBEAT — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -281,31 +242,33 @@ def print_health(store: MemoryStore, project_context: str = None):
     stages = {}
     total = 0
     for stage in ("instinctive", "crystallized", "consolidated", "ephemeral"):
-        active = store.list_by_stage(stage)
+        active = list(Memory.by_stage(stage))
         stages[stage] = len(active)
         total += len(active)
-    archived = len(store.list_archived())
+    archived_count = Memory.select().where(Memory.archived_at.is_null(False)).count()
 
     print(f"\n  Stages:")
     for stage, count in stages.items():
-        bar = "█" * min(count, 40)
+        bar = "\u2588" * min(count, 40)
         print(f"    {stage:14s} {count:4d}  {bar}")
-    print(f"    {'archived':14s} {archived:4d}")
+    print(f"    {'archived':14s} {archived_count:4d}")
     print(f"    {'TOTAL':14s} {total:4d}")
 
     # Promotion readiness
     candidates = lifecycle.get_promotion_candidates()
-    with sqlite3.connect(store.db_path) as conn:
-        rc_dist = conn.execute("""
-            SELECT reinforcement_count, COUNT(*) FROM memories
-            WHERE stage = 'consolidated' GROUP BY reinforcement_count
-            ORDER BY reinforcement_count DESC
-        """).fetchall()
+    rc_rows = (
+        Memory.select(Memory.reinforcement_count)
+        .where(Memory.stage == 'consolidated')
+    )
+    rc_dist = {}
+    for row in rc_rows:
+        rc = row.reinforcement_count or 0
+        rc_dist[rc] = rc_dist.get(rc, 0) + 1
 
     print(f"\n  Promotion readiness:")
     print(f"    Candidates (reinforcement >= 3): {len(candidates)}")
     if rc_dist:
-        for rc, cnt in rc_dist:
+        for rc, cnt in sorted(rc_dist.items(), reverse=True):
             print(f"    reinforcement_count={rc}: {cnt} memories")
 
     # Relevance summary
@@ -323,7 +286,7 @@ def print_health(store: MemoryStore, project_context: str = None):
         print(f"\n  Demotion candidates (injected 10+, never used): {len(demotion)}")
 
     # Consolidation counter
-    counter_path = store.base_dir / "meta" / "consolidation-count.json"
+    counter_path = base_dir / "meta" / "consolidation-count.json"
     if counter_path.exists():
         try:
             count = json.loads(counter_path.read_text()).get("count", 0)
@@ -335,10 +298,10 @@ def print_health(store: MemoryStore, project_context: str = None):
     # Recommendations
     recs = []
     if len(candidates) == 0 and stages.get("consolidated", 0) > 0:
-        with sqlite3.connect(store.db_path) as conn:
-            zero_rc = conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE stage='consolidated' AND reinforcement_count=0"
-            ).fetchone()[0]
+        zero_rc = Memory.select().where(
+            Memory.stage == 'consolidated',
+            Memory.reinforcement_count == 0,
+        ).count()
         if zero_rc > 0:
             recs.append(f"  {zero_rc} consolidated memories have reinforcement_count=0 "
                         f"— run --bootstrap to fix")
@@ -383,49 +346,50 @@ def main():
             print(f"Unknown arg: {args[i]}", file=sys.stderr)
             sys.exit(1)
 
-    store = MemoryStore(project_context=project_context)
+    init_db(project_context=project_context)
 
     if report_only:
-        print_health(store, project_context)
-        store.close()
+        print_health(project_context)
+        close_db()
         return
 
-    print_health(store, project_context)
+    print_health(project_context)
 
     # Phase 0: Bootstrap reinforcements if requested
     if bootstrap:
         print(f"\n--- Phase 0: Bootstrap reinforcements ---")
-        result = bootstrap_reinforcements(store, dry_run=dry_run)
+        result = bootstrap_reinforcements(dry_run=dry_run)
         print(f"  Matched: {result['matched']}, Baseline: {result['baseline']}, "
               f"Skipped: {result['skipped']}")
 
     # Phase 1: Crystallization
     print(f"\n--- Phase 1: Crystallization ---")
-    crystals = run_crystallization(store, LifecycleManager(store), dry_run=dry_run)
+    lifecycle = LifecycleManager()
+    crystals = run_crystallization(lifecycle, dry_run=dry_run)
     print(f"  Crystallized: {len(crystals)} insights")
 
     # Phase 1.5: Narrative thread building
     print(f"\n--- Phase 1.5: Narrative threads ---")
     if dry_run:
         from core.threads import ThreadDetector
-        detector = ThreadDetector(store)
+        detector = ThreadDetector()
         clusters = detector.detect_threads()
         print(f"  Would narrate {len(clusters)} thread clusters")
     else:
-        threads = build_threads(store)
+        threads = build_threads()
         print(f"  Built {len(threads)} narrative threads")
         for t in threads:
             print(f"    '{t['title']}' ({len(t['member_ids'])} memories)")
 
     # Phase 2: Relevance maintenance
     print(f"\n--- Phase 2: Relevance maintenance ---")
-    maintenance = run_relevance_maintenance(store, project_context, dry_run=dry_run)
+    maintenance = run_relevance_maintenance(project_context, dry_run=dry_run)
     print(f"  Archived: {len(maintenance.get('archived', []))}, "
           f"Rehydrated: {len(maintenance.get('rehydrated', []))}")
 
     # Phase 3: Self-reflection
     print(f"\n--- Phase 3: Self-reflection ---")
-    reflection = run_self_reflection(store, force=force_reflect, dry_run=dry_run)
+    reflection = run_self_reflection(force=force_reflect, dry_run=dry_run)
     if reflection:
         print(f"  Observations: {len(reflection.get('observations', []))}, "
               f"Deprecated: {len(reflection.get('deprecated', []))}")
@@ -434,14 +398,14 @@ def main():
 
     # Phase 4: Manifest regeneration
     print(f"\n--- Phase 4: Manifest regeneration ---")
-    regenerate_manifest(store, dry_run=dry_run)
+    regenerate_manifest(dry_run=dry_run)
 
     # Final health
     if not dry_run:
         print()
-        print_health(store, project_context)
+        print_health(project_context)
 
-    store.close()
+    close_db()
 
 
 if __name__ == "__main__":

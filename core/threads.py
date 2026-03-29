@@ -19,11 +19,12 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional
 
+from .database import get_vec_store
 from .llm import call_llm
-from .storage import MemoryStore
+from .models import Memory, NarrativeThread, ThreadMember, db
 
 
-def _get_embeddings(store, memories: list[dict]):
+def _get_embeddings(memories: list):
     """Retrieve stored embeddings from vec_memories."""
     try:
         import struct
@@ -31,9 +32,14 @@ def _get_embeddings(store, memories: list[dict]):
     except ImportError:
         return None
 
+    vec_store = get_vec_store()
+    if vec_store is None or not vec_store.available:
+        return None
+
     embeddings = []
     for m in memories:
-        raw = store.get_embedding(m["id"])
+        mid = m.id if hasattr(m, 'id') and not isinstance(m, dict) else m["id"]
+        raw = vec_store.get_embedding(mid)
         if raw is None:
             return None
         vec = struct.unpack(f"{len(raw)//4}f", raw)
@@ -97,14 +103,6 @@ Respond ONLY with valid JSON:
 class ThreadDetector:
     """
     Finds clusters of memories that form narrative arcs.
-
-    A narrative arc is a sequence of memories that:
-    1. Share topical overlap (tag intersection or FTS similarity)
-    2. Have temporal spread (created across multiple sessions/days)
-    3. Show evolution (corrections, refinements, or building knowledge)
-
-    The detector does NOT require all three — two of three is sufficient.
-    The narrator will reject false arcs during synthesis.
     """
 
     # Minimum memories to form a thread
@@ -114,24 +112,16 @@ class ThreadDetector:
     # Minimum tag overlap ratio to consider memories related
     MIN_TAG_OVERLAP = 0.3
 
-    def __init__(self, store: MemoryStore):
-        self.store = store
+    def __init__(self):
+        pass
 
     def detect_threads(
         self,
         stages: list[str] = None,
         exclude_threaded: bool = True,
-    ) -> list[list[dict]]:
+    ) -> list[list]:
         """
         Find memory clusters that could form narrative threads.
-
-        Args:
-            stages: Which stages to scan. Defaults to consolidated + crystallized.
-            exclude_threaded: Skip memories already in a thread.
-
-        Returns:
-            List of clusters, where each cluster is an ordered list of memory
-            dicts (chronological).
         """
         if stages is None:
             stages = ["consolidated", "crystallized"]
@@ -139,7 +129,7 @@ class ThreadDetector:
         # Gather candidate memories
         candidates = []
         for stage in stages:
-            candidates.extend(self.store.list_by_stage(stage))
+            candidates.extend(list(Memory.by_stage(stage)))
 
         if exclude_threaded:
             candidates = self._exclude_already_threaded(candidates)
@@ -151,14 +141,13 @@ class ThreadDetector:
         full_candidates = []
         for c in candidates:
             try:
-                mem = self.store.get(c["id"])
+                mem = Memory.get_by_id(c.id)
                 full_candidates.append(mem)
-            except (KeyError, ValueError):
+            except Memory.DoesNotExist:
                 continue
 
-        # Try embedding-based clustering first (D-09: threshold 0.70 — topical
-        # overlap, not content convergence). Fall back to tag overlap.
-        embeddings = _get_embeddings(self.store, full_candidates)
+        # Try embedding-based clustering first
+        embeddings = _get_embeddings(full_candidates)
 
         if embeddings is not None:
             clusters = self._cluster_by_embeddings(full_candidates, embeddings, threshold=0.70)
@@ -169,37 +158,31 @@ class ThreadDetector:
         valid_clusters = []
         for cluster in clusters:
             if len(cluster) >= self.MIN_CLUSTER_SIZE:
-                sorted_cluster = sorted(cluster, key=lambda m: m.get("created_at", ""))
+                sorted_cluster = sorted(cluster, key=lambda m: m.created_at or "")
                 if self._has_temporal_spread(sorted_cluster):
                     valid_clusters.append(sorted_cluster)
 
         return valid_clusters
 
-    def _exclude_already_threaded(self, candidates: list[dict]) -> list[dict]:
+    def _exclude_already_threaded(self, candidates: list) -> list:
         """Remove memories that already belong to a thread."""
         result = []
         for c in candidates:
-            threads = self.store.get_threads_for_memory(c["id"])
-            if not threads:
+            threads = (
+                NarrativeThread.select()
+                .join(ThreadMember, on=(NarrativeThread.id == ThreadMember.thread_id))
+                .where(ThreadMember.memory_id == c.id)
+            )
+            if not list(threads):
                 result.append(c)
         return result
 
-    def _cluster_by_tags(self, memories: list[dict]) -> list[list[dict]]:
-        """
-        Group memories by tag overlap using greedy transitive clustering.
-
-        Two memories are related if they share at least MIN_TAG_OVERLAP
-        fraction of their tags (excluding generic tags like 'source:*').
-        """
+    def _cluster_by_tags(self, memories: list) -> list[list]:
+        """Group memories by tag overlap using greedy transitive clustering."""
         generic_prefixes = {"source:", "stage:"}
 
-        def get_meaningful_tags(mem: dict) -> set[str]:
-            tags = mem.get("tags", [])
-            if isinstance(tags, str):
-                try:
-                    tags = json.loads(tags)
-                except (json.JSONDecodeError, TypeError):
-                    tags = []
+        def get_meaningful_tags(mem) -> set[str]:
+            tags = mem.tag_list if hasattr(mem, 'tag_list') else []
             return {
                 t for t in tags
                 if not any(t.startswith(p) for p in generic_prefixes)
@@ -236,7 +219,7 @@ class ThreadDetector:
                     union(i, j)
 
         # Collect clusters
-        groups: dict[int, list[dict]] = {}
+        groups: dict[int, list] = {}
         for i in range(n):
             root = find(i)
             groups.setdefault(root, []).append(memories[i])
@@ -245,16 +228,11 @@ class ThreadDetector:
 
     def _cluster_by_embeddings(
         self,
-        memories: list[dict],
+        memories: list,
         embeddings,  # numpy array (N, 512)
         threshold: float,
-    ) -> list[list[dict]]:
-        """
-        Group memories using cosine similarity on embeddings with union-find.
-
-        Two memories are placed in the same cluster if their cosine similarity
-        is >= threshold. Same union-find structure as _cluster_by_tags.
-        """
+    ) -> list[list]:
+        """Group memories using cosine similarity on embeddings with union-find."""
         import numpy as np
 
         n = len(memories)
@@ -263,7 +241,7 @@ class ThreadDetector:
 
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         normed = embeddings / np.maximum(norms, 1e-9)
-        sims = normed @ normed.T  # (N, N) cosine similarity matrix
+        sims = normed @ normed.T
 
         parent = list(range(n))
 
@@ -280,26 +258,21 @@ class ThreadDetector:
                     if ri != rj:
                         parent[ri] = rj
 
-        groups: dict[int, list[dict]] = {}
+        groups: dict[int, list] = {}
         for i in range(n):
             groups.setdefault(find(i), []).append(memories[i])
 
         return list(groups.values())
 
-    def _has_temporal_spread(self, sorted_cluster: list[dict]) -> bool:
-        """
-        Check that a cluster spans multiple sessions (not all from one burst).
-
-        Returns True if the oldest and newest memories are at least 1 hour apart
-        and no more than MAX_AGE_SPAN_DAYS apart.
-        """
+    def _has_temporal_spread(self, sorted_cluster: list) -> bool:
+        """Check that a cluster spans multiple sessions."""
         if len(sorted_cluster) < 2:
             return False
 
         try:
-            oldest = datetime.fromisoformat(sorted_cluster[0]["created_at"])
-            newest = datetime.fromisoformat(sorted_cluster[-1]["created_at"])
-        except (KeyError, ValueError, TypeError):
+            oldest = datetime.fromisoformat(sorted_cluster[0].created_at)
+            newest = datetime.fromisoformat(sorted_cluster[-1].created_at)
+        except (ValueError, TypeError, AttributeError):
             return False
 
         span = newest - oldest
@@ -309,32 +282,14 @@ class ThreadDetector:
 class ThreadNarrator:
     """
     Synthesizes memory clusters into narrative threads via LLM.
-
-    Takes a cluster from ThreadDetector and produces a narrative arc —
-    a story of how understanding evolved across sessions.
     """
 
-    def __init__(self, store: MemoryStore):
-        self.store = store
+    def __init__(self):
+        pass
 
-    def narrate_cluster(self, cluster: list[dict]) -> Optional[dict]:
+    def narrate_cluster(self, cluster: list) -> Optional[dict]:
         """
         Synthesize a memory cluster into a narrative thread.
-
-        Args:
-            cluster: Chronologically ordered list of memory dicts (with content).
-
-        Returns:
-            Dict with thread fields if synthesis succeeded:
-            {
-                "title": str,
-                "summary": str,
-                "narrative": str,
-                "arc_type": str,
-                "confidence": float,
-                "member_ids": [str, ...],
-            }
-            None if the LLM determined these don't form a real arc.
         """
         if not cluster:
             return None
@@ -342,10 +297,9 @@ class ThreadNarrator:
         # Format memories for the prompt
         mem_parts = []
         for i, mem in enumerate(cluster, 1):
-            title = mem.get("title", "Untitled")
-            created = mem.get("created_at", "unknown")
-            content = mem.get("content", "")
-            # Strip frontmatter from content for cleaner prompt
+            title = mem.title or "Untitled"
+            created = mem.created_at or "unknown"
+            content = mem.content or ""
             content = self._strip_frontmatter(content)
             mem_parts.append(
                 f"[{i}] **{title}** (created: {created})\n{content}"
@@ -362,7 +316,6 @@ class ThreadNarrator:
 
         confidence = result.get("confidence", 0.0)
         if confidence < 0.4:
-            # LLM doesn't think these form a real arc
             return None
 
         narrative_body = result["narrative"]
@@ -376,7 +329,7 @@ class ThreadNarrator:
             "narrative": narrative_body,
             "arc_type": result.get("arc_type", "knowledge_building"),
             "confidence": confidence,
-            "member_ids": [m["id"] for m in cluster],
+            "member_ids": [m.id for m in cluster],
         }
 
     def _strip_frontmatter(self, content: str) -> str:
@@ -390,14 +343,14 @@ class ThreadNarrator:
         return content
 
 
-def build_threads(store: MemoryStore) -> list[dict]:
+def build_threads() -> list[dict]:
     """
     End-to-end thread building: detect clusters, narrate them, persist.
 
     Returns list of created thread dicts.
     """
-    detector = ThreadDetector(store)
-    narrator = ThreadNarrator(store)
+    detector = ThreadDetector()
+    narrator = ThreadNarrator()
 
     clusters = detector.detect_threads()
     created = []
@@ -407,14 +360,37 @@ def build_threads(store: MemoryStore) -> list[dict]:
         if result is None:
             continue
 
-        thread_id = store.create_thread(
+        now = datetime.now().isoformat()
+
+        # Validate all member IDs exist
+        member_ids = result["member_ids"]
+        valid_ids = []
+        for mid in member_ids:
+            try:
+                Memory.get_by_id(mid)
+                valid_ids.append(mid)
+            except Memory.DoesNotExist:
+                continue
+
+        if not valid_ids:
+            continue
+
+        thread = NarrativeThread.create(
             title=result["title"],
             summary=result["summary"],
             narrative=result["narrative"],
-            member_ids=result["member_ids"],
+            created_at=now,
+            updated_at=now,
         )
 
-        result["id"] = thread_id
+        for position, mid in enumerate(valid_ids):
+            ThreadMember.create(
+                thread_id=thread.id,
+                memory_id=mid,
+                position=position,
+            )
+
+        result["id"] = thread.id
         created.append(result)
 
     return created
