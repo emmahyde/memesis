@@ -28,6 +28,7 @@ DEFAULTS = {
     "orienting_detector": True,
     "habituation_baseline": True,
     "somatic_markers": True,
+    "replay_priority": True,
 }
 
 _cache: dict | None = None

@@ -78,6 +78,10 @@ class Consolidator:
             if suppressed_count > 0:
                 logger.info("Habituation filter suppressed %d routine observations", suppressed_count)
 
+        # 2c. Replay priority — sort observations by salience before LLM sees them
+        from .replay import sort_by_salience
+        filtered_content = sort_by_salience(filtered_content)
+
         # 3. Build manifest summary
         manifest_summary = self._build_manifest_summary()
 
