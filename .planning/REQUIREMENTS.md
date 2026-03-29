@@ -5,6 +5,10 @@
 
 ## v1 Requirements
 
+### Eval Framework
+
+- [ ] **EVAL-01**: Build eval harness with LongMemEval integration (500-question retrieval benchmark), internal metrics (precision@k, MRR, prune accuracy, injection utility rate), baseline capture against current FTS-only system, and verifier hook that runs suite after each phase and logs delta
+
 ### Cleanup
 
 - [ ] **CLEAN-01**: Commit Peewee ORM migration (Tasks 1-3) with atomic commits
@@ -69,6 +73,7 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| EVAL-01 | Phase 0.5 | Pending |
 | CLEAN-01 | Phase 1 | Pending |
 | CLEAN-02 | Phase 2 | Pending |
 | CLEAN-03 | Phase 3 | Pending |
@@ -97,8 +102,8 @@
 | LEARN-02 | Phase 26 (v2) | Future |
 
 **Coverage:**
-- v1 requirements: 20 total
-- v1 mapped to phases: 20
+- v1 requirements: 21 total
+- v1 mapped to phases: 21
 - v1 unmapped: 0
 - v2 requirements: 6 total
 - v2 mapped to future phases: 6
