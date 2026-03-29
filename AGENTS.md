@@ -12,6 +12,7 @@ memesis/
     lifecycle.py         # LifecycleManager — stage transitions with validation
     retrieval.py         # RetrievalEngine — three-tier injection + FTS search
     consolidator.py      # Consolidator — LLM-based curation at PreCompact
+    llm.py               # Shared LLM transport — call_llm(), model constants
     manifest.py          # ManifestGenerator — writes MEMORY.md index
     feedback.py          # FeedbackLoop — usage tracking, importance scoring
     prompts.py           # Prompt templates + EMOTIONAL_STATE_PATTERNS list
@@ -179,6 +180,7 @@ Content table backed by `memories`. Indexes: `title`, `summary`, `tags`,
 | `core/lifecycle.py`    | `LifecycleManager`  | Stage transitions with promotion/demotion rules. Wraps `MemoryStore`.          |
 | `core/retrieval.py`    | `RetrievalEngine`   | Three-tier injection (instinctive → crystallized → FTS).                       |
 | `core/consolidator.py` | `Consolidator`      | LLM-based curation. Owns the privacy filter.                                   |
+| `core/llm.py`          | —                   | Shared LLM transport: `call_llm()`, model constants, fence stripping.          |
 | `core/manifest.py`     | `ManifestGenerator` | Writes `MEMORY.md` index for human inspection.                                 |
 | `core/feedback.py`     | `FeedbackLoop`      | Usage heuristic (2+ keyword hits), importance score deltas.                    |
 | `core/prompts.py`      | —                   | `CONSOLIDATION_PROMPT` template and `EMOTIONAL_STATE_PATTERNS` regex list.     |
@@ -199,6 +201,8 @@ Do not use shorthand forms (`:learn`, `learn`, etc.).
 - All file I/O goes through `MemoryStore` — do not write memory files directly.
 - Atomic writes use `tempfile.mkstemp` + `shutil.move`.
 - Privacy filter runs before any LLM call — never bypass it.
+- All LLM calls go through `core.llm.call_llm()` — do not create
+  `anthropic.Anthropic()` clients directly in service modules.
 - Stage names are lowercase strings: `ephemeral`, `consolidated`,
   `crystallized`, `instinctive`.
 - `importance` is a float in [0.0, 1.0]; the SQLite CHECK constraint enforces

@@ -78,7 +78,7 @@ existing transcript data.
 
 ### What We Learn
 
-- **Consolidation prompt calibration**: Is the 15% keep rate right? Too aggressive? Too permissive?
+- **Consolidation prompt calibration**: Quality-test the keeps — are they genuinely useful? The right keep rate is whatever produces good output.
 - **Observation type distribution**: What types of observations actually emerge from real conversations?
 - **Signal patterns**: What conversational patterns reliably produce high-value observations?
 - **Noise patterns**: What patterns produce observations that *look* useful but aren't?
