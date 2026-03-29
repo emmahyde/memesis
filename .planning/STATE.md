@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 10-provenance-signals-01-PLAN.md
-last_updated: "2026-03-29T23:16:47.407Z"
+stopped_at: Completed 11-orientingdetector-01-PLAN.md
+last_updated: "2026-03-29T23:31:07.401Z"
 last_activity: 2026-03-29 — Phases 1-6 (cleanup) complete, gold set eval wired into report
 progress:
   total_phases: 27
-  completed_phases: 4
-  total_plans: 5
-  completed_plans: 5
+  completed_phases: 5
+  total_plans: 6
+  completed_plans: 6
   percent: 33
 ---
 
@@ -58,6 +58,7 @@ Progress: [███░░░░░░░] 33%
 | Phase 08-prompt-aware-tier-2-injection P01 | 2 | 1 tasks | 2 files |
 | Phase 09-thompson-sampling-selection P01 | 12 | 1 tasks | 2 files |
 | Phase 10-provenance-signals P01 | 3 | 1 tasks | 2 files |
+| Phase 11-orientingdetector P01 | 3 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -91,6 +92,8 @@ Recent decisions affecting current work:
 - [Phase 10-provenance-signals]: Provenance computed after injection logging so current session is included in session count - reflects actual retrieval history
 - [Phase 10-provenance-signals]: Batch query uses peewee fn.COUNT(field.distinct()) + fn.MIN in single SELECT GROUP BY - avoids N+1 queries for provenance computation
 - [Phase 10-provenance-signals]: Memory.created_at used as fallback for single/zero-session memories; week phrase is floor(days/7) with 'over less than a week' when 0
+- [Phase 11-orientingdetector]: OrientingDetector is stateless - detect() takes text + optional message_lengths, no internal state - caller manages message history
+- [Phase 11-orientingdetector]: importance_boost is max across signals not sum - prevents over-boosting when multiple categories fire simultaneously
 
 ### Pending Todos
 
@@ -104,6 +107,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T23:13:52.297Z
-Stopped at: Completed 10-provenance-signals-01-PLAN.md
+Last session: 2026-03-29T23:31:07.398Z
+Stopped at: Completed 11-orientingdetector-01-PLAN.md
 Resume file: None
