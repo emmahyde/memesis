@@ -2,14 +2,12 @@
 Consolidation engine for LLM-based memory curation during PreCompact.
 
 Reads ephemeral session observations, calls Claude to decide what to
-keep/prune/promote, applies privacy filtering, and writes decisions back
-to the memory store.
+keep/prune/promote, and writes decisions back to the memory store.
 """
 
 import hashlib
 import json
 import logging
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -17,7 +15,7 @@ from .database import get_base_dir, get_vec_store
 from .lifecycle import LifecycleManager
 from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, db
-from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT, EMOTIONAL_STATE_PATTERNS
+from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .relevance import RelevanceEngine
 
 logger = logging.getLogger(__name__)
@@ -39,7 +37,6 @@ class Consolidator:
     ):
         self.lifecycle = lifecycle
         self.model = model
-        self._privacy_patterns = [re.compile(p, re.IGNORECASE) for p in EMOTIONAL_STATE_PATTERNS]
 
     # ------------------------------------------------------------------
     # Public interface
@@ -51,11 +48,10 @@ class Consolidator:
 
         Steps:
         1. Read the ephemeral markdown file at ephemeral_path.
-        2. Build a manifest summary from the existing memory store.
-        3. Privacy-filter the ephemeral content before sending to the LLM.
-        4. Call Claude to get per-observation decisions.
-        5. Execute decisions (keep/prune/promote) and collect conflicts.
-        6. Return a summary dict.
+        2. Apply habituation filter and build manifest summary.
+        3. Call Claude to get per-observation decisions.
+        4. Execute decisions (keep/prune/promote) and collect conflicts.
+        5. Return a summary dict.
 
         Args:
             ephemeral_path: Absolute path to the ephemeral session markdown.
@@ -72,12 +68,8 @@ class Consolidator:
         # 1. Read ephemeral content
         ephemeral_content = Path(ephemeral_path).read_text(encoding="utf-8")
 
-        # 2. Privacy-filter before sending to LLM
-        filtered_content, was_filtered = self.filter_privacy(ephemeral_content)
-        if was_filtered:
-            logger.info("Privacy filter removed emotional state observations from ephemeral content")
-
-        # 2b. Habituation filter — suppress routine events before LLM call
+        # 2. Habituation filter — suppress routine events before LLM call
+        filtered_content = ephemeral_content
         base_dir = get_base_dir()
         if base_dir:
             from .habituation import HabituationModel
@@ -164,37 +156,9 @@ class Consolidator:
         total_chars = sum(len(str(m)) for m in memories)
         return total_chars // 4
 
-    def filter_privacy(self, text: str) -> tuple[str, bool]:
-        """
-        Remove lines matching emotional state patterns (D-12).
-
-        Args:
-            text: Raw text to filter.
-
-        Returns:
-            (filtered_text, was_anything_filtered) — the cleaned text and a
-            boolean indicating whether any lines were removed.
-        """
-        lines = text.splitlines(keepends=True)
-        kept_lines = []
-        any_filtered = False
-
-        for line in lines:
-            if self._is_emotional_state(line):
-                any_filtered = True
-                logger.debug("Privacy filter removed line: %s", line.rstrip())
-            else:
-                kept_lines.append(line)
-
-        return "".join(kept_lines), any_filtered
-
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-
-    def _is_emotional_state(self, text: str) -> bool:
-        """Return True if text matches any emotional state pattern."""
-        return any(p.search(text) for p in self._privacy_patterns)
 
     def _build_manifest_summary(self) -> str:
         """
@@ -304,6 +268,14 @@ class Consolidator:
         if obs_type and obs_type != "null" and f"type:{obs_type}" not in tags:
             tags.append(f"type:{obs_type}")
 
+        # Somatic marker — classify valence and boost importance
+        from .somatic import classify_valence
+        somatic = classify_valence(observation)
+        valence = somatic.valence
+        importance_boost = somatic.importance_boost
+        if f"valence:{valence}" not in tags:
+            tags.append(f"valence:{valence}")
+
         # Normalise path: strip any leading "consolidated/" prefix since
         # the file path is built from base_dir + stage.
         if target_path.startswith("consolidated/"):
@@ -334,7 +306,7 @@ class Consolidator:
                 summary=summary,
                 content=full_content,
                 tags=json.dumps(tags),
-                importance=0.5,
+                importance=min(0.5 + importance_boost, 1.0),
                 reinforcement_count=0,
                 created_at=now,
                 updated_at=now,

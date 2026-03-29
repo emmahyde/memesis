@@ -396,25 +396,3 @@ class TestFeedbackImportanceUpdates:
 # ---------------------------------------------------------------------------
 
 
-class TestPrivacyFilterBlocksEmotionalState:
-    def test_privacy_filter_blocks_emotional_state(self, tmp_path):
-        init_db(base_dir=str(tmp_path / "memory"))
-        try:
-            lifecycle = LifecycleManager()
-            consolidator = Consolidator(lifecycle=lifecycle)
-
-            ephemeral_text = (
-                "Emma seemed frustrated with the approach\n"
-                "Uses pytest for all tests\n"
-                "Prefers black for formatting\n"
-            )
-
-            filtered, was_filtered = consolidator.filter_privacy(ephemeral_text)
-
-            assert was_filtered is True
-            assert "frustrated" not in filtered
-            assert "Emma seemed frustrated" not in filtered
-            assert "pytest" in filtered
-            assert "black" in filtered
-        finally:
-            close_db()
