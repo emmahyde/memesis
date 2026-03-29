@@ -9,9 +9,9 @@ Usage:
     python3 eval/capture_baseline.py --phase "07-after-rrf"
     python3 eval/capture_baseline.py --output path/to/output.json
 
-When core.storage is not available (Phase 1 not yet complete), all retrieval
-and consolidation metrics are recorded as 0.0 with
-captured_without_core_storage: true.  The script always succeeds.
+Uses Peewee ORM models for all database operations. Retrieval and
+consolidation metrics use stubs until Phase 7 (Hybrid RRF) lands real
+retrieval logic.
 
 Importable API:
     from eval.capture_baseline import capture_baseline, run_internal_evals
@@ -37,16 +37,10 @@ if str(_REPO_ROOT_EARLY) not in sys.path:
 # Optional core.storage import — absent until Phase 1 completes
 # ---------------------------------------------------------------------------
 
-try:
-    from core.storage import MemoryStore
-    from core.lifecycle import LifecycleManager
-    from core.retrieval import RetrievalEngine
-    _CORE_STORAGE_AVAILABLE = True
-except ImportError:
-    MemoryStore = None
-    LifecycleManager = None
-    RetrievalEngine = None
-    _CORE_STORAGE_AVAILABLE = False
+from core.database import init_db, close_db
+from core.models import Memory
+from core.lifecycle import LifecycleManager
+from core.retrieval import RetrievalEngine
 
 # ---------------------------------------------------------------------------
 # Internal eval imports (always available — no core.* dependencies)
@@ -96,33 +90,25 @@ _LONGMEMEVAL_CATEGORIES = [
 
 def run_internal_evals() -> tuple[dict, dict]:
     """
-    Run retrieval and consolidation metrics against a live MemoryStore.
+    Run retrieval and consolidation metrics against a live Peewee database.
 
     Returns:
         Tuple of (retrieval_dict, consolidation_dict).
         Both match the JSON schema in eval-baseline.json.
-
-    Raises:
-        RuntimeError if core.storage is not available.
     """
-    if not _CORE_STORAGE_AVAILABLE:
-        raise RuntimeError("core.storage not available")
-
     import tempfile
 
     # Import SYNTHETIC_MEMORIES from conftest without triggering pytest
     from eval.conftest import SYNTHETIC_MEMORIES, seed_store
 
     with tempfile.TemporaryDirectory() as tmp:
-        store = MemoryStore(base_dir=str(Path(tmp) / "eval_memory"))
+        init_db(base_dir=str(Path(tmp) / "eval_memory"))
         try:
-            ids = seed_store(store)
+            ids = seed_store()
 
-            # Build a lookup: id -> spec, and path -> id
-            path_to_id = {}
+            # Build a lookup: id -> spec
             id_to_spec = {}
             for mid, spec in zip(ids, SYNTHETIC_MEMORIES):
-                path_to_id[spec["path"]] = mid
                 id_to_spec[mid] = spec
 
             crystallized_ids = {
@@ -159,16 +145,10 @@ def run_internal_evals() -> tuple[dict, dict]:
             # --- Prune accuracy ---
             # Use curation_audit fixture expectations as ground truth.
             # Crystallized (5) should be kept; ephemeral (5) should be pruned.
-            # Consolidated and instinctive fall to the pruner's discretion.
             # Without a real prune call (Phase 5), stub kept=[] → all zeros.
             kept: list[str] = []
             true_keep: set[str] = crystallized_ids
             pruned_list: list[str] = []
-            # instinctive memories expected to survive too
-            instinctive_ids = {
-                mid for mid, spec in id_to_spec.items()
-                if spec["stage"] == "instinctive"
-            }
             true_prune_ids = {
                 mid for mid, spec in id_to_spec.items()
                 if spec["stage"] == "ephemeral"
@@ -182,7 +162,7 @@ def run_internal_evals() -> tuple[dict, dict]:
             }
 
         finally:
-            store.close()
+            close_db()
 
     return retrieval, consolidation
 
@@ -248,16 +228,11 @@ def capture_baseline(
     output_path = Path(output_path)
 
     # --- Retrieval + consolidation metrics ---
-    if _CORE_STORAGE_AVAILABLE:
-        try:
-            retrieval, consolidation = run_internal_evals()
-            without_storage = False
-        except Exception as exc:
-            print(f"[capture_baseline] core.storage available but eval failed: {exc}", file=sys.stderr)
-            retrieval = dict(_ZERO_RETRIEVAL)
-            consolidation = dict(_ZERO_CONSOLIDATION)
-            without_storage = True
-    else:
+    try:
+        retrieval, consolidation = run_internal_evals()
+        without_storage = False
+    except Exception as exc:
+        print(f"[capture_baseline] eval failed: {exc}", file=sys.stderr)
         retrieval = dict(_ZERO_RETRIEVAL)
         consolidation = dict(_ZERO_CONSOLIDATION)
         without_storage = True
@@ -303,7 +278,7 @@ def _main() -> None:
     )
     args = parser.parse_args()
 
-    print(f"[capture_baseline] core.storage available: {_CORE_STORAGE_AVAILABLE}")
+    print("[capture_baseline] using Peewee models")
     snapshot = capture_baseline(phase=args.phase, output_path=Path(args.output))
 
     print(f"[capture_baseline] Written to: {args.output}")

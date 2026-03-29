@@ -14,14 +14,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-try:
-    from core.retrieval import RetrievalEngine
-    from core.storage import MemoryStore
-    _CORE_STORAGE_AVAILABLE = True
-except ImportError:
-    RetrievalEngine = None
-    MemoryStore = None
-    _CORE_STORAGE_AVAILABLE = False
+import json
+from core.database import init_db, close_db
+from core.models import Memory
+from core.retrieval import RetrievalEngine
 from eval.conftest import seed_store
 
 
@@ -65,35 +61,29 @@ NEEDLES = [
 
 @pytest.fixture
 def needle_store(tmp_path):
-    """Store pre-seeded with background noise + 3 needle memories."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    store = MemoryStore(base_dir=str(tmp_path / "needle_memory"))
-    seed_store(store)  # 20 background memories
+    """Database pre-seeded with background noise + 3 needle memories."""
+    init_db(base_dir=str(tmp_path / "needle_memory"))
+    seed_store()  # 20 background memories
 
     # Plant all 3 needles in crystallized stage
     for needle in NEEDLES:
-        store.create(
-            path=needle["path"],
+        Memory.create(
+            stage="crystallized",
+            title=needle["title"],
+            summary=needle["summary"],
             content=needle["content"],
-            metadata={
-                "stage": "crystallized",
-                "title": needle["title"],
-                "summary": needle["summary"],
-                "importance": needle["importance"],
-                "tags": ["needle", "eval"],
-            },
+            importance=needle["importance"],
+            tags=json.dumps(["needle", "eval"]),
         )
 
-    return store
+    yield tmp_path / "needle_memory"
+    close_db()
 
 
 @pytest.fixture
 def needle_context(needle_store):
     """Pre-built injection context for needle tests."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    engine = RetrievalEngine(needle_store)
+    engine = RetrievalEngine()
     return engine.inject_for_session(session_id="needle_eval_session")
 
 
@@ -141,16 +131,13 @@ def test_needle_background_memories_do_not_cause_false_positives(needle_store):
     """
     for needle in NEEDLES:
         for stage in ("ephemeral", "consolidated", "crystallized", "instinctive"):
-            for record in needle_store.list_by_stage(stage):
-                if needle["unique_token"] in (record.get("title") or ""):
+            for mem in Memory.by_stage(stage):
+                if needle["unique_token"] in (mem.title or ""):
                     continue  # Skip needle memories themselves
-                mem = needle_store.get(record["id"])
-                body = mem.get("content", "") or ""
-                # Background memories should not contain needle tokens
-                # (unless they are the needle memories we just planted)
-                if record.get("title", "").startswith("Needle Fact:"):
+                body = mem.content or ""
+                if (mem.title or "").startswith("Needle Fact:"):
                     continue
                 assert needle["unique_token"] not in body, (
                     f"Needle token '{needle['unique_token']}' found in non-needle "
-                    f"memory '{record['title']}' — test data contamination."
+                    f"memory '{mem.title}' — test data contamination."
                 )

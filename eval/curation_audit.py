@@ -21,16 +21,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-try:
-    from core.consolidator import Consolidator
-    from core.lifecycle import LifecycleManager
-    from core.storage import MemoryStore
-    _CORE_STORAGE_AVAILABLE = True
-except ImportError:
-    Consolidator = None
-    LifecycleManager = None
-    MemoryStore = None
-    _CORE_STORAGE_AVAILABLE = False
+from core.database import init_db, close_db
+from core.models import Memory
+from core.consolidator import Consolidator
+from core.lifecycle import LifecycleManager
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +112,10 @@ def _build_mock_llm_decisions() -> str:
 
 @pytest.fixture
 def curation_store(tmp_path):
-    """Isolated store for curation audit."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    return MemoryStore(base_dir=str(tmp_path / "curation_memory"))
+    """Isolated database for curation audit."""
+    init_db(base_dir=str(tmp_path / "curation_memory"))
+    yield tmp_path / "curation_memory"
+    close_db()
 
 
 @pytest.fixture
@@ -130,12 +124,10 @@ def consolidation_result(curation_store, tmp_path):
     Run consolidation with a mocked LLM response.
 
     The mock patches Consolidator._call_llm so no real API call is made.
-    Returns the consolidation result dict and the store for inspection.
+    Returns the consolidation result dict for inspection.
     """
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    lifecycle = LifecycleManager(curation_store)
-    consolidator = Consolidator(curation_store, lifecycle)
+    lifecycle = LifecycleManager()
+    consolidator = Consolidator(lifecycle)
 
     # Write the ephemeral file to disk
     ephemeral_file = tmp_path / "session_ephemeral.md"
@@ -150,12 +142,12 @@ def consolidation_result(curation_store, tmp_path):
             session_id="curation_eval_session",
         )
 
-    return result, curation_store
+    return result
 
 
 def test_curation_keeps_important_observations(consolidation_result):
     """All 4 important observations should produce kept memory_ids."""
-    result, store = consolidation_result
+    result = consolidation_result
     kept_ids = result["kept"]
 
     assert len(kept_ids) == len(IMPORTANT_OBSERVATIONS), (
@@ -163,17 +155,17 @@ def test_curation_keeps_important_observations(consolidation_result):
         f"got {len(kept_ids)}: {kept_ids}"
     )
 
-    # Each kept ID should be retrievable from the store
+    # Each kept ID should be retrievable from the database
     for mid in kept_ids:
-        mem = store.get(mid)
-        assert mem["stage"] == "consolidated", (
-            f"Kept memory {mid} is in stage '{mem['stage']}', expected 'consolidated'."
+        mem = Memory.get_by_id(mid)
+        assert mem.stage == "consolidated", (
+            f"Kept memory {mid} is in stage '{mem.stage}', expected 'consolidated'."
         )
 
 
 def test_curation_prunes_trivial_observations(consolidation_result):
     """All 6 trivial observations should appear in pruned list."""
-    result, _ = consolidation_result
+    result = consolidation_result
     pruned = result["pruned"]
 
     assert len(pruned) == len(TRIVIAL_OBSERVATIONS), (
@@ -194,7 +186,7 @@ def test_curation_precision_above_threshold(consolidation_result):
     All kept memories come from IMPORTANT_OBSERVATIONS (no false positives),
     so precision should be 100%, well above the 80% threshold.
     """
-    result, store = consolidation_result
+    result = consolidation_result
     kept_ids = result["kept"]
     total_kept = len(kept_ids)
 
@@ -206,16 +198,9 @@ def test_curation_precision_above_threshold(consolidation_result):
     correctly_kept = 0
 
     for mid in kept_ids:
-        mem = store.get(mid)
-        content = mem.get("content", "") or ""
-        # Strip frontmatter: body starts after the closing '---' line
-        lines = content.split("\n")
-        if lines and lines[0] == "---":
-            end = next((i for i in range(1, len(lines)) if lines[i] == "---"), None)
-            body = "\n".join(lines[end + 1:]).strip() if end else content
-        else:
-            body = content
-        if any(text in body for text in important_texts):
+        mem = Memory.get_by_id(mid)
+        content = mem.content or ""
+        if any(text in content for text in important_texts):
             correctly_kept += 1
 
     precision = correctly_kept / total_kept
@@ -232,14 +217,12 @@ def test_curation_memory_tree_state(consolidation_result):
     After consolidation, the memory tree should have exactly 4 consolidated memories
     and 0 ephemeral memories from this session (none were persisted there).
     """
-    result, store = consolidation_result
-
-    consolidated = store.list_by_stage("consolidated")
+    consolidated = list(Memory.by_stage("consolidated"))
     assert len(consolidated) == 4, (
         f"Expected 4 consolidated memories, found {len(consolidated)}"
     )
 
-    ephemeral = store.list_by_stage("ephemeral")
+    ephemeral = list(Memory.by_stage("ephemeral"))
     assert len(ephemeral) == 0, (
         f"Expected 0 ephemeral memories after consolidation, found {len(ephemeral)}"
     )
@@ -250,8 +233,8 @@ def test_curation_no_real_llm_call(curation_store, tmp_path):
     Ensure the eval never makes a real Anthropic API call.
     Patch anthropic.Anthropic at the module level to catch any accidental import.
     """
-    lifecycle = LifecycleManager(curation_store)
-    consolidator = Consolidator(curation_store, lifecycle)
+    lifecycle = LifecycleManager()
+    consolidator = Consolidator(lifecycle)
 
     ephemeral_file = tmp_path / "ephemeral_no_llm.md"
     ephemeral_file.write_text("- Some observation.", encoding="utf-8")

@@ -18,16 +18,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-try:
-    from core.lifecycle import LifecycleManager
-    from core.retrieval import RetrievalEngine
-    from core.storage import MemoryStore
-    _CORE_STORAGE_AVAILABLE = True
-except ImportError:
-    LifecycleManager = None
-    RetrievalEngine = None
-    MemoryStore = None
-    _CORE_STORAGE_AVAILABLE = False
+import json
+from core.database import init_db, close_db
+from core.models import Memory
+from core.lifecycle import LifecycleManager
+from core.retrieval import RetrievalEngine
 
 
 # ---------------------------------------------------------------------------
@@ -66,62 +61,56 @@ DECISION_TOKEN = "event-driven microservices architecture using Kafka"
 REASONING_TOKEN = "integration tests over unit tests"
 
 
-def _make_crystallized(store: MemoryStore, spec: dict) -> str:
+def _make_crystallized(spec: dict) -> str:
     """
     Create a memory, then promote it to crystallized by setting
     reinforcement_count to 3 and calling LifecycleManager.promote().
     """
-    # Start in consolidated (required stage before crystallized)
-    memory_id = store.create(
-        path=spec["path"],
+    mem = Memory.create(
+        stage="consolidated",
+        title=spec["title"],
+        summary=spec["summary"],
         content=spec["content"],
-        metadata={
-            "stage": "consolidated",
-            "title": spec["title"],
-            "summary": spec["summary"],
-            "importance": spec["importance"],
-            "tags": spec["tags"],
-        },
+        importance=spec["importance"],
+        tags=json.dumps(spec["tags"]),
     )
 
     # Set reinforcement_count to 3 so promote() passes validation
-    store.update(memory_id, metadata={"reinforcement_count": 3})
+    mem.reinforcement_count = 3
+    mem.save()
 
-    lifecycle = LifecycleManager(store)
-    lifecycle.promote(memory_id, rationale="Promoted by eval seeder: 3 reinforcements")
+    lifecycle = LifecycleManager()
+    lifecycle.promote(mem.id, rationale="Promoted by eval seeder: 3 reinforcements")
 
-    return memory_id
+    return mem.id
 
 
 @pytest.fixture
 def session_a_base_dir(tmp_path):
     """Return a stable base_dir path shared across both sessions."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
     return str(tmp_path / "shared_memory")
 
 
 @pytest.fixture
 def session_a_memory_ids(session_a_base_dir):
     """Session A: create and promote two decisions to crystallized."""
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    store_a = MemoryStore(base_dir=session_a_base_dir)
-    decision_id = _make_crystallized(store_a, SESSION_A_DECISION)
-    reasoning_id = _make_crystallized(store_a, SESSION_A_REASONING)
+    init_db(base_dir=session_a_base_dir)
+    decision_id = _make_crystallized(SESSION_A_DECISION)
+    reasoning_id = _make_crystallized(SESSION_A_REASONING)
     return {"decision": decision_id, "reasoning": reasoning_id}
 
 
 @pytest.fixture
 def session_b_context(session_a_base_dir, session_a_memory_ids):
     """
-    Session B: fresh MemoryStore from the same base_dir, inject for session.
+    Session B: re-init from the same base_dir, inject for session.
     """
-    if not _CORE_STORAGE_AVAILABLE:
-        pytest.skip("core.storage not available — run after Phase 1")
-    store_b = MemoryStore(base_dir=session_a_base_dir)
-    engine_b = RetrievalEngine(store_b)
-    return engine_b.inject_for_session(session_id="session_b_continuity_eval")
+    close_db()
+    init_db(base_dir=session_a_base_dir)
+    engine_b = RetrievalEngine()
+    context = engine_b.inject_for_session(session_id="session_b_continuity_eval")
+    yield context
+    close_db()
 
 
 def test_decision_survives_session_boundary(session_b_context):
@@ -146,19 +135,21 @@ def test_reasoning_preserved_in_continuity(session_b_context):
 
 def test_session_b_store_sees_crystallized_memories(session_a_base_dir, session_a_memory_ids):
     """
-    A fresh MemoryStore opened on the shared base_dir should list both memories
+    A fresh database opened on the shared base_dir should list both memories
     in the crystallized stage.
     """
-    store_b = MemoryStore(base_dir=session_a_base_dir)
-    crystallized = store_b.list_by_stage("crystallized")
-    crystallized_ids = {m["id"] for m in crystallized}
+    close_db()
+    init_db(base_dir=session_a_base_dir)
+    crystallized = list(Memory.by_stage("crystallized"))
+    crystallized_ids = {m.id for m in crystallized}
 
     assert session_a_memory_ids["decision"] in crystallized_ids, (
-        "Decision memory not found in crystallized stage on Session B store."
+        "Decision memory not found in crystallized stage on Session B."
     )
     assert session_a_memory_ids["reasoning"] in crystallized_ids, (
-        "Reasoning memory not found in crystallized stage on Session B store."
+        "Reasoning memory not found in crystallized stage on Session B."
     )
+    close_db()
 
 
 def test_continuity_score_above_threshold(session_b_context):
@@ -180,12 +171,14 @@ def test_promoted_memory_carries_correct_metadata(session_a_base_dir, session_a_
     """
     After promotion, memories should have reinforcement_count >= 3 and be in crystallized.
     """
-    store = MemoryStore(base_dir=session_a_base_dir)
+    close_db()
+    init_db(base_dir=session_a_base_dir)
     for key, memory_id in session_a_memory_ids.items():
-        mem = store.get(memory_id)
-        assert mem["stage"] == "crystallized", (
-            f"Memory '{key}' (id={memory_id}) is in stage '{mem['stage']}', expected 'crystallized'."
+        mem = Memory.get_by_id(memory_id)
+        assert mem.stage == "crystallized", (
+            f"Memory '{key}' (id={memory_id}) is in stage '{mem.stage}', expected 'crystallized'."
         )
-        assert mem["reinforcement_count"] >= 3, (
-            f"Memory '{key}' has reinforcement_count={mem['reinforcement_count']}, expected >= 3."
+        assert mem.reinforcement_count >= 3, (
+            f"Memory '{key}' has reinforcement_count={mem.reinforcement_count}, expected >= 3."
         )
+    close_db()
