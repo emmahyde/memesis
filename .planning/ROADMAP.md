@@ -188,7 +188,10 @@ Plans:
   1. Every injected memory block includes a provenance line when session_count > 1
   2. The N (sessions) and M (weeks) values are computed from actual RetrievalLog or ConsolidationLog data
   3. Single-session memories show appropriate provenance ("first observed" or similar) rather than fabricated counts
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [ ] 10-01-PLAN.md — _compute_provenance_batch + wire provenance lines into Tier 2 injection formatting
 
 ### Phase 11: OrientingDetector
 **Goal**: A rule-based OrientingDetector fires on high-signal moments — user corrections, explicit emphasis, error spikes, and pacing breaks — before observations reach the ephemeral buffer
@@ -361,7 +364,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 7. Hybrid RRF Retrieval | 2/2 | Complete   | 2026-03-29 |
 | 8. Prompt-Aware Tier 2 Injection | 1/1 | Complete   | 2026-03-29 |
 | 9. Thompson Sampling Selection | 1/1 | Complete   | 2026-03-29 |
-| 10. Provenance Signals | 0/? | Not started | - |
+| 10. Provenance Signals | 0/1 | Not started | - |
 | 11. OrientingDetector | 0/? | Not started | - |
 | 12. Habituation Baseline | 0/? | Not started | - |
 | 13. Somatic Markers | 0/? | Not started | - |
