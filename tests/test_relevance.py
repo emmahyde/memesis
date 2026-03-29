@@ -263,6 +263,50 @@ class TestRehydration:
 
 
 # ---------------------------------------------------------------------------
+# NLTK rehydration (D-07)
+# ---------------------------------------------------------------------------
+
+
+class TestNLTKRehydration:
+    """NLTK stemming and stopword filtering in find_rehydration_by_observation (D-07)."""
+
+    def test_stemmed_observation_finds_archived_memory(self, engine, tmp_store):
+        """Observation with inflected form should still match via Porter stem."""
+        mid = _create_memory(
+            tmp_store,
+            'Payment Pipeline Locking',
+            importance=0.6,
+            days_ago=30,
+        )
+        tmp_store.archive(mid)
+
+        # "payments" stems to "payment" — should match the archived title
+        matches = engine.find_rehydration_by_observation(
+            'payments pipeline deadlock needs investigation'
+        )
+
+        assert any(m['id'] == mid for m in matches)
+
+    def test_rehydration_fallback_when_nltk_unavailable(self, engine, tmp_store, monkeypatch):
+        """LookupError from nltk.data.find must not raise — returns a list."""
+        import nltk as _nltk
+
+        # Block NLTK data lookup so the except branch is exercised
+        monkeypatch.setattr(
+            _nltk.data,
+            'find',
+            lambda *a, **kw: (_ for _ in ()).throw(LookupError('not found')),
+        )
+
+        mid = _create_memory(tmp_store, 'Cache Invalidation', importance=0.6, days_ago=10)
+        tmp_store.archive(mid)
+
+        result = engine.find_rehydration_by_observation('cache invalidation strategy')
+
+        assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
 # Inhibition (retrieval-induced forgetting)
 # ---------------------------------------------------------------------------
 

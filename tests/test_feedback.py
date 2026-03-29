@@ -556,6 +556,87 @@ def test_log_event_timestamp_format(store, feedback):
 
 
 # ---------------------------------------------------------------------------
+# NLTK usage scoring (D-07)
+# ---------------------------------------------------------------------------
+
+
+class TestNLTKUsageScoring:
+    """NLTK stopword filtering and stemming in track_usage (D-07)."""
+
+    def test_stemmed_variant_triggers_usage(self, store, feedback):
+        """Inflected form in response should match via Porter stem."""
+        memory_id = _make_memory(
+            store,
+            path='auth_middleware.md',
+            title='Authentication Middleware',
+            summary='validates tokens before routing requests',
+        )
+        store.record_injection(memory_id, 'sess1')
+
+        # Response uses "authenticating" — stem matches "authentication"
+        result = feedback.track_usage(
+            'sess1',
+            [memory_id],
+            'We are authenticating requests using the middleware layer.',
+        )
+
+        assert result[memory_id] is True
+
+    def test_stopword_in_title_does_not_inflate_score(self, store, feedback):
+        """Stopwords like 'the' in the title must not trigger usage on unrelated content."""
+        memory_id = _make_memory(
+            store,
+            path='payment_system.md',
+            title='The Payment System',
+            summary='handles billing and invoicing workflows',
+        )
+        store.record_injection(memory_id, 'sess1')
+
+        # Response has no payment/billing/invoicing content — only common words
+        result = feedback.track_usage(
+            'sess1',
+            [memory_id],
+            'We deployed the new Kubernetes cluster today.',
+        )
+
+        assert result[memory_id] is False
+
+    def test_nltk_fallback_when_data_unavailable(self, store, feedback, monkeypatch):
+        """LookupError from nltk.data.find must not raise — fallback path stays valid."""
+        import core.feedback as feedback_module
+
+        # Force re-initialization by resetting the cached globals
+        monkeypatch.setattr(feedback_module, '_STOPWORDS', None)
+        monkeypatch.setattr(feedback_module, '_STEMMER', None)
+
+        # Make nltk.data.find raise LookupError so _ensure_nltk_data triggers
+        # the download path, which itself is mocked to fail gracefully
+        import nltk as _nltk
+        monkeypatch.setattr(_nltk.data, 'find', lambda *a, **kw: (_ for _ in ()).throw(LookupError('not found')))
+        # Also block the download so no network call is made
+        monkeypatch.setattr(_nltk, 'download', lambda *a, **kw: None)
+
+        memory_id = _make_memory(
+            store,
+            path='fallback.md',
+            title='Python Testing',
+            summary='pytest fixtures and helpers',
+        )
+        store.record_injection(memory_id, 'sess1')
+
+        # Must not raise; must return a valid dict with a boolean value
+        result = feedback.track_usage(
+            'sess1',
+            [memory_id],
+            'We used pytest fixtures throughout the testing session.',
+        )
+
+        assert isinstance(result, dict)
+        assert memory_id in result
+        assert isinstance(result[memory_id], bool)
+
+
+# ---------------------------------------------------------------------------
 # Content-aware usage scoring
 # ---------------------------------------------------------------------------
 
