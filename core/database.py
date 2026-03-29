@@ -72,10 +72,8 @@ def init_db(
     _base_dir = bd
     _db_path = dp
 
-    # Ensure directories exist
+    # Ensure base directory exists
     bd.mkdir(parents=True, exist_ok=True)
-    for stage in ("ephemeral", "consolidated", "crystallized", "instinctive", "meta", "archived"):
-        (bd / stage).mkdir(exist_ok=True)
 
     # Bind deferred database
     db.init(
@@ -156,7 +154,6 @@ def _run_migrations():
     - Add 'subsumed_by' column if missing
     - Add 'project_context' to retrieval_log if missing
     - Add 'last_surfaced_at' to narrative_threads if missing
-    - Add 'file_path' column to memories if missing (for bridge compat)
     - Rebuild consolidation_log CHECK constraint if outdated
     """
     # Helper: get column names for a table
@@ -170,7 +167,6 @@ def _run_migrations():
         ("content", "TEXT"),
         ("archived_at", "TEXT"),
         ("subsumed_by", "TEXT"),
-        ("file_path", "TEXT"),
     ]:
         if col not in mem_cols:
             try:

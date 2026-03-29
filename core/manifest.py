@@ -8,7 +8,6 @@ frontmatter-links + ~150-char summary format (D-02).
 import os
 import shutil
 import tempfile
-from pathlib import Path
 
 from .database import get_base_dir
 from .models import Memory
@@ -42,12 +41,8 @@ def _format_entry(memory, base_dir: Path, include_importance: bool = False) -> s
 
     Pattern: `- [title](relative_path) — summary [importance: X.XX]`
     """
-    title = memory.title or Path(memory.file_path or "unknown").stem.replace('_', ' ').title()
-    if memory.file_path:
-        rel_path = os.path.relpath(memory.file_path, base_dir)
-    else:
-        # Memory has no file_path (DB-only) — use stage/id as placeholder
-        rel_path = f"{memory.stage}/{memory.id}.md"
+    title = memory.title or memory.id
+    rel_path = f"{memory.stage}/{memory.id}.md"
     summary = _truncate(memory.summary or '', 150)
 
     line = f'- [{title}]({rel_path})'
@@ -138,9 +133,8 @@ class ManifestGenerator:
 
         # All instinctive
         for memory in Memory.by_stage('instinctive'):
-            fp = Path(memory.file_path) if memory.file_path else None
-            if fp and fp.exists():
-                char_count += len(fp.read_text(encoding='utf-8'))
+            if memory.content:
+                char_count += len(memory.content)
 
         # Top-10 crystallized by importance
         crystallized = sorted(
@@ -149,9 +143,8 @@ class ManifestGenerator:
             reverse=True,
         )
         for memory in crystallized[:10]:
-            fp = Path(memory.file_path) if memory.file_path else None
-            if fp and fp.exists():
-                char_count += len(fp.read_text(encoding='utf-8'))
+            if memory.content:
+                char_count += len(memory.content)
 
         token_count = char_count // 4
         return token_count, token_count / _CONTEXT_WINDOW
