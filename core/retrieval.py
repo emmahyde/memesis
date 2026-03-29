@@ -403,6 +403,10 @@ class RetrievalEngine:
             ),
         )
 
+        # Thompson sampling re-rank: stochastic explore/exploit on top of ranked list
+        if get_flag("thompson_sampling"):
+            records_sorted = self._thompson_rerank(records_sorted)
+
         # Apply token budget
         budget_remaining = token_limit
         selected = []
@@ -416,6 +420,29 @@ class RetrievalEngine:
                 budget_remaining -= cost
 
         return selected
+
+    def _thompson_rerank(self, memories: list) -> list:
+        """Re-rank memories using Thompson sampling over Beta(usage+1, unused+1).
+
+        Each memory draws a sample from Beta(a, b) where:
+          a = usage_count + 1
+          b = max(injection_count - usage_count, 0) + 1
+
+        This gives a Beta(1,1) uniform prior for cold-start memories (injection=0,
+        usage=0), and increasingly favours high-usage memories as counts grow.
+        The b=max(..., 0)+1 guard handles data anomalies where usage_count
+        exceeds injection_count.
+        """
+        import random
+
+        scored = []
+        for mem in memories:
+            a = (mem.usage_count or 0) + 1
+            b = max((mem.injection_count or 0) - (mem.usage_count or 0), 0) + 1
+            sample = random.betavariate(a, b)
+            scored.append((sample, mem))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [mem for _, mem in scored]
 
     def _crystallized_hybrid(
         self,
@@ -466,10 +493,18 @@ class RetrievalEngine:
 
         scored.sort(key=lambda x: x[0], reverse=True)
 
+        # Thompson sampling re-rank: stochastic explore/exploit on top of ranked list
+        from .flags import get_flag
+        if get_flag("thompson_sampling"):
+            ranked_memories = [mem for _, mem in scored]
+            ranked_memories = self._thompson_rerank(ranked_memories)
+        else:
+            ranked_memories = [mem for _, mem in scored]
+
         # Greedy token budget
         budget_remaining = token_limit
         selected = []
-        for _, memory in scored:
+        for memory in ranked_memories:
             content = memory.content or ""
             cost = len(content)
             if cost <= budget_remaining:

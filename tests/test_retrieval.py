@@ -191,8 +191,11 @@ def test_get_crystallized_token_budget_respected(base):
     assert total_chars <= 80
 
 
-def test_get_crystallized_project_context_boosted(base, engine):
-    """Project-matching memories appear before non-matching ones."""
+def test_get_crystallized_project_context_boosted(base, engine, monkeypatch):
+    """Project-matching memories appear before non-matching ones (Thompson sampling off for determinism)."""
+    import core.flags as flags_module
+    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+
     _make_memory(
         "Unrelated content", "crystallized",
         "Unrelated Memory", importance=0.9, project_context="/other/project",
@@ -209,8 +212,11 @@ def test_get_crystallized_project_context_boosted(base, engine):
     assert results[1].title == "Unrelated Memory"
 
 
-def test_get_crystallized_sort_importance_desc(base, engine):
-    """Without project context, memories sorted by importance DESC."""
+def test_get_crystallized_sort_importance_desc(base, engine, monkeypatch):
+    """Without project context, memories sorted by importance DESC (Thompson sampling off)."""
+    import core.flags as flags_module
+    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+
     _make_memory("Low importance content", "crystallized", "Low", importance=0.3)
     _make_memory("High importance content", "crystallized", "High", importance=0.9)
     _make_memory("Mid importance content", "crystallized", "Mid", importance=0.6)
@@ -227,8 +233,11 @@ def test_get_crystallized_empty(base, engine):
     assert results == []
 
 
-def test_get_crystallized_no_project_context_no_boost(base, engine):
-    """Without project_context, all memories treated equally (importance order)."""
+def test_get_crystallized_no_project_context_no_boost(base, engine, monkeypatch):
+    """Without project_context, all memories treated equally (importance order, Thompson sampling off)."""
+    import core.flags as flags_module
+    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+
     _make_memory("Content A", "crystallized", "A",
                  importance=0.8, project_context="/proj/a")
     _make_memory("Content B", "crystallized", "B",
@@ -420,8 +429,11 @@ def test_inject_for_session_only_crystallized(base, engine):
     assert "## Your Behavioral Guidelines (always active)" not in result
 
 
-def test_inject_for_session_project_context_boosting(base, engine):
-    """Project context passed to Tier-2 retrieval is applied."""
+def test_inject_for_session_project_context_boosting(base, engine, monkeypatch):
+    """Project context passed to Tier-2 retrieval is applied (Thompson sampling off for determinism)."""
+    import core.flags as flags_module
+    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+
     matching_id = _make_memory(
         "Project-specific knowledge", "crystallized",
         "Matching Project Memory", importance=0.5,
@@ -979,8 +991,11 @@ class TestCrystallizedHybrid:
         assert id_a in result_ids
         assert id_b in result_ids
 
-    def test_crystallized_no_query_preserves_static_sort(self, base, engine):
-        """get_crystallized_for_context() with no query preserves existing static sort behavior."""
+    def test_crystallized_no_query_preserves_static_sort(self, base, engine, monkeypatch):
+        """get_crystallized_for_context() with no query preserves existing static sort behavior (Thompson sampling off)."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+
         id_high = _make_memory("content high importance", "crystallized", "High Importance", importance=0.9)
         id_low = _make_memory("content low importance", "crystallized", "Low Importance", importance=0.2)
 
@@ -998,8 +1013,11 @@ class TestCrystallizedHybrid:
         total_chars = sum(len(m.content or "") for m in results)
         assert total_chars <= 100
 
-    def test_crystallized_hybrid_project_context_boost(self, base, engine):
-        """get_crystallized_for_context with query applies project_context boost."""
+    def test_crystallized_hybrid_project_context_boost(self, base, engine, monkeypatch):
+        """get_crystallized_for_context with query applies project_context boost (Thompson sampling off)."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": True, "thompson_sampling": False})
+
         # Two memories both match FTS "deployment", but one matches project_context
         id_match = _make_memory(
             "deployment pipeline step", "crystallized", "Matching Deploy",
@@ -1023,8 +1041,12 @@ class TestCrystallizedHybrid:
         sig = inspect.signature(engine.inject_for_session)
         assert "query" in sig.parameters
 
-    def test_inject_for_session_forwards_query(self, base, engine):
+    def test_inject_for_session_forwards_query(self, base, engine, monkeypatch):
         """inject_for_session with query produces result containing relevant memories."""
+        import core.flags as flags_module
+        # Disable Thompson sampling so static path ordering is deterministic
+        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": True, "thompson_sampling": False})
+
         id_a = _make_memory("kubernetes deployment scaling", "crystallized", "Kube Deploy", importance=0.5)
         id_b = _make_memory("python refactoring patterns", "crystallized", "Python Refactor", importance=0.9)
 
