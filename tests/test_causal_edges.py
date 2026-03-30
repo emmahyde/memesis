@@ -606,3 +606,335 @@ class TestRelevanceContradictionIntegration:
 
         score_connected = engine.compute_relevance(m2)
         assert score_connected > score
+
+
+# ---------------------------------------------------------------------------
+# Contradiction edges created by _create_contradiction_edges()
+# ---------------------------------------------------------------------------
+
+class TestContradictionEdges:
+
+    def test_creates_bidirectional_edges(self, store):
+        """Contradicted memory and confirmed memory get edges in both directions."""
+        m_contra = _make_memory(title="Old deploy strategy")
+        m_confirmed = _make_memory(title="New CI/CD pipeline")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "Deploy moved to Tuesdays"},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "CI/CD active"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "session content", "sess-ct-1")
+
+        a_to_b = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m_contra.id,
+            MemoryEdge.target_id == m_confirmed.id,
+            MemoryEdge.edge_type == "contradicts",
+        ))
+        b_to_a = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m_confirmed.id,
+            MemoryEdge.target_id == m_contra.id,
+            MemoryEdge.edge_type == "contradicts",
+        ))
+        assert len(a_to_b) == 1, "A→B edge missing"
+        assert len(b_to_a) == 1, "B→A edge missing"
+
+    def test_edge_metadata_fields(self, store):
+        """Edge metadata includes all required fields with correct types."""
+        m_contra = _make_memory(title="Old approach")
+        m_confirmed = _make_memory(title="New approach")
+
+        evidence_text = "The new approach replaces the old one"
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": evidence_text},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "confirmed"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "session", "sess-ct-2")
+
+        edge = MemoryEdge.select().where(
+            MemoryEdge.source_id == m_contra.id,
+            MemoryEdge.target_id == m_confirmed.id,
+            MemoryEdge.edge_type == "contradicts",
+        ).get()
+
+        meta = json.loads(edge.metadata)
+        assert meta["evidence"] == evidence_text
+        assert meta["session_id"] == "sess-ct-2"
+        assert "created_at" in meta
+        assert isinstance(meta["resolved"], bool)
+        assert "resolution" in meta
+        assert meta["detected_by"] == "reconsolidation"
+        assert "detected_at" in meta
+
+    def test_default_weight_is_0_7(self, store):
+        """Contradiction edges are created with weight 0.7."""
+        m_contra = _make_memory(title="A")
+        m_confirmed = _make_memory(title="B")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "reason"},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "ok"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "content", "sess-ct-3")
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        assert len(edges) == 2
+        for edge in edges:
+            assert edge.weight == 0.7
+
+    def test_no_duplicate_edges_on_repeated_calls(self, store):
+        """Running reconsolidate twice with the same contradiction creates no duplicate edges."""
+        m_contra = _make_memory(title="A")
+        m_confirmed = _make_memory(title="B")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "updated"},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "ok"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "content", "sess-ct-4a")
+            reconsolidate([m_contra.id, m_confirmed.id], "content again", "sess-ct-4b")
+
+        a_to_b = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m_contra.id,
+            MemoryEdge.target_id == m_confirmed.id,
+            MemoryEdge.edge_type == "contradicts",
+        ))
+        b_to_a = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m_confirmed.id,
+            MemoryEdge.target_id == m_contra.id,
+            MemoryEdge.edge_type == "contradicts",
+        ))
+        assert len(a_to_b) == 1, "Duplicate A→B edge created"
+        assert len(b_to_a) == 1, "Duplicate B→A edge created"
+
+    def test_flag_disabled_creates_no_edges(self, store, monkeypatch):
+        """With contradiction_tensors flag off, no contradicts edges are created."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "reconsolidation": True,
+            "causal_edges": False,
+            "contradiction_tensors": False,
+        })
+
+        m_contra = _make_memory(title="A")
+        m_confirmed = _make_memory(title="B")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "reason"},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "ok"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "content", "sess-ct-5")
+
+        assert MemoryEdge.select().where(
+            MemoryEdge.edge_type == "contradicts"
+        ).count() == 0
+
+    def test_superseded_gets_resolved_true(self, store):
+        """A memory contradicted again (already had contradiction_flagged) gets resolved=True."""
+        # Pre-flag the memory as if it was contradicted in a prior session
+        m_contra = _make_memory(title="Old strategy", tags=["contradiction_flagged"])
+        m_confirmed = _make_memory(title="Current approach")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "superseded again"},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "confirmed"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "session content", "sess-ct-6")
+
+        edge = MemoryEdge.select().where(
+            MemoryEdge.source_id == m_contra.id,
+            MemoryEdge.target_id == m_confirmed.id,
+            MemoryEdge.edge_type == "contradicts",
+        ).get()
+        meta = json.loads(edge.metadata)
+        assert meta["resolved"] is True
+        assert meta["resolution"] == "superseded"
+
+    def test_first_contradiction_is_active_tension(self, store):
+        """A memory contradicted for the first time has resolved=False (active tension)."""
+        m_contra = _make_memory(title="Fresh memory")
+        m_confirmed = _make_memory(title="Confirmed position")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "new info"},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "yes"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "session", "sess-ct-7")
+
+        edge = MemoryEdge.select().where(
+            MemoryEdge.source_id == m_contra.id,
+            MemoryEdge.target_id == m_confirmed.id,
+            MemoryEdge.edge_type == "contradicts",
+        ).get()
+        meta = json.loads(edge.metadata)
+        assert meta["resolved"] is False
+        assert meta["resolution"] is None
+
+    def test_no_edges_when_no_confirmed_memories(self, store):
+        """If no memories were confirmed in the session, no contradiction edges are created."""
+        m_contra = _make_memory(title="A")
+        m_unmentioned = _make_memory(title="B")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "something"},
+            {"memory_id": m_unmentioned.id, "action": "unmentioned", "evidence": ""},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_unmentioned.id], "content", "sess-ct-8")
+
+        assert MemoryEdge.select().where(
+            MemoryEdge.edge_type == "contradicts"
+        ).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Thread narration contradiction edges (Phase 2, Source 2)
+# ---------------------------------------------------------------------------
+
+class TestThreadContradictionEdges:
+    """Tests for resolved contradicts edges created by build_threads() when
+    arc_type == 'correction_chain'."""
+
+    def _run_build_threads(self, cluster_memories, arc_type="correction_chain"):
+        """Patch build_threads() so the detector returns our cluster and the
+        narrator returns the given arc_type."""
+        from core.threads import build_threads, ThreadDetector, ThreadNarrator
+
+        member_ids = [m.id for m in cluster_memories]
+        narrate_result = {
+            "title": "Test correction arc",
+            "summary": "Correction arc summary",
+            "narrative": "First believed X. Got corrected. Now understands Y.",
+            "arc_type": arc_type,
+            "confidence": 0.9,
+            "member_ids": member_ids,
+        }
+
+        with patch.object(ThreadDetector, "detect_threads", return_value=[cluster_memories]):
+            with patch.object(ThreadNarrator, "narrate_cluster", return_value=narrate_result):
+                return build_threads()
+
+    def test_correction_chain_creates_contradiction_edges(self, store):
+        """correction_chain thread creates bidirectional resolved contradicts edges."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(4)]
+
+        created = self._run_build_threads(mems)
+
+        assert len(created) == 1
+        assert created[0]["arc_type"] == "correction_chain"
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        assert len(edges) == 2  # bidirectional
+
+        src_ids = {e.source_id for e in edges}
+        tgt_ids = {e.target_id for e in edges}
+        # Both directions present — union of src+tgt contains both endpoints
+        assert src_ids == tgt_ids
+
+    def test_non_correction_chain_creates_no_edges(self, store):
+        """Other arc_types (e.g. knowledge_building) do NOT create contradiction edges."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(3)]
+
+        self._run_build_threads(mems, arc_type="knowledge_building")
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        assert len(edges) == 0
+
+    def test_preference_evolution_creates_no_edges(self, store):
+        """preference_evolution arc does NOT create contradiction edges."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(2)]
+
+        self._run_build_threads(mems, arc_type="preference_evolution")
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        assert len(edges) == 0
+
+    def test_early_late_split_uses_median(self, store):
+        """With 4 members, early=[0,1] late=[2,3]; edges are between [0] and [3]."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(4)]
+
+        self._run_build_threads(mems)
+
+        # The edge endpoints must be mems[0] and mems[3]
+        edge_pairs = {(e.source_id, e.target_id) for e in
+                      MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts")}
+
+        assert (mems[0].id, mems[3].id) in edge_pairs
+        assert (mems[3].id, mems[0].id) in edge_pairs
+
+    def test_early_late_split_three_members(self, store):
+        """With 3 members, early=[0] late=[1,2]; edges between [0] and [2]."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(3)]
+
+        self._run_build_threads(mems)
+
+        edge_pairs = {(e.source_id, e.target_id) for e in
+                      MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts")}
+
+        assert (mems[0].id, mems[2].id) in edge_pairs
+        assert (mems[2].id, mems[0].id) in edge_pairs
+
+    def test_edge_metadata_fields(self, store):
+        """Edge metadata contains all required fields."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(2)]
+
+        created = self._run_build_threads(mems)
+        thread_id = created[0]["id"]
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        assert len(edges) == 2
+
+        for edge in edges:
+            assert edge.weight == 0.3
+            meta = json.loads(edge.metadata)
+            assert "evidence" in meta
+            assert meta["thread_id"] == thread_id
+            assert meta["arc_type"] == "correction_chain"
+            assert meta["resolved"] is True
+            assert meta["resolution"] == "correction_chain"
+            assert "created_at" in meta
+            assert "detected_at" in meta
+            assert meta["detected_by"] == "thread_narrator"
+
+    def test_edge_weight_is_0_3(self, store):
+        """Contradiction edges from threads have weight 0.3."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(2)]
+
+        self._run_build_threads(mems)
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        for edge in edges:
+            assert edge.weight == 0.3
+
+    def test_flag_disabled_skips_edges(self, store, monkeypatch):
+        """When contradiction_tensors flag is False, no edges are created."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "contradiction_tensors": False,
+        })
+
+        mems = [_make_memory(title=f"Mem {i}") for i in range(4)]
+
+        self._run_build_threads(mems)
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        assert len(edges) == 0
+
+    def test_no_duplicate_edges_on_rebuild(self, store):
+        """Running build_threads() twice for the same cluster does not duplicate edges."""
+        mems = [_make_memory(title=f"Mem {i}") for i in range(2)]
+
+        self._run_build_threads(mems)
+        # Simulate a second build against same members (exclude_threaded would
+        # normally prevent this, but we bypass the detector entirely)
+        self._run_build_threads(mems)
+
+        edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
+        # Only one edge in each direction — no duplicates
+        assert len(edges) == 2
