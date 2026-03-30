@@ -48,8 +48,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 ### v1 — Advanced Retrieval
 
-- [ ] **Phase 19: 1-Hop Graph Expansion** - Expand hybrid search results to thread neighbors via memory_edges table
-- [ ] **Phase 20: Ghost Coherence Check** - Periodic LLM check comparing self-model claims against memory evidence
+- [x] **Phase 19: 1-Hop Graph Expansion** - Expand hybrid search results to thread neighbors via memory_edges table (completed 2026-03-30)
+- [x] **Phase 20: Ghost Coherence Check** - Periodic LLM check comparing self-model claims against memory evidence (completed 2026-03-30)
 
 ### v2 — Future Phases
 
@@ -379,8 +379,8 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 20, then v2 phases 21
 | 16. Reconsolidation at PreCompact | 0/? | Complete    | 2026-03-29 |
 | 17. Saturation Decay | 0/? | Complete    | 2026-03-30 |
 | 18. Integration Factor | 0/? | Complete    | 2026-03-30 |
-| 19. 1-Hop Graph Expansion | 0/? | Not started | - |
-| 20. Ghost Coherence Check | 0/? | Not started | - |
+| 19. 1-Hop Graph Expansion | 0/? | Complete    | 2026-03-30 |
+| 20. Ghost Coherence Check | 0/? | Complete    | 2026-03-30 |
 | 21. Prospective Memory Table (v2) | 0/? | Not started | - |
 | 22. Intent Detection (v2) | 0/? | Not started | - |
 | 23. ContextPercept Sensory Fusion (v2) | 0/? | Not started | - |
