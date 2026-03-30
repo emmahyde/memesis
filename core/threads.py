@@ -15,13 +15,16 @@ This module:
 """
 
 import json
+import logging
 import re
 from datetime import datetime, timedelta
 from typing import Optional
 
 from .database import get_vec_store
 from .llm import call_llm
-from .models import Memory, NarrativeThread, ThreadMember, db
+from .models import Memory, MemoryEdge, NarrativeThread, ThreadMember, db
+
+logger = logging.getLogger(__name__)
 
 
 def _get_embeddings(memories: list):
@@ -349,6 +352,8 @@ def build_threads() -> list[dict]:
 
     Returns list of created thread dicts.
     """
+    from .flags import get_flag
+
     detector = ThreadDetector()
     narrator = ThreadNarrator()
 
@@ -393,4 +398,65 @@ def build_threads() -> list[dict]:
         result["id"] = thread.id
         created.append(result)
 
+        # Create resolved contradiction edges for correction_chain threads
+        if result.get("arc_type") == "correction_chain" and get_flag("contradiction_tensors"):
+            _create_thread_contradiction_edges(thread.id, valid_ids, now)
+
     return created
+
+
+def _create_thread_contradiction_edges(
+    thread_id: str,
+    member_ids: list[str],
+    timestamp: str,
+) -> None:
+    """Create resolved contradicts edges between early and late members of a
+    correction_chain thread.
+
+    The member_ids list is in chronological order (position order).  We split
+    at the median: positions 0..median-1 are "early" (the corrected position)
+    and positions median..-1 are "late" (the current understanding).  We then
+    create bidirectional contradicts edges between early[0] and late[-1].
+
+    Weight is 0.3 — historical contradiction, already resolved.
+    """
+    n = len(member_ids)
+    if n < 2:
+        return
+
+    median = n // 2
+    early_ids = member_ids[:median]
+    late_ids = member_ids[median:]
+
+    source_id = early_ids[0]
+    target_id = late_ids[-1]
+
+    meta = json.dumps({
+        "evidence": f"correction_chain thread: {thread_id}",
+        "thread_id": thread_id,
+        "arc_type": "correction_chain",
+        "resolved": True,
+        "resolution": "correction_chain",
+        "created_at": timestamp,
+        "detected_at": timestamp,
+        "detected_by": "thread_narrator",
+    })
+
+    for src, tgt in [(source_id, target_id), (target_id, source_id)]:
+        exists = MemoryEdge.select().where(
+            MemoryEdge.source_id == src,
+            MemoryEdge.target_id == tgt,
+            MemoryEdge.edge_type == "contradicts",
+        ).exists()
+        if not exists:
+            MemoryEdge.create(
+                source_id=src,
+                target_id=tgt,
+                edge_type="contradicts",
+                weight=0.3,
+                metadata=meta,
+            )
+            logger.info(
+                "Thread contradiction edge: %s -[contradicts]-> %s (thread=%s)",
+                src[:8], tgt[:8], thread_id[:8],
+            )
