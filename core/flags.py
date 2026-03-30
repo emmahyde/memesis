@@ -8,10 +8,10 @@ a flags file.
 Usage:
     from core.flags import get_flag
 
-    if get_flag("hybrid_rrf"):
-        # use hybrid search
+    if get_flag("thompson_sampling"):
+        # use stochastic reranking
     else:
-        # fallback to FTS-only
+        # use deterministic ranking
 """
 
 import json
@@ -21,7 +21,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DEFAULTS = {
-    "hybrid_rrf": True,
     "prompt_aware_tier2": True,
     "thompson_sampling": True,
     "provenance_signals": True,
@@ -36,6 +35,10 @@ DEFAULTS = {
     "graph_expansion": True,
     "ghost_coherence": True,
     "affect_awareness": True,
+    "causal_edges": True,
+    "contradiction_tensors": True,
+    "affect_signatures": True,
+    "adversarial_surfacing": True,
 }
 
 _cache: dict | None = None

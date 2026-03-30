@@ -122,14 +122,17 @@ class RelevanceEngine:
         integration_factor = 1.0
         if get_flag("integration_factor"):
             reinforcement = _get("reinforcement_count", 0) or 0
-            # Check thread membership and tag co-occurrence
+            # Check thread membership, tag co-occurrence, and causal edges
             has_thread = self._has_thread_membership(memory)
             has_tag_overlap = self._has_tag_overlap(memory)
+            has_causal = self._has_causal_edges(memory) if get_flag("causal_edges") else False
+            has_contradiction = self._has_contradiction_edges(memory) if get_flag("contradiction_tensors") else False
 
-            if not has_thread and not has_tag_overlap and reinforcement == 0:
+            connected = has_thread or has_tag_overlap or has_causal or has_contradiction
+            if not connected and reinforcement == 0:
                 # Fully isolated — significant penalty
                 integration_factor = 0.5
-            elif not has_thread and not has_tag_overlap:
+            elif not connected:
                 # No connections but has reinforcement — mild penalty
                 integration_factor = 0.75
             # else: connected — no penalty (1.0)
@@ -197,6 +200,38 @@ class RelevanceEngine:
             if matches.exists():
                 return True
         return False
+
+    @staticmethod
+    def _has_causal_edges(memory) -> bool:
+        """Check if memory participates in any causal relationship."""
+        from .models import MemoryEdge
+        mid = memory.id if hasattr(memory, 'id') else memory.get('id')
+        if not mid:
+            return False
+        _CAUSAL_TYPES = ("caused_by", "refined_from", "subsumed_into")
+        return MemoryEdge.select().where(
+            ((MemoryEdge.source_id == mid) | (MemoryEdge.target_id == mid)),
+            MemoryEdge.edge_type.in_(_CAUSAL_TYPES),
+        ).exists()
+
+    @staticmethod
+    def _has_contradiction_edges(memory) -> bool:
+        """Check if memory participates in any contradiction relationship.
+
+        Checks both directions — memory may be the source (it contradicts
+        something) or the target (something contradicts it).  Per D-01,
+        contradiction edges exist for all resolution types (unresolved,
+        resolved, superseded), so the presence of a contradicts edge is
+        sufficient to consider the memory connected.
+        """
+        from .models import MemoryEdge
+        mid = memory.id if hasattr(memory, 'id') else memory.get('id')
+        if not mid:
+            return False
+        return MemoryEdge.select().where(
+            ((MemoryEdge.source_id == mid) | (MemoryEdge.target_id == mid)),
+            MemoryEdge.edge_type == "contradicts",
+        ).exists()
 
     # ------------------------------------------------------------------
     # Archival

@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from core.affect import load_analyzer
 from core.consolidator import Consolidator
 from core.crystallizer import Crystallizer
 from core.database import close_db, get_base_dir, get_vec_store, init_db
@@ -60,6 +61,17 @@ def main():
         today = datetime.now().strftime("%Y-%m-%d")
 
         base_dir = init_db(project_context=project_context)
+
+        # Load session affect state — available before reconsolidation and
+        # thread-building so later waves can pass it to those subsystems.
+        # Non-fatal: missing or corrupt affect file yields a neutral AffectState.
+        session_affect = None
+        try:
+            analyzer = load_analyzer(base_dir, session_id)
+            session_affect = analyzer.current_state()
+        except Exception as e:
+            print(f"Affect load error (non-fatal): {e}", file=sys.stderr)
+
         lifecycle = LifecycleManager()
         consolidator = Consolidator(lifecycle)
         manifest = ManifestGenerator()
@@ -120,12 +132,14 @@ def main():
                     from core.reconsolidation import reconsolidate
                     recon = reconsolidate(injected_ids, usage_text, session_id)
                     if any(recon.values()):
-                        logger.info(
-                            "Reconsolidation: %d confirmed, %d contradicted, %d refined",
-                            len(recon["confirmed"]), len(recon["contradicted"]), len(recon["refined"]),
+                        print(
+                            f"Reconsolidation: {len(recon['confirmed'])} confirmed,"
+                            f" {len(recon['contradicted'])} contradicted,"
+                            f" {len(recon['refined'])} refined",
+                            file=sys.stderr,
                         )
                 except Exception as e:
-                    logger.warning("Reconsolidation error (non-fatal): %s", e)
+                    print(f"Reconsolidation error (non-fatal): {e}", file=sys.stderr)
 
             result = consolidator.consolidate_session(str(snapshot_path), session_id)
             feedback.update_importance_scores(session_id)
