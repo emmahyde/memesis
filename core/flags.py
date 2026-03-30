@@ -31,6 +31,8 @@ DEFAULTS = {
     "replay_priority": True,
     "sm2_spaced_injection": True,
     "reconsolidation": True,
+    "saturation_decay": True,
+    "integration_factor": True,
     "affect_awareness": True,
 }
 

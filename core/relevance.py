@@ -111,15 +111,92 @@ class RelevanceEngine:
         if project_context and _get("project_context") == project_context:
             context_boost = 1.5
 
+        # Saturation penalty: memories injected often but never used
+        from .flags import get_flag
+        saturation_penalty = 0.0
+        if get_flag("saturation_decay"):
+            unused_injections = max((_get("injection_count", 0) or 0) - usage_count, 0)
+            saturation_penalty = min(0.3, unused_injections * 0.05)
+
+        # Integration factor: isolated memories decay faster
+        integration_factor = 1.0
+        if get_flag("integration_factor"):
+            reinforcement = _get("reinforcement_count", 0) or 0
+            # Check thread membership and tag co-occurrence
+            has_thread = self._has_thread_membership(memory)
+            has_tag_overlap = self._has_tag_overlap(memory)
+
+            if not has_thread and not has_tag_overlap and reinforcement == 0:
+                # Fully isolated — significant penalty
+                integration_factor = 0.5
+            elif not has_thread and not has_tag_overlap:
+                # No connections but has reinforcement — mild penalty
+                integration_factor = 0.75
+            # else: connected — no penalty (1.0)
+
         # Weighted geometric mean
         relevance = (
             (importance ** 0.4)
             * (recency ** 0.3)
             * (usage_signal ** 0.2)
             * (context_boost ** 0.1)
+            * integration_factor
         )
 
+        # Apply saturation penalty as subtraction (post-multiply)
+        relevance = relevance - saturation_penalty
+
         return min(1.0, max(0.0, relevance))
+
+    # ------------------------------------------------------------------
+    # Integration factor helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_thread_membership(memory) -> bool:
+        """Check if memory belongs to any narrative thread."""
+        from .models import ThreadMember
+        mid = memory.id if hasattr(memory, 'id') else memory.get('id')
+        if not mid:
+            return False
+        return ThreadMember.select().where(ThreadMember.memory_id == mid).exists()
+
+    @staticmethod
+    def _has_tag_overlap(memory) -> bool:
+        """Check if memory shares any tags with other active memories."""
+        if isinstance(memory, dict):
+            tags = memory.get('tags', '[]')
+            mid = memory.get('id')
+        else:
+            tags = memory.tags
+            mid = memory.id
+
+        import json
+        try:
+            tag_list = json.loads(tags) if isinstance(tags, str) else (tags or [])
+        except (json.JSONDecodeError, TypeError):
+            return False
+
+        if not tag_list or not mid:
+            return False
+
+        # Check if any other active memory shares at least one tag
+        for tag in tag_list:
+            # Skip type: and valence: meta-tags — they're universal
+            if tag.startswith("type:") or tag.startswith("valence:"):
+                continue
+            matches = (
+                Memory.select()
+                .where(
+                    Memory.id != mid,
+                    Memory.archived_at.is_null(),
+                    Memory.tags.contains(tag),
+                )
+                .limit(1)
+            )
+            if matches.exists():
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Archival
