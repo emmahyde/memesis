@@ -21,6 +21,20 @@ from core.models import Memory, ConsolidationLog, RetrievalLog, db
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _disable_new_relevance_flags(monkeypatch):
+    """Disable saturation_decay and integration_factor for existing tests.
+
+    These features change the formula and would break existing score thresholds.
+    They're tested separately in test_saturation_integration.py.
+    """
+    import core.flags
+    monkeypatch.setattr(core.flags, "_cache", {
+        "saturation_decay": False,
+        "integration_factor": False,
+    })
+
+
 @pytest.fixture
 def base(tmp_path):
     init_db(base_dir=str(tmp_path / "memory"))
