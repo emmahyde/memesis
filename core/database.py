@@ -14,6 +14,7 @@ from typing import Optional
 from .models import (
     ConsolidationLog,
     Memory,
+    MemoryEdge,
     NarrativeThread,
     RetrievalLog,
     ThreadMember,
@@ -27,7 +28,7 @@ _vec_store = None
 _db_path: Optional[Path] = None
 _base_dir: Optional[Path] = None
 
-ALL_TABLES = [Memory, NarrativeThread, ThreadMember, RetrievalLog, ConsolidationLog]
+ALL_TABLES = [Memory, NarrativeThread, ThreadMember, MemoryEdge, RetrievalLog, ConsolidationLog]
 
 
 def _resolve_db_path(project_context: str = None, base_dir: str = None) -> tuple[Path, Path]:

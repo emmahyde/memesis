@@ -299,6 +299,24 @@ class ThreadMember(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# MemoryEdge
+# ---------------------------------------------------------------------------
+
+
+class MemoryEdge(BaseModel):
+    """Pre-computed edges between memories for graph expansion."""
+
+    id = AutoField()
+    source_id = TextField()
+    target_id = TextField()
+    edge_type = TextField()  # "thread_neighbor", "tag_cooccurrence"
+    weight = FloatField(default=1.0)
+
+    class Meta:
+        table_name = "memory_edges"
+
+
+# ---------------------------------------------------------------------------
 # RetrievalLog
 # ---------------------------------------------------------------------------
 
