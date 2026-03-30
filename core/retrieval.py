@@ -590,6 +590,18 @@ class RetrievalEngine:
             return []
 
         ranked_ids = [mid for mid, _ in ranked]
+
+        # 1-hop graph expansion: add thread/tag neighbors to candidate pool
+        from .graph import expand_neighbors
+        neighbor_ids = expand_neighbors(ranked_ids, max_expansion=10)
+        if neighbor_ids:
+            # Neighbors get a reduced RRF score (half of the lowest seed score)
+            min_score = min(s for _, s in ranked) if ranked else 0.0
+            neighbor_score = min_score * 0.5
+            for nid in neighbor_ids:
+                ranked.append((nid, neighbor_score))
+            ranked_ids = ranked_ids + neighbor_ids
+
         memories_by_id = {
             m.id: m
             for m in Memory.select().where(Memory.id.in_(ranked_ids))

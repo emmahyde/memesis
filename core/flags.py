@@ -33,6 +33,8 @@ DEFAULTS = {
     "reconsolidation": True,
     "saturation_decay": True,
     "integration_factor": True,
+    "graph_expansion": True,
+    "ghost_coherence": True,
     "affect_awareness": True,
 }
 
