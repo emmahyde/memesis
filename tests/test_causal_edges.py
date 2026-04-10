@@ -938,3 +938,308 @@ class TestThreadContradictionEdges:
         edges = list(MemoryEdge.select().where(MemoryEdge.edge_type == "contradicts"))
         # Only one edge in each direction — no duplicates
         assert len(edges) == 2
+
+
+# ---------------------------------------------------------------------------
+# Affect metadata on reconsolidation edges (Phase 3, Task 3.1)
+# ---------------------------------------------------------------------------
+
+class TestAffectOnEdges:
+    """Tests that session_affect is included in edge metadata when provided."""
+
+    def test_causal_edge_includes_affect_when_provided(self, store, monkeypatch):
+        """Causal edge metadata includes affect key when session_affect is given."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "reconsolidation": True,
+            "causal_edges": True,
+            "contradiction_tensors": False,
+            "affect_signatures": True,
+        })
+
+        m1 = _make_memory(title="Memory A")
+        m2 = _make_memory(title="Memory B")
+
+        llm_response = json.dumps([
+            {"memory_id": m1.id, "action": "refined", "evidence": "Added nuance"},
+            {"memory_id": m2.id, "action": "confirmed", "evidence": "Yes"},
+        ])
+        affect = {"frustration": 0.7, "satisfaction": 0.2, "momentum": -0.5}
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m1.id, m2.id], "session text", "sess-aff-1",
+                          session_affect=affect)
+
+        edges = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m1.id,
+            MemoryEdge.edge_type == "refined_from",
+        ))
+        assert len(edges) >= 1
+        meta = json.loads(edges[0].metadata)
+        assert "affect" in meta
+        assert meta["affect"]["frustration"] == 0.7
+        assert meta["affect"]["momentum"] == -0.5
+        assert meta["affect"]["dominant_valence"] == "friction"
+
+    def test_causal_edge_no_affect_when_none(self, store):
+        """Causal edge metadata does not include affect key when session_affect is None."""
+        m1 = _make_memory(title="Memory A")
+        m2 = _make_memory(title="Memory B")
+
+        llm_response = json.dumps([
+            {"memory_id": m1.id, "action": "refined", "evidence": "Updated"},
+            {"memory_id": m2.id, "action": "confirmed", "evidence": "Yes"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m1.id, m2.id], "session text", "sess-aff-2",
+                          session_affect=None)
+
+        edges = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m1.id,
+            MemoryEdge.edge_type == "refined_from",
+        ))
+        assert len(edges) >= 1
+        meta = json.loads(edges[0].metadata)
+        assert "affect" not in meta
+
+    def test_contradiction_edge_includes_affect(self, store, monkeypatch):
+        """Contradiction edge metadata includes affect key when session_affect is given."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "reconsolidation": True,
+            "causal_edges": False,
+            "contradiction_tensors": True,
+            "affect_signatures": True,
+        })
+
+        m_contra = _make_memory(title="Old belief")
+        m_confirmed = _make_memory(title="New belief")
+
+        llm_response = json.dumps([
+            {"memory_id": m_contra.id, "action": "contradicted", "evidence": "Replaced"},
+            {"memory_id": m_confirmed.id, "action": "confirmed", "evidence": "Yes"},
+        ])
+        affect = {"frustration": 0.2, "satisfaction": 0.8, "momentum": 0.6}
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m_contra.id, m_confirmed.id], "session", "sess-aff-3",
+                          session_affect=affect)
+
+        edge = MemoryEdge.select().where(
+            MemoryEdge.source_id == m_contra.id,
+            MemoryEdge.target_id == m_confirmed.id,
+            MemoryEdge.edge_type == "contradicts",
+        ).get()
+        meta = json.loads(edge.metadata)
+        assert "affect" in meta
+        assert meta["affect"]["dominant_valence"] == "delight"
+
+    def test_dominant_valence_neutral_when_neither_friction_nor_delight(
+        self, store, monkeypatch
+    ):
+        """dominant_valence is 'neutral' when frustration <= 0.4 and satisfaction <= 0.6."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "reconsolidation": True,
+            "causal_edges": True,
+            "contradiction_tensors": False,
+            "affect_signatures": True,
+        })
+
+        m1 = _make_memory(title="A")
+        m2 = _make_memory(title="B")
+
+        llm_response = json.dumps([
+            {"memory_id": m1.id, "action": "refined", "evidence": "Mild update"},
+            {"memory_id": m2.id, "action": "confirmed", "evidence": "ok"},
+        ])
+        # Neither friction (>0.4) nor delight (>0.6)
+        affect = {"frustration": 0.3, "satisfaction": 0.4, "momentum": 0.1}
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m1.id, m2.id], "content", "sess-aff-4",
+                          session_affect=affect)
+
+        edges = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m1.id,
+            MemoryEdge.edge_type == "refined_from",
+        ))
+        assert len(edges) >= 1
+        meta = json.loads(edges[0].metadata)
+        assert meta["affect"]["dominant_valence"] == "neutral"
+
+    def test_affect_signatures_flag_disabled_omits_affect(self, store, monkeypatch):
+        """When affect_signatures flag is False, affect is not included in metadata."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "reconsolidation": True,
+            "causal_edges": True,
+            "contradiction_tensors": False,
+            "affect_signatures": False,
+        })
+
+        m1 = _make_memory(title="A")
+        m2 = _make_memory(title="B")
+
+        llm_response = json.dumps([
+            {"memory_id": m1.id, "action": "refined", "evidence": "Updated"},
+            {"memory_id": m2.id, "action": "confirmed", "evidence": "ok"},
+        ])
+        affect = {"frustration": 0.9, "satisfaction": 0.1, "momentum": -0.8}
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([m1.id, m2.id], "content", "sess-aff-5",
+                          session_affect=affect)
+
+        edges = list(MemoryEdge.select().where(
+            MemoryEdge.source_id == m1.id,
+            MemoryEdge.edge_type == "refined_from",
+        ))
+        assert len(edges) >= 1
+        meta = json.loads(edges[0].metadata)
+        assert "affect" not in meta
+
+
+# ---------------------------------------------------------------------------
+# Arc affect trajectories on NarrativeThreads (Phase 3, Task 3.1)
+# ---------------------------------------------------------------------------
+
+class TestArcAffect:
+    """Tests for _compute_arc_affect() trajectory detection and arc_affect storage."""
+
+    def test_frustration_to_mastery(self, store):
+        """friction start + delight end → frustration_to_mastery."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["friction", "friction", "delight"], "correction_chain")
+        assert result["trajectory"] == "frustration_to_mastery"
+        assert result["start"] == "friction"
+        assert result["end"] == "delight"
+
+    def test_frustration_to_resolution(self, store):
+        """friction start + neutral end → frustration_to_resolution."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["friction", "neutral"], "correction_chain")
+        assert result["trajectory"] == "frustration_to_resolution"
+
+    def test_curiosity_to_mastery(self, store):
+        """neutral start + delight end → curiosity_to_mastery."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["neutral", "neutral", "delight"], "knowledge_building")
+        assert result["trajectory"] == "curiosity_to_mastery"
+
+    def test_discovery_neutral_end(self, store):
+        """surprise start + neutral end → discovery."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["surprise", "neutral"], "pattern_discovery")
+        assert result["trajectory"] == "discovery"
+
+    def test_discovery_delight_end(self, store):
+        """surprise start + delight end → discovery."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["surprise", "delight"], "pattern_discovery")
+        assert result["trajectory"] == "discovery"
+
+    def test_sustained_struggle(self, store):
+        """All friction → sustained_struggle (overrides start/end check)."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["friction", "friction", "friction"], "correction_chain")
+        assert result["trajectory"] == "sustained_struggle"
+        assert result["friction_ratio"] == 1.0
+
+    def test_friction_ratio_computed(self, store):
+        """friction_ratio is the fraction of valences that are friction."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["friction", "neutral", "friction", "delight"], "knowledge_building")
+        assert result["friction_ratio"] == pytest.approx(0.5)
+
+    def test_arc_type_preserved(self, store):
+        """arc_type field in output matches the input arc_type."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["neutral", "delight"], "preference_evolution")
+        assert result["arc_type"] == "preference_evolution"
+
+    def test_empty_valences_returns_neutral(self, store):
+        """Empty valence list returns neutral trajectory."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect([], "knowledge_building")
+        assert result["trajectory"] == "neutral"
+        assert result["friction_ratio"] == 0.0
+
+    def test_build_threads_stores_arc_affect(self, store, monkeypatch):
+        """build_threads() stores arc_affect JSON on NarrativeThread when flag is on."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "affect_signatures": True,
+            "contradiction_tensors": False,
+        })
+
+        from core.threads import build_threads, ThreadDetector, ThreadNarrator
+
+        # Memories with friction→delight valence tags
+        m1 = _make_memory(title="Struggle", tags=["valence:friction"])
+        m2 = _make_memory(title="Success", tags=["valence:delight"])
+
+        narrate_result = {
+            "title": "Learning arc",
+            "summary": "Struggled then succeeded",
+            "narrative": "Started with friction. Eventually got it.",
+            "arc_type": "correction_chain",
+            "confidence": 0.85,
+            "member_ids": [m1.id, m2.id],
+        }
+
+        with patch.object(ThreadDetector, "detect_threads", return_value=[[m1, m2]]):
+            with patch.object(ThreadNarrator, "narrate_cluster", return_value=narrate_result):
+                created = build_threads()
+
+        assert len(created) == 1
+        assert "arc_affect" in created[0]
+
+        thread = NarrativeThread.get_by_id(created[0]["id"])
+        assert thread.arc_affect is not None
+        data = json.loads(thread.arc_affect)
+        assert data["trajectory"] == "frustration_to_mastery"
+        assert data["start"] == "friction"
+        assert data["end"] == "delight"
+
+    def test_build_threads_no_arc_affect_when_flag_disabled(self, store, monkeypatch):
+        """build_threads() does not compute arc_affect when affect_signatures is False."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "affect_signatures": False,
+            "contradiction_tensors": False,
+        })
+
+        from core.threads import build_threads, ThreadDetector, ThreadNarrator
+
+        m1 = _make_memory(title="A", tags=["valence:friction"])
+        m2 = _make_memory(title="B", tags=["valence:delight"])
+
+        narrate_result = {
+            "title": "Some arc",
+            "summary": "Summary",
+            "narrative": "Narrative text",
+            "arc_type": "knowledge_building",
+            "confidence": 0.9,
+            "member_ids": [m1.id, m2.id],
+        }
+
+        with patch.object(ThreadDetector, "detect_threads", return_value=[[m1, m2]]):
+            with patch.object(ThreadNarrator, "narrate_cluster", return_value=narrate_result):
+                created = build_threads()
+
+        assert len(created) == 1
+        thread = NarrativeThread.get_by_id(created[0]["id"])
+        assert thread.arc_affect is None
+
+    def test_arc_affect_result_includes_all_keys(self, store):
+        """arc_affect dict always has trajectory, start, end, friction_ratio, arc_type."""
+        from core.threads import _compute_arc_affect
+
+        result = _compute_arc_affect(["neutral", "neutral"], "knowledge_building")
+        assert set(result.keys()) == {"trajectory", "start", "end", "friction_ratio", "arc_type"}

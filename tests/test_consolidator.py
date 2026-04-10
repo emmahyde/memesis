@@ -75,71 +75,6 @@ def _create_memory(stage='consolidated', title='Test', content='Content', **kwar
 
 
 # ---------------------------------------------------------------------------
-# filter_privacy
-# ---------------------------------------------------------------------------
-
-class TestFilterPrivacy:
-    def test_blocks_seemed_frustrated(self, consolidator):
-        text = "The user seemed frustrated with the build system.\n"
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert was_filtered
-        assert "frustrated" not in filtered
-
-    def test_blocks_was_excited(self, consolidator):
-        text = "Emma was excited about the new feature.\n"
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert was_filtered
-        assert "excited" not in filtered
-
-    def test_blocks_mood_keyword(self, consolidator):
-        text = "Current mood: productive.\n"
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert was_filtered
-
-    def test_blocks_is_stressed(self, consolidator):
-        text = "Emma is stressed about the deadline.\n"
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert was_filtered
-
-    def test_allows_technical_observation(self, consolidator):
-        text = "Prefers pytest over unittest for test discovery.\n"
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert not was_filtered
-        assert filtered == text
-
-    def test_allows_domain_knowledge(self, consolidator):
-        text = "SQLite WAL mode improves concurrent read safety.\n"
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert not was_filtered
-
-    def test_allows_correction(self, consolidator):
-        text = "Correction: use Path.read_text() instead of open().\n"
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert not was_filtered
-
-    def test_multi_line_partial_filter(self, consolidator):
-        text = (
-            "Prefers snake_case.\n"
-            "User seemed annoyed with verbose logging.\n"
-            "Uses mypy for type checking.\n"
-        )
-        filtered, was_filtered = consolidator.filter_privacy(text)
-        assert was_filtered
-        assert "snake_case" in filtered
-        assert "mypy" in filtered
-        assert "annoyed" not in filtered
-
-    def test_returns_tuple(self, consolidator):
-        result = consolidator.filter_privacy("anything")
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-
-    def test_no_filter_returns_false(self, consolidator):
-        _, was_filtered = consolidator.filter_privacy("Clean technical note.\n")
-        assert was_filtered is False
-
-
-# ---------------------------------------------------------------------------
 # estimate_token_budget
 # ---------------------------------------------------------------------------
 
@@ -431,49 +366,6 @@ class TestConsolidateConflicts:
             result = consolidator.consolidate_session(ephemeral_file, "sess-011")
 
         assert result["conflicts"] == []
-
-
-# ---------------------------------------------------------------------------
-# Privacy filtering applied before LLM call
-# ---------------------------------------------------------------------------
-
-class TestPrivacyFilterIntegration:
-    def test_emotional_lines_removed_before_prompt(self, consolidator, tmp_path):
-        ephemeral = tmp_path / "obs.md"
-        ephemeral.write_text(
-            "User seemed frustrated with the CI pipeline.\n"
-            "Prefers pytest for unit tests.\n",
-            encoding="utf-8",
-        )
-
-        decisions = [
-            {
-                "observation": "Prefers pytest for unit tests.",
-                "action": "keep",
-                "rationale": "Testing preference.",
-                "title": "Pytest preference",
-                "summary": "Uses pytest.",
-                "tags": ["pytest"],
-                "target_path": "testing/pytest.md",
-                "reinforces": None,
-                "contradicts": None,
-            }
-        ]
-
-        captured_prompt = []
-
-        def capture_transport(prompt, **kwargs):
-            captured_prompt.append(prompt)
-            return _llm_response_text(decisions)
-
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = capture_transport
-            consolidator.consolidate_session(str(ephemeral), "sess-012")
-
-        assert len(captured_prompt) == 1
-        prompt_text = captured_prompt[0]
-        assert "frustrated" not in prompt_text
-        assert "Prefers pytest" in prompt_text
 
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,7 @@ class Memory(BaseModel):
     content_hash = TextField(null=True)
     archived_at = TextField(null=True)
     subsumed_by = TextField(null=True)
+    echo_count = IntegerField(default=0, null=True)
     next_injection_due = TextField(null=True)
     injection_ease_factor = FloatField(default=2.5, null=True)
     injection_interval_days = FloatField(default=1.0, null=True)
@@ -123,6 +124,40 @@ class Memory(BaseModel):
         """
         escaped = term.replace('"', '""')
         return f'"{escaped}"'
+
+    @staticmethod
+    def tokenize_fts_query(query: str) -> str:
+        """
+        Convert a natural language query into an FTS5 OR query.
+
+        Strips stop words, quotes each remaining token to neutralize FTS5
+        operators, and joins with OR so any matching term produces results.
+        Falls back to the raw query (quoted) if no tokens remain.
+        """
+        _STOP_WORDS = {
+            "a", "an", "the", "is", "are", "was", "were", "be", "been",
+            "being", "have", "has", "had", "do", "does", "did", "will",
+            "would", "could", "should", "may", "might", "shall", "can",
+            "to", "of", "in", "for", "on", "with", "at", "by", "from",
+            "as", "into", "through", "during", "before", "after", "above",
+            "below", "between", "out", "off", "over", "under", "again",
+            "further", "then", "once", "here", "there", "when", "where",
+            "why", "how", "all", "both", "each", "few", "more", "most",
+            "other", "some", "such", "no", "nor", "not", "only", "own",
+            "same", "so", "than", "too", "very", "and", "but", "or",
+            "if", "while", "what", "which", "who", "whom", "this", "that",
+            "these", "those", "it", "its", "s",
+        }
+        import re
+        # Extract word tokens, lowercase
+        tokens = re.findall(r"[a-zA-Z0-9_'-]+", query.lower())
+        # Filter stop words and very short tokens
+        keywords = [t for t in tokens if t not in _STOP_WORDS and len(t) > 1]
+        if not keywords:
+            escaped = query.replace('"', '""')
+            return f'"{escaped}"'
+        # Quote each keyword and join with OR
+        return " OR ".join(f'"{kw}"' for kw in keywords)
 
     # -- Properties ----------------------------------------------------
 
@@ -256,6 +291,7 @@ class NarrativeThread(BaseModel):
     created_at = TextField(default=lambda: datetime.now().isoformat())
     updated_at = TextField(default=lambda: datetime.now().isoformat())
     last_surfaced_at = TextField(null=True)
+    arc_affect = TextField(null=True)  # JSON: trajectory, start/end valence, friction_ratio
 
     class Meta:
         table_name = "narrative_threads"
@@ -304,16 +340,27 @@ class ThreadMember(BaseModel):
 
 
 class MemoryEdge(BaseModel):
-    """Pre-computed edges between memories for graph expansion."""
+    """Pre-computed and incremental edges between memories for graph expansion.
+
+    Recomputable types (rebuilt by compute_edges):
+        thread_neighbor, tag_cooccurrence
+
+    Incremental types (created during pipeline steps, preserved across rebuilds):
+        caused_by, refined_from, subsumed_into, contradicts, echo
+    """
 
     id = AutoField()
     source_id = TextField()
     target_id = TextField()
-    edge_type = TextField()  # "thread_neighbor", "tag_cooccurrence"
+    edge_type = TextField()
     weight = FloatField(default=1.0)
+    metadata = TextField(null=True)  # JSON: evidence, affect, timestamps
 
     class Meta:
         table_name = "memory_edges"
+
+    # Edge types that compute_edges() rebuilds from scratch each run.
+    RECOMPUTABLE_TYPES = {"thread_neighbor", "tag_cooccurrence"}
 
 
 # ---------------------------------------------------------------------------

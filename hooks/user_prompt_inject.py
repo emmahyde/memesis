@@ -19,7 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.database import get_vec_store, init_db
+from core.affect import coherence_probe, load_analyzer, save_analyzer, format_guidance
+from core.database import get_base_dir, get_vec_store, init_db
 from core.models import Memory, RetrievalLog
 from core.retrieval import RetrievalEngine
 
@@ -238,7 +239,43 @@ def main():
         project_context = os.getcwd()
 
         init_db(project_context=project_context)
+
+        # Memory search + injection
         result = search_and_inject(prompt, session_id, project_context)
+
+        # Affect awareness — track interaction state across messages
+        base_dir = get_base_dir()
+        if base_dir:
+            try:
+                analyzer = load_analyzer(base_dir, session_id)
+                state = analyzer.update(prompt)
+                save_analyzer(analyzer, base_dir, session_id)
+
+                # If degradation looks likely and we haven't probed recently,
+                # run a coherence check (2 parallel LLM calls, ~1-2s)
+                if state.likely_degraded:
+                    try:
+                        probe = coherence_probe(prompt)
+                        if probe.likely_degraded:
+                            guidance = (
+                                "[Affect signal: coherence probe confirms degradation"
+                                f" (variance={probe.variance:.2f})"
+                                " — suggest compacting context or starting a fresh session"
+                                " rather than retrying the same approach]"
+                            )
+                            result = f"{guidance}\n{result}" if result else guidance
+                        # If probe says coherent, skip guidance — task is just hard
+                    except Exception:
+                        # Probe failed (API error, timeout) — fall back to cheap signal
+                        guidance = format_guidance(state)
+                        if guidance:
+                            result = f"{guidance}\n{result}" if result else guidance
+                else:
+                    guidance = format_guidance(state)
+                    if guidance:
+                        result = f"{guidance}\n{result}" if result else guidance
+            except Exception:
+                pass  # affect tracking is best-effort
 
         print(result, flush=True)
 

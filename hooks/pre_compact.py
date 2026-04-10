@@ -130,7 +130,15 @@ def main():
                 # Reconsolidate: check if session confirms/contradicts/refines memories
                 try:
                     from core.reconsolidation import reconsolidate
-                    recon = reconsolidate(injected_ids, usage_text, session_id)
+                    # Pass session_affect as a plain dict so reconsolidation can
+                    # embed affect signals into edge metadata without importing
+                    # core.affect (avoids circular import risk in the hook layer).
+                    affect_dict = None
+                    if session_affect is not None:
+                        import dataclasses
+                        affect_dict = dataclasses.asdict(session_affect)
+                    recon = reconsolidate(injected_ids, usage_text, session_id,
+                                          session_affect=affect_dict)
                     if any(recon.values()):
                         print(
                             f"Reconsolidation: {len(recon['confirmed'])} confirmed,"

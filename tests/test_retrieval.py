@@ -18,9 +18,9 @@ import pytest
 # Add parent directory to path so imports resolve as `from core.xxx import ...`
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.retrieval import RetrievalEngine
+from core.retrieval import RetrievalEngine, TENSION_BUDGET_CHARS
 from core.database import init_db, close_db, get_base_dir, get_db_path
-from core.models import Memory, NarrativeThread, ThreadMember, RetrievalLog, db
+from core.models import Memory, MemoryEdge, NarrativeThread, ThreadMember, RetrievalLog, db
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +194,7 @@ def test_get_crystallized_token_budget_respected(base):
 def test_get_crystallized_project_context_boosted(base, engine, monkeypatch):
     """Project-matching memories appear before non-matching ones (Thompson sampling off for determinism)."""
     import core.flags as flags_module
-    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+    monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
     _make_memory(
         "Unrelated content", "crystallized",
@@ -215,7 +215,7 @@ def test_get_crystallized_project_context_boosted(base, engine, monkeypatch):
 def test_get_crystallized_sort_importance_desc(base, engine, monkeypatch):
     """Without project context, memories sorted by importance DESC (Thompson sampling off)."""
     import core.flags as flags_module
-    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+    monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
     _make_memory("Low importance content", "crystallized", "Low", importance=0.3)
     _make_memory("High importance content", "crystallized", "High", importance=0.9)
@@ -236,7 +236,7 @@ def test_get_crystallized_empty(base, engine):
 def test_get_crystallized_no_project_context_no_boost(base, engine, monkeypatch):
     """Without project_context, all memories treated equally (importance order, Thompson sampling off)."""
     import core.flags as flags_module
-    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+    monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
     _make_memory("Content A", "crystallized", "A",
                  importance=0.8, project_context="/proj/a")
@@ -432,7 +432,7 @@ def test_inject_for_session_only_crystallized(base, engine):
 def test_inject_for_session_project_context_boosting(base, engine, monkeypatch):
     """Project context passed to Tier-2 retrieval is applied (Thompson sampling off for determinism)."""
     import core.flags as flags_module
-    monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+    monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
     matching_id = _make_memory(
         "Project-specific knowledge", "crystallized",
@@ -994,7 +994,7 @@ class TestCrystallizedHybrid:
     def test_crystallized_no_query_preserves_static_sort(self, base, engine, monkeypatch):
         """get_crystallized_for_context() with no query preserves existing static sort behavior (Thompson sampling off)."""
         import core.flags as flags_module
-        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+        monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
         id_high = _make_memory("content high importance", "crystallized", "High Importance", importance=0.9)
         id_low = _make_memory("content low importance", "crystallized", "Low Importance", importance=0.2)
@@ -1016,7 +1016,7 @@ class TestCrystallizedHybrid:
     def test_crystallized_hybrid_project_context_boost(self, base, engine, monkeypatch):
         """get_crystallized_for_context with query applies project_context boost (Thompson sampling off)."""
         import core.flags as flags_module
-        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": True, "thompson_sampling": False})
+        monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
         # Two memories both match FTS "deployment", but one matches project_context
         id_match = _make_memory(
@@ -1045,7 +1045,7 @@ class TestCrystallizedHybrid:
         """inject_for_session with query produces result containing relevant memories."""
         import core.flags as flags_module
         # Disable Thompson sampling so static path ordering is deterministic
-        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": True, "thompson_sampling": False})
+        monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
         id_a = _make_memory("kubernetes deployment scaling", "crystallized", "Kube Deploy", importance=0.5)
         id_b = _make_memory("python refactoring patterns", "crystallized", "Python Refactor", importance=0.9)
@@ -1194,7 +1194,7 @@ class TestThompsonSampling:
     def test_flag_disabled_preserves_deterministic_order(self, base, engine, monkeypatch):
         """Test 4: When thompson_sampling flag is False, get_crystallized_for_context returns deterministic order."""
         import core.flags as flags_module
-        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": False})
+        monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": False})
 
         mem_high = _make_memory_with_counts("high importance content", "High Imp", usage_count=0, injection_count=0)
         Memory.update(importance=0.9).where(Memory.id == mem_high.id).execute()
@@ -1211,7 +1211,7 @@ class TestThompsonSampling:
     def test_flag_enabled_hybrid_path_calls_thompson_rerank(self, base, engine, monkeypatch):
         """Test 5: When thompson_sampling flag is True, _crystallized_hybrid calls _thompson_rerank."""
         import core.flags as flags_module
-        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": True, "thompson_sampling": True})
+        monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": True})
 
         rerank_calls = []
 
@@ -1231,7 +1231,7 @@ class TestThompsonSampling:
     def test_flag_enabled_static_path_calls_thompson_rerank(self, base, engine, monkeypatch):
         """Test 6: When thompson_sampling flag is True, static path calls _thompson_rerank."""
         import core.flags as flags_module
-        monkeypatch.setattr(flags_module, "_cache", {"hybrid_rrf": False, "thompson_sampling": True})
+        monkeypatch.setattr(flags_module, "_cache", {"thompson_sampling": True})
 
         rerank_calls = []
 
@@ -1365,7 +1365,6 @@ class TestProvenanceSignals:
         between the title line and the summary line for each Tier 2 memory."""
         import core.flags as flags_module
         monkeypatch.setattr(flags_module, "_cache", {
-            "hybrid_rrf": False,
             "thompson_sampling": False,
             "provenance_signals": True,
         })
@@ -1403,7 +1402,6 @@ class TestProvenanceSignals:
         contain any provenance line — formatting identical to pre-Phase 10 behavior."""
         import core.flags as flags_module
         monkeypatch.setattr(flags_module, "_cache", {
-            "hybrid_rrf": False,
             "thompson_sampling": False,
             "provenance_signals": False,
         })
@@ -1472,3 +1470,520 @@ class TestProvenanceSignals:
         assert len(result) == 4
         for mem in mems:
             assert mem.id in result
+
+
+# ---------------------------------------------------------------------------
+# Tier 2.6 -- Active Tensions
+# ---------------------------------------------------------------------------
+
+
+def _make_edge(source_id, target_id, edge_type="contradicts", metadata=None):
+    """Helper to create a MemoryEdge."""
+    return MemoryEdge.create(
+        source_id=source_id,
+        target_id=target_id,
+        edge_type=edge_type,
+        weight=1.0,
+        metadata=json.dumps(metadata) if metadata is not None else None,
+    )
+
+
+class TestActiveTensions:
+    """Tests for _get_active_tensions() — Tier 2.6."""
+
+    def test_unresolved_edge_surfaces_as_tension(self, base, engine):
+        """An unresolved contradicts edge between two injected memories surfaces a tension block."""
+        mid_a = _make_memory("Use mocks for unit tests", "crystallized", "Mocking Strategy A",
+                             summary="Use mocks for speed in unit tests")
+        mid_b = _make_memory("Never mock the database", "crystallized", "Mocking Strategy B",
+                             summary="Integration tests should not mock DB")
+        _make_edge(mid_a, mid_b, metadata={"resolved": False})
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+
+        assert len(blocks) == 1
+        assert "Mocking Strategy A" in blocks[0]
+        assert "Mocking Strategy B" in blocks[0]
+
+    def test_resolved_edge_excluded(self, base, engine):
+        """An edge with metadata.resolved == true is NOT surfaced."""
+        mid_a = _make_memory("Resolved side A", "crystallized", "Resolved A")
+        mid_b = _make_memory("Resolved side B", "crystallized", "Resolved B")
+        _make_edge(mid_a, mid_b, metadata={"resolved": True})
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+
+        assert blocks == []
+
+    def test_no_metadata_treated_as_unresolved(self, base, engine):
+        """An edge with no metadata (NULL) is treated as unresolved and surfaced."""
+        mid_a = _make_memory("Position alpha", "crystallized", "Alpha Memory",
+                             summary="Alpha position summary")
+        mid_b = _make_memory("Position beta", "crystallized", "Beta Memory",
+                             summary="Beta position summary")
+        _make_edge(mid_a, mid_b, metadata=None)
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+
+        assert len(blocks) == 1
+
+    def test_non_contradicts_edge_excluded(self, base, engine):
+        """Edges with edge_type != 'contradicts' are not surfaced as tensions."""
+        mid_a = _make_memory("Cause memory", "crystallized", "Cause Memory")
+        mid_b = _make_memory("Effect memory", "crystallized", "Effect Memory")
+        _make_edge(mid_a, mid_b, edge_type="caused_by", metadata={"resolved": False})
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+
+        assert blocks == []
+
+    def test_budget_respected(self, base, engine, monkeypatch):
+        """Greedy packing never exceeds TENSION_BUDGET_CHARS."""
+        import core.retrieval as retrieval_module
+        monkeypatch.setattr(retrieval_module, "TENSION_BUDGET_CHARS", 300)
+
+        # Create 10 contradicts pairs — each block will be ~100 chars
+        mems = []
+        for i in range(10):
+            mid_a = _make_memory(f"Position A{i}", "crystallized", f"Memory A{i}",
+                                 summary=f"Summary for A{i}")
+            mid_b = _make_memory(f"Position B{i}", "crystallized", f"Memory B{i}",
+                                 summary=f"Summary for B{i}")
+            _make_edge(mid_a, mid_b, metadata={"resolved": False})
+            mems.extend([Memory.get_by_id(mid_a), Memory.get_by_id(mid_b)])
+
+        blocks = engine._get_active_tensions(mems)
+
+        total_chars = sum(len(b) for b in blocks)
+        assert total_chars <= 300, f"Tension blocks exceeded budget: {total_chars} chars"
+
+    def test_bidirectional_deduplication(self, base, engine):
+        """If both A→B and B→A contradicts edges exist, only one tension block is surfaced."""
+        mid_a = _make_memory("Dedup side A", "crystallized", "Dedup A",
+                             summary="Summary dedup A")
+        mid_b = _make_memory("Dedup side B", "crystallized", "Dedup B",
+                             summary="Summary dedup B")
+        # Create both directions
+        _make_edge(mid_a, mid_b, metadata={"resolved": False})
+        _make_edge(mid_b, mid_a, metadata={"resolved": False})
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+
+        assert len(blocks) == 1
+
+    def test_tension_includes_both_positions(self, base, engine):
+        """Each tension block contains 'Position A:' and 'Position B:' labels."""
+        mid_a = _make_memory("Memory with approach X", "crystallized", "Approach X",
+                             summary="Use X for everything")
+        mid_b = _make_memory("Memory with approach Y", "crystallized", "Approach Y",
+                             summary="Use Y for everything")
+        _make_edge(mid_a, mid_b, metadata={"resolved": False})
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+
+        assert len(blocks) == 1
+        assert "Position A:" in blocks[0]
+        assert "Position B:" in blocks[0]
+
+    def test_context_field_included_when_present(self, base, engine):
+        """When edge metadata has a 'context' field, it appears in the tension block."""
+        mid_a = _make_memory("Context source A", "crystallized", "Context A",
+                             summary="Summary A")
+        mid_b = _make_memory("Context source B", "crystallized", "Context B",
+                             summary="Summary B")
+        _make_edge(mid_a, mid_b, metadata={
+            "resolved": False,
+            "context": "A applies to unit tests; B applies to integration tests",
+        })
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+
+        assert len(blocks) == 1
+        assert "Context:" in blocks[0]
+        assert "unit tests" in blocks[0]
+
+    def test_empty_tier2_returns_empty_list(self, base, engine):
+        """_get_active_tensions returns empty list when called with empty tier2."""
+        blocks = engine._get_active_tensions([])
+        assert blocks == []
+
+    def test_no_contradicts_edges_returns_empty(self, base, engine):
+        """_get_active_tensions returns empty list when no contradicts edges exist."""
+        mid_a = _make_memory("No edge A", "crystallized", "No Edge A")
+        mid_b = _make_memory("No edge B", "crystallized", "No Edge B")
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        blocks = engine._get_active_tensions([mem_a, mem_b])
+        assert blocks == []
+
+    def test_flag_gates_tier26_in_inject(self, base, engine, monkeypatch):
+        """When contradiction_tensors flag is False, Active Tensions section is absent."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {
+            "thompson_sampling": False,
+            "provenance_signals": False,
+            "contradiction_tensors": False,
+            "affect_signatures": False,
+        })
+
+        mid_a = _make_memory("Flagged A", "crystallized", "Flagged A", summary="Summary flagged A")
+        mid_b = _make_memory("Flagged B", "crystallized", "Flagged B", summary="Summary flagged B")
+        _make_edge(mid_a, mid_b, metadata={"resolved": False})
+
+        result = engine.inject_for_session(session_id="flag_gate_test")
+
+        assert "Active Tensions" not in result
+
+    def test_flag_enabled_tier26_appears_in_inject(self, base, engine, monkeypatch):
+        """When contradiction_tensors flag is True and unresolved edges exist, section appears."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {
+            "thompson_sampling": False,
+            "provenance_signals": False,
+            "contradiction_tensors": True,
+            "affect_signatures": False,
+        })
+
+        mid_a = _make_memory("Flagged ON A", "crystallized", "Flagged ON A",
+                             summary="Summary flagged ON A")
+        mid_b = _make_memory("Flagged ON B", "crystallized", "Flagged ON B",
+                             summary="Summary flagged ON B")
+        _make_edge(mid_a, mid_b, metadata={"resolved": False})
+
+        result = engine.inject_for_session(session_id="flag_on_test")
+
+        assert "Active Tensions" in result
+        assert "Flagged ON A" in result
+        assert "Flagged ON B" in result
+
+    def test_tier26_appears_after_tier25_in_inject(self, base, engine, monkeypatch):
+        """Active Tensions section appears after Narrative Threads section in output."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {
+            "thompson_sampling": False,
+            "provenance_signals": False,
+            "contradiction_tensors": True,
+            "affect_signatures": False,
+        })
+
+        mid_a = _make_memory("Order test A", "crystallized", "Order Test A",
+                             summary="Order A summary")
+        mid_b = _make_memory("Order test B", "crystallized", "Order Test B",
+                             summary="Order B summary")
+        _make_edge(mid_a, mid_b, metadata={"resolved": False})
+
+        # Create a thread to produce a Tier 2.5 section
+        _create_thread("Order Thread", "Thread summary", "A short narrative here.", [mid_a])
+
+        result = engine.inject_for_session(session_id="order_test")
+
+        threads_pos = result.find("Narrative Threads")
+        tensions_pos = result.find("Active Tensions")
+
+        assert threads_pos != -1, "Narrative Threads section not found"
+        assert tensions_pos != -1, "Active Tensions section not found"
+        assert tensions_pos > threads_pos, (
+            "Active Tensions should appear after Narrative Threads"
+        )
+
+    def test_batch_query_not_n_plus_one(self, base, engine, monkeypatch):
+        """_get_active_tensions uses at most 2 queries (edges batch + memory batch)."""
+        # Create 5 contradicts pairs
+        mems = []
+        for i in range(5):
+            mid_a = _make_memory(f"Batch A{i}", "crystallized", f"Batch Mem A{i}",
+                                 summary=f"Batch summary A{i}")
+            mid_b = _make_memory(f"Batch B{i}", "crystallized", f"Batch Mem B{i}",
+                                 summary=f"Batch summary B{i}")
+            _make_edge(mid_a, mid_b, metadata={"resolved": False})
+            mems.extend([Memory.get_by_id(mid_a), Memory.get_by_id(mid_b)])
+
+        query_count = [0]
+        original_select = MemoryEdge.select
+
+        def counting_select(*args, **kwargs):
+            query_count[0] += 1
+            return original_select(*args, **kwargs)
+
+        monkeypatch.setattr(MemoryEdge, "select", counting_select)
+
+        engine._get_active_tensions(mems)
+
+        # Should be at most 1 MemoryEdge.select call (the batch edges query)
+        assert query_count[0] == 1, (
+            f"Expected 1 MemoryEdge.select call, got {query_count[0]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Affect-Aware Thread Ordering
+# ---------------------------------------------------------------------------
+
+
+def _create_thread_with_arc(title, narrative, member_ids, arc_affect=None):
+    """Helper to create a narrative thread with optional arc_affect JSON."""
+    now = datetime.now().isoformat()
+    thread = NarrativeThread.create(
+        title=title,
+        summary=f"Summary for {title}",
+        narrative=narrative,
+        created_at=now,
+        updated_at=now,
+        arc_affect=json.dumps(arc_affect) if arc_affect is not None else None,
+    )
+    for pos, mid in enumerate(member_ids):
+        ThreadMember.create(thread_id=thread.id, memory_id=mid, position=pos)
+    return thread.id
+
+
+class TestAffectAwareThreadOrdering:
+    """Tests for affect-aware ordering in _get_thread_narratives()."""
+
+    def test_frustration_to_mastery_prioritized_when_frustrated(self, base, engine, monkeypatch):
+        """When frustration > 0.3 and affect_signatures is on, frustration_to_mastery thread appears first."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"affect_signatures": True})
+
+        mid_a = _make_memory("Memory alpha", "crystallized", "Alpha Crystal")
+        mid_b = _make_memory("Memory beta", "crystallized", "Beta Crystal")
+        mid_c = _make_memory("Memory gamma", "crystallized", "Gamma Crystal")
+
+        # All narratives same length to isolate the affect ordering (same-length secondary sort)
+        narrative = "X" * 200
+
+        _create_thread_with_arc(
+            "Sustained Struggle Thread", narrative, [mid_a],
+            arc_affect={"trajectory": "sustained_struggle"},
+        )
+        _create_thread_with_arc(
+            "Neutral Thread", narrative, [mid_b],
+            arc_affect=None,
+        )
+        _create_thread_with_arc(
+            "Mastery Thread", narrative, [mid_c],
+            arc_affect={"trajectory": "frustration_to_mastery"},
+        )
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+        mem_c = Memory.get_by_id(mid_c)
+
+        session_affect = {"frustration": 0.7, "arousal": 0.5}
+        selected = engine._get_thread_narratives(
+            [mem_a, mem_b, mem_c], session_affect=session_affect
+        )
+
+        titles = [t.title for t in selected]
+        assert titles[0] == "Mastery Thread", (
+            f"Expected Mastery Thread first, got: {titles}"
+        )
+
+    def test_sustained_struggle_deprioritized_when_frustrated(self, base, engine, monkeypatch):
+        """When frustration > 0.3, sustained_struggle thread is sorted last."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"affect_signatures": True})
+
+        mid_a = _make_memory("Struggle mem", "crystallized", "Struggle Crystal")
+        mid_b = _make_memory("Neutral mem", "crystallized", "Neutral Crystal")
+
+        narrative = "Y" * 150
+
+        _create_thread_with_arc(
+            "Struggle Thread", narrative, [mid_a],
+            arc_affect={"trajectory": "sustained_struggle"},
+        )
+        _create_thread_with_arc(
+            "Neutral Thread", narrative, [mid_b],
+            arc_affect=None,
+        )
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        session_affect = {"frustration": 0.5}
+        selected = engine._get_thread_narratives(
+            [mem_a, mem_b], session_affect=session_affect
+        )
+
+        titles = [t.title for t in selected]
+        assert titles[-1] == "Struggle Thread", (
+            f"Expected Struggle Thread last, got: {titles}"
+        )
+
+    def test_low_frustration_uses_default_length_sort(self, base, engine, monkeypatch):
+        """When frustration <= 0.3, default shortest-first ordering applies."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"affect_signatures": True})
+
+        mid_a = _make_memory("Mem low frust A", "crystallized", "Low Frust Crystal A")
+        mid_b = _make_memory("Mem low frust B", "crystallized", "Low Frust Crystal B")
+
+        _create_thread_with_arc(
+            "Long Mastery Thread", "Z" * 600, [mid_a],
+            arc_affect={"trajectory": "frustration_to_mastery"},
+        )
+        _create_thread_with_arc(
+            "Short Neutral Thread", "Z" * 100, [mid_b],
+            arc_affect=None,
+        )
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        # frustration = 0.2, below threshold
+        session_affect = {"frustration": 0.2}
+        selected = engine._get_thread_narratives(
+            [mem_a, mem_b], session_affect=session_affect
+        )
+
+        # Shortest first — short neutral thread should come before long mastery thread
+        titles = [t.title for t in selected]
+        assert titles[0] == "Short Neutral Thread", (
+            f"Expected Short Neutral Thread first (shortest-first sort), got: {titles}"
+        )
+
+    def test_no_session_affect_uses_default_sort(self, base, engine, monkeypatch):
+        """When session_affect is None, default shortest-first ordering applies."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"affect_signatures": True})
+
+        mid_a = _make_memory("Mem no affect A", "crystallized", "No Affect Crystal A")
+        mid_b = _make_memory("Mem no affect B", "crystallized", "No Affect Crystal B")
+
+        _create_thread_with_arc(
+            "Long Thread No Affect", "A" * 700, [mid_a],
+            arc_affect={"trajectory": "frustration_to_mastery"},
+        )
+        _create_thread_with_arc(
+            "Short Thread No Affect", "A" * 80, [mid_b],
+            arc_affect=None,
+        )
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        selected = engine._get_thread_narratives([mem_a, mem_b], session_affect=None)
+
+        titles = [t.title for t in selected]
+        assert titles[0] == "Short Thread No Affect", (
+            f"Expected Short Thread first (shortest-first), got: {titles}"
+        )
+
+    def test_affect_flag_disabled_no_affect_ordering(self, base, engine, monkeypatch):
+        """When affect_signatures flag is False, affect-aware sort is NOT applied."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"affect_signatures": False})
+
+        mid_a = _make_memory("Flag off A", "crystallized", "Flag Off Crystal A")
+        mid_b = _make_memory("Flag off B", "crystallized", "Flag Off Crystal B")
+
+        _create_thread_with_arc(
+            "Long Mastery Flag Off", "M" * 600, [mid_a],
+            arc_affect={"trajectory": "frustration_to_mastery"},
+        )
+        _create_thread_with_arc(
+            "Short Struggle Flag Off", "S" * 100, [mid_b],
+            arc_affect={"trajectory": "sustained_struggle"},
+        )
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+
+        # High frustration but flag is off
+        session_affect = {"frustration": 0.9}
+        selected = engine._get_thread_narratives(
+            [mem_a, mem_b], session_affect=session_affect
+        )
+
+        titles = [t.title for t in selected]
+        # Default sort: shortest first. Short Struggle comes first (not deprioritized)
+        assert titles[0] == "Short Struggle Flag Off", (
+            f"Expected Short Struggle first (shortest-first, flag off), got: {titles}"
+        )
+
+    def test_null_arc_affect_treated_as_neutral(self, base, engine, monkeypatch):
+        """Threads with arc_affect = NULL are treated as neutral (middle priority bucket)."""
+        import core.flags as flags_module
+        monkeypatch.setattr(flags_module, "_cache", {"affect_signatures": True})
+
+        mid_a = _make_memory("Null arc A", "crystallized", "Null Arc Crystal A")
+        mid_b = _make_memory("Null arc B", "crystallized", "Null Arc Crystal B")
+        mid_c = _make_memory("Null arc C", "crystallized", "Null Arc Crystal C")
+
+        narrative = "N" * 200
+
+        _create_thread_with_arc(
+            "Mastery Null Test", narrative, [mid_a],
+            arc_affect={"trajectory": "frustration_to_mastery"},
+        )
+        _create_thread_with_arc(
+            "Null Arc Thread", narrative, [mid_b],
+            arc_affect=None,  # NULL arc_affect
+        )
+        _create_thread_with_arc(
+            "Struggle Null Test", narrative, [mid_c],
+            arc_affect={"trajectory": "sustained_struggle"},
+        )
+
+        mem_a = Memory.get_by_id(mid_a)
+        mem_b = Memory.get_by_id(mid_b)
+        mem_c = Memory.get_by_id(mid_c)
+
+        session_affect = {"frustration": 0.6}
+        selected = engine._get_thread_narratives(
+            [mem_a, mem_b, mem_c], session_affect=session_affect
+        )
+
+        titles = [t.title for t in selected]
+        mastery_idx = titles.index("Mastery Null Test")
+        null_idx = titles.index("Null Arc Thread")
+        struggle_idx = titles.index("Struggle Null Test")
+
+        assert mastery_idx < null_idx, "Mastery should come before Null"
+        assert null_idx < struggle_idx, "Null should come before Struggle"
+
+    def test_inject_for_session_forwards_session_affect(self, base, engine, monkeypatch):
+        """inject_for_session accepts session_affect and passes it to _get_thread_narratives."""
+        import inspect
+        sig = inspect.signature(engine.inject_for_session)
+        assert "session_affect" in sig.parameters
+
+        # Verify it forwards the value by patching _get_thread_narratives
+        received_affect = []
+        original = engine._get_thread_narratives
+
+        def capture(tier2_memories, session_affect=None):
+            received_affect.append(session_affect)
+            return original(tier2_memories, session_affect=session_affect)
+
+        monkeypatch.setattr(engine, "_get_thread_narratives", capture)
+
+        _make_memory("Affect forward test", "crystallized", "Affect Forward")
+        affect = {"frustration": 0.8, "arousal": 0.4}
+        engine.inject_for_session(session_id="affect_forward_sess", session_affect=affect)
+
+        assert len(received_affect) == 1
+        assert received_affect[0] == affect
