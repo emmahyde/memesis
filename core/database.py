@@ -168,6 +168,7 @@ def _run_migrations():
         ("content", "TEXT"),
         ("archived_at", "TEXT"),
         ("subsumed_by", "TEXT"),
+        ("echo_count", "INTEGER DEFAULT 0"),
         ("next_injection_due", "TEXT"),
         ("injection_ease_factor", "REAL DEFAULT 2.5"),
         ("injection_interval_days", "REAL DEFAULT 1.0"),
@@ -188,9 +189,21 @@ def _run_migrations():
 
     # narrative_threads migration
     nt_cols = _columns("narrative_threads")
-    if "last_surfaced_at" not in nt_cols:
+    for col, typ in [
+        ("last_surfaced_at", "TEXT"),
+        ("arc_affect", "TEXT"),
+    ]:
+        if col not in nt_cols:
+            try:
+                db.execute_sql(f"ALTER TABLE narrative_threads ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
+
+    # memory_edges migration
+    edge_cols = _columns("memory_edges")
+    if "metadata" not in edge_cols:
         try:
-            db.execute_sql("ALTER TABLE narrative_threads ADD COLUMN last_surfaced_at TEXT")
+            db.execute_sql("ALTER TABLE memory_edges ADD COLUMN metadata TEXT")
         except Exception:
             pass
 

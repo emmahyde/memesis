@@ -26,7 +26,7 @@ from typing import Optional
 from .database import get_base_dir, get_vec_store
 from .lifecycle import LifecycleManager
 from .llm import call_llm
-from .models import ConsolidationLog, Memory
+from .models import ConsolidationLog, Memory, MemoryEdge
 
 # ---------------------------------------------------------------------------
 # Crystallization prompt
@@ -373,6 +373,12 @@ class Crystallizer:
             except Exception:
                 pass
 
+        # Create subsumed_into edges — makes crystallization lineage walkable
+        # via the graph rather than requiring a scan of Memory.subsumed_by.
+        from .flags import get_flag
+        if get_flag("causal_edges"):
+            self._create_subsumption_edges(group, crystallized_id, result["title"])
+
         return {
             "crystallized_id": crystallized_id,
             "source_ids": source_ids,
@@ -380,6 +386,31 @@ class Crystallizer:
             "insight": result["insight"],
             "group_size": len(group),
         }
+
+    @staticmethod
+    def _create_subsumption_edges(
+        group: list, crystallized_id: str, crystal_title: str
+    ) -> None:
+        """Create subsumed_into edges from source memories to the crystal."""
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        now = datetime.now().isoformat()
+        for mem in group:
+            try:
+                MemoryEdge.create(
+                    source_id=mem.id,
+                    target_id=crystallized_id,
+                    edge_type="subsumed_into",
+                    weight=1.0,
+                    metadata=json.dumps({
+                        "source_title": mem.title or "",
+                        "crystal_title": crystal_title,
+                        "created_at": now,
+                    }),
+                )
+            except Exception as e:
+                _logger.warning("Failed to create subsumption edge: %s", e)
 
     def _fallback_promote(self, group: list) -> Optional[dict]:
         """Simple promotion without synthesis — used when LLM call fails."""

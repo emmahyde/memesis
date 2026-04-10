@@ -193,15 +193,3 @@ Respond ONLY with valid JSON:
   "resolution_type": "scoped|superseded|coexist",
   "confidence": 0.0-1.0
 }}"""
-
-
-# ---------------------------------------------------------------------------
-# Privacy filter patterns
-# ---------------------------------------------------------------------------
-
-EMOTIONAL_STATE_PATTERNS = [
-    r'\b(seemed?|appears?|looks?|sounds?)\s+(frustrated|excited|angry|upset|happy|sad|annoyed|pleased|disappointed|confused|stressed)',
-    r'\b(was|is|feels?)\s+(frustrated|excited|angry|upset|happy|sad|annoyed|pleased|disappointed|confused|stressed)',
-    r'\b(mood|emotion|feeling)\b',
-    r'\b(emma|user)\s+(seemed?|was|felt?)\s+\w+ly?\b',
-]

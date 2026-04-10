@@ -1,367 +1,452 @@
 # Research: Python 3.10+ Ecosystem Pitfalls
 
-**Confidence:** HIGH (SQLite/WAL, Anthropic SDK, rate limits — official docs + Context7); MEDIUM (pytest fixture scoping — Context7); MEDIUM (pyproject.toml — PEP 517/621 primary sources, Cloudflare blocked setuptools docs); MEDIUM (TOCTOU — well-established OS security literature, codebase review)
+**Mode:** ecosystem
+**Confidence:** HIGH (peewee, sqlite-vec, Anthropic SDK, WAL — Context7 + official docs); MEDIUM (NLTK, apsw, scikit-learn — official doc access partially blocked by Cloudflare; characterizations based on known behavior and codebase review)
 
 **Sources:**
-- SQLite WAL: https://www.sqlite.org/wal.html
-- SQLite FTS5: https://www.sqlite.org/fts5.html
-- SQLite threading: https://docs.python.org/3/library/sqlite3.html
-- Anthropic rate limits: https://platform.claude.com/docs/en/api/rate-limits
-- Anthropic token counting: https://platform.claude.com/docs/en/docs/build-with-claude/token-counting
-- Anthropic SDK: Context7 /anthropics/anthropic-sdk-python (reputation: High)
-- pytest: Context7 /websites/pytest_en_stable (reputation: High)
-- PEP 621: https://peps.python.org/pep-0621/
-- PEP 517: https://peps.python.org/pep-0517/
-- Codebase: /Users/emma.hyde/projects/memesis/core/storage.py, tests/conftest.py
+- Context7 /anthropics/anthropic-sdk-python (reputation: High) — fetched 2026-03-30
+- Context7 /coleifer/peewee (reputation: High) — fetched 2026-03-30
+- Context7 /asg017/sqlite-vec (reputation: High) — fetched 2026-03-30
+- SQLite WAL official documentation — https://www.sqlite.org/wal.html (fetched 2026-03-30)
+- Codebase audit: core/database.py, core/models.py, core/vec.py, core/embeddings.py,
+  core/retrieval.py, core/relevance.py, core/feedback.py, hooks/pre_compact.py, scripts/reduce.py
 
 ---
 
-## 1. SQLite — Locking and Concurrent Access
+## Current Landscape
 
-### WAL Mode Is Not a Silver Bullet
+This project combines six layers that each have distinct failure modes:
 
-WAL mode (`PRAGMA journal_mode=WAL`) enables concurrent readers with a single writer, but several traps exist:
+| Layer | Technology | Role in codebase |
+|-------|-----------|-----------------|
+| LLM calls | Anthropic SDK (sync) | Consolidation, crystallization, reconsolidation |
+| Embeddings | AWS Bedrock Titan v2 (boto3) | Float32 vectors for KNN |
+| ORM | Peewee + deferred SqliteDatabase | All relational reads/writes |
+| Vector store | sqlite-vec via apsw | KNN over memory embeddings |
+| FTS | SQLite FTS5 (raw SQL via Peewee) | Text leg of hybrid RRF |
+| Text processing | NLTK (stopwords, PorterStemmer) | Relevance scoring, feedback loop |
+| Dedup/clustering | scikit-learn TF-IDF + cosine | scripts/reduce.py, scripts/consolidate.py |
 
-**Checkpoint starvation.** If readers continuously overlap — no gap where zero readers are active — the WAL file grows without bound and is never flushed to the main database. Query performance degrades proportionally to WAL file size. Mitigation: ensure periodic "reader gaps" and call `PRAGMA wal_checkpoint(RESTART)` after write-heavy batches. This codebase already does `wal_checkpoint(TRUNCATE)` in `MemoryStore.close()`, which is correct but only fires at explicit teardown, not after bulk ingest.
-
-**WAL reset bug in SQLite 3.7.0–3.51.2.** A data race in WAL mode under concurrent writes+checkpoints can silently corrupt the database. Affects all Python versions that ship those SQLite builds. macOS Sequoia (system Python) typically ships 3.43.x. Check with `sqlite3.sqlite_version`. Upgrade to 3.51.3+ where possible; on macOS this means using a Homebrew-linked SQLite or a `pysqlite3` wheel.
-
-```python
-import sqlite3
-print(sqlite3.sqlite_version)  # e.g. "3.43.2" — vulnerable range
-```
-
-**Anti-pattern: opening a new connection per operation under concurrent load.** Every `sqlite3.connect(self.db_path)` in `storage.py` opens, uses, and closes a connection. Under concurrent scripts (e.g., `consolidate_cron.py` + `pre_compact.py` running simultaneously), SQLite's default 5-second `timeout` applies. If that is exceeded, `OperationalError: database is locked` is raised and the write is silently dropped — there is no retry logic.
-
-```python
-# Anti-pattern (current codebase pattern under concurrent cron + hook):
-with sqlite3.connect(self.db_path) as conn:  # timeout=5.0 default
-    conn.execute("INSERT ...")
-
-# Better: explicit timeout + WAL for multi-process resilience
-with sqlite3.connect(self.db_path, timeout=30.0) as conn:
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("INSERT ...")
-```
-
-**`synchronous=NORMAL` vs `FULL`.** The codebase uses `PRAGMA synchronous=NORMAL`, which is correct for WAL mode (WAL provides crash safety up to the last committed transaction without full sync). Do not set `synchronous=OFF` — that sacrifices durability entirely and can corrupt the DB on power loss or OS crash.
-
-**Multi-process vs multi-thread.** WAL mode handles multiple *processes* safely. For multi-*thread* use within one process, SQLite's `check_same_thread=True` (the default) blocks cross-thread access. Setting `check_same_thread=False` without a threading lock causes undefined behavior. The codebase creates a new connection per call (single-threaded pattern), which is safe but expensive; shared-connection pools require explicit locking.
+The hook runtime (`pre_compact.py`) is single-process and sequential, which is the primary concurrency mitigation. The dual-connection architecture (peewee + apsw to the same `.db` file) is the primary structural risk.
 
 ---
 
-## 2. SQLite FTS5 — Injection Vulnerabilities
+## 1. SQLite Concurrency and WAL Mode
 
-### FTS5 Query Injection Is Real
+### WAL-reset race condition — CVE-level severity
 
-FTS5 has its own query language with special characters and boolean operators. Unlike SQL injection (addressed by `?` binding), **FTS5 query injection** occurs when user-supplied strings are passed as the MATCH argument via a parameterized binding but the *content* of that string contains FTS5 operators.
+SQLite versions 3.7.0–3.51.2 contain a data race in WAL mode: when two connections checkpoint concurrently while a third commits, the WAL-index header can be left in an incorrect state, causing a later checkpoint to silently skip committed transactions. The result is **silent database corruption with no error raised**. This was fixed in SQLite 3.51.3 (released 2026-03-13).
 
-The current `search_fts()` call is safe against SQL injection because `query` is passed as a bound parameter (`WHERE memories_fts MATCH ?`). However, **FTS5 query syntax errors raised by malformed user input will propagate as `OperationalError`**, and malicious input can broaden or break the search semantics.
+macOS ships its own system SQLite (typically 3.43.x on Sequoia), which apsw and the stdlib sqlite3 module both link against unless overridden. Both connections in this codebase (peewee and apsw/VecStore) are in the vulnerable range on a default macOS install.
 
-**Special characters with FTS5 meaning:**
-
-| Character/Token | Meaning |
-|---|---|
-| `AND`, `OR`, `NOT` | Boolean set operators (case-sensitive) |
-| `*` | Prefix wildcard |
-| `^` | Initial token marker |
-| `:` | Column filter (`title: foo`) |
-| `"..."` | Phrase query |
-| `()` | Grouping / NEAR |
-| `+` | Phrase concatenation |
-| `-` | NOT / column exclusion |
-
-**Injection example:**
-
+*Check at startup:*
 ```python
-# User submits: python OR 1
-store.search_fts("python OR 1")
-# FTS5 interprets this as: rows containing "python" UNION rows containing "1"
-# This is semantically wrong and leaks unintended results.
-
-# User submits: * (bare asterisk)
-store.search_fts("*")
-# OperationalError: fts5: syntax error near "*"
+import sqlite3, apsw
+print(sqlite3.sqlite_version)      # peewee/FTS5 connection
+print(apsw.sqlitelibversion())      # vec_memories connection
 ```
 
-**Correct mitigation — sanitize before passing to FTS5:**
+On macOS, upgrade to a Homebrew-linked SQLite >= 3.51.3 and set `DYLD_LIBRARY_PATH` or use `pysqlite3-binary`. The concurrent-write risk is low for the current sequential hook design, but any future cron overlap makes it real.
 
+### Dual-connection architecture — split-brain risk
+
+`core/vec.py` opens a new apsw `Connection` for every `store_embedding`, `search_vector`, and `get_embedding` call. `core/database.py` holds a persistent peewee connection. Both write to the same WAL file. This is architecturally sound but creates two concrete risks:
+
+**1. apsw connections have no busy timeout.** The `VecStore._connect()` method opens `apsw.Connection(self._db_path)` with no `setbusytimeout()` call. If the peewee connection holds a write lock (e.g., during the `db.atomic()` in `Memory.save()`), any concurrent `store_embedding` call will raise `apsw.BusyError` immediately instead of waiting. The peewee connection has `busy_timeout: 5000` set via pragmas; apsw does not.
+
+*Fix:*
 ```python
-import re
-
-def sanitize_fts_query(query: str) -> str:
-    """
-    Wrap user input in a phrase query to neutralize FTS5 operators.
-    Double-quotes inside are escaped by doubling them.
-    """
-    escaped = query.replace('"', '""')
-    return f'"{escaped}"'
-
-# Then:
-cursor.execute("SELECT ... WHERE memories_fts MATCH ?", (sanitize_fts_query(user_input),))
+def _connect(self):
+    conn = apsw.Connection(self._db_path)
+    conn.setbusytimeout(5000)   # match peewee's 5-second timeout
+    conn.enable_load_extension(True)
+    conn.load_extension(sqlite_vec.loadable_path())
+    return conn
 ```
 
-**Column filter injection.** If any caller constructs `"title: " + user_input` for column-scoped search, the user can inject arbitrary FTS5 expressions by terminating the column filter. Always validate column names against an allowlist before building column-scoped queries.
+**2. Extension loaded on every connection open.** `sqlite_vec.loadable_path()` resolves the `.dylib`/`.so` path and `load_extension` initializes it on every call. In the pre-compact loop that embeds all newly-kept memories (`for memory_id in result.get("kept", []):`) this multiplies load overhead. A single apsw connection held for the duration of a batch write loop is faster:
 
-**Content-table consistency.** The codebase uses `content='memories'` with an external content FTS5 table and manages FTS sync manually (no triggers). If a crash occurs between the file write and the `conn.commit()` in `create()`, the FTS index will be out of sync with the `memories` table. The fix is running `INSERT INTO memories_fts(memories_fts) VALUES('rebuild')` as a recovery step, not as a regular operation (it is expensive — O(n) rows).
+```python
+conn = self._connect()
+try:
+    for memory_id, embedding in batch:
+        conn.execute("INSERT OR REPLACE ...", (memory_id, embedding))
+finally:
+    conn.close()
+```
+
+### WAL checkpoint starvation and silent failure
+
+`close_db()` calls `PRAGMA wal_checkpoint(TRUNCATE)` but does not inspect the result. `TRUNCATE` returns `(busy, log, checkpointed)` — if `busy > 0`, the checkpoint was incomplete (a reader had an open transaction). Under continuous use, this causes unbounded WAL growth and degraded read performance.
+
+*Fix — log the result:*
+```python
+cursor = db.execute_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+result = cursor.fetchone()
+if result and result[0] > 0:  # busy > 0
+    logger.warning("WAL checkpoint incomplete: %s busy frames", result[1])
+```
+
+### `synchronous=NORMAL` is correct for WAL mode
+
+The codebase uses `synchronous: normal` which is the right setting for WAL. Do not change to `synchronous=OFF` — that sacrifices crash durability entirely. `FULL` is not needed with WAL.
+
+### FTS5 content-table desync on process kill
+
+`memories_fts` is a content FTS5 table backed by `memories` with manual sync (no triggers). The sequence in `Memory.save()` is: SELECT rowid → DELETE fts row → INSERT memories row → INSERT fts row, wrapped in `db.atomic()`. The atomic wrapper protects against normal exceptions, but a process kill (SIGKILL) or OOM between the DELETE and INSERT steps leaves the FTS index with a deleted-but-not-re-inserted row.
+
+Recovery: `INSERT INTO memories_fts(memories_fts) VALUES('rebuild')` — expensive but correct. This should be part of a startup integrity check, not a routine operation.
+
+**FTS bulk insert bypass.** If any code path uses peewee's `Model.insert_many()` or `bulk_create()`, the `Memory.save()` override is bypassed and FTS is not updated. Search results will silently miss those records.
 
 ---
 
-## 3. Anthropic Python SDK — Rate Limiting and Token Counting
+## 2. Peewee ORM
 
-### Rate Limit Architecture (as of 2026-03)
+### Deferred database — initialization ordering traps
 
-The API uses a **token bucket algorithm** — capacity replenishes continuously, not at fixed minute boundaries. Critically:
+`db = SqliteDatabase(None)` is module-level in `models.py`. Any import that eagerly queries a model (e.g., a module-level `Memory.select()`) before `init_db()` is called raises `OperationalError: database path is not set` or `no such table`. This is safe in the current codebase but easy to break when adding new entry points.
 
-- Limits are enforced as *three independent dimensions*: RPM (requests/min), ITPM (input tokens/min), OTPM (output tokens/min).
-- A 429 error includes a `retry-after` header and `anthropic-ratelimit-*` headers. Retrying before `retry-after` seconds will fail.
-- **Burst behavior:** A 60 RPM limit may be enforced as 1 req/sec. A burst of 5 simultaneous requests will trigger 429s for 4 of them even though the per-minute budget has headroom.
+### Thread-local connections vs. asyncio
 
-**Anti-pattern: treating RPM as "60 per minute resets at :00":**
+Peewee's `SqliteDatabase` stores connection state in thread-local storage. This is safe across OS threads but incompatible with asyncio: if any async coroutine awaits across a peewee call, the wrong thread's connection state is used. The codebase is currently synchronous. If streaming Anthropic responses via `AsyncAnthropic` are ever added, peewee calls must be wrapped with `asyncio.to_thread()` or replaced with an async ORM.
 
-```python
-# WRONG — this can burst and hit per-second enforcement
-for memory in all_memories:
-    client.messages.create(...)  # fires all at once
+### N+1 in `_pk_exists()`
 
-# RIGHT — respect the token bucket with back-off
-import time
-from anthropic import RateLimitError
+`Memory.save()` calls `_pk_exists()` which issues `Memory.get_by_id(self.id)` before every save. This is one extra SELECT per save to detect insert vs. update. In the consolidation loop that creates many memories, this doubles query count. Peewee's `on_conflict` or `force_insert` parameter can eliminate this check.
 
-for memory in all_memories:
-    try:
-        client.messages.create(...)
-    except RateLimitError as e:
-        retry_after = int(e.response.headers.get("retry-after", 60))
-        time.sleep(retry_after)
-        client.messages.create(...)  # retry once
-```
+### Naive vs. UTC datetime mixing
 
-The SDK's built-in retry logic handles transient 429s with exponential back-off by default (2 retries). For consolidation batch loops, the default is usually insufficient — set `max_retries` higher or implement application-level throttling.
+All timestamp columns are `TextField(null=True)` containing ISO strings. Lexicographic ordering works only if format is consistent. The codebase mixes:
+- `datetime.now().isoformat()` — naive, no timezone (e.g., `"2026-03-30T14:00:00.123456"`)
+- `datetime.now(timezone.utc).isoformat()` — UTC-aware (e.g., `"2026-03-30T14:00:00.123456+00:00"`)
 
-### Token Counting Gotchas
+`retrieval.py` uses UTC-aware in `_get_thread_narratives` (line ~384) but naive datetimes in `_record_injection`. Mixed formats break ordering comparisons and `datetime.fromisoformat()` parsing in the provenance batch logic.
 
-**`count_tokens` is an estimate, not a guarantee.** The docs state: "the actual number of input tokens used when creating a message may differ by a small amount." Anthropic may add system optimization tokens that appear in the count but are not billed. Do not use `count_tokens` results for hard budget enforcement — use them for routing and soft warnings only.
+*Fix:* Pick `datetime.now(timezone.utc).isoformat()` everywhere. Add a one-time migration to normalize existing rows.
 
-**`input_tokens` in the response body is not total input.** When prompt caching is active:
+### `consolidation_log` migration is not atomic
 
-```
-total_input = cache_read_input_tokens + cache_creation_input_tokens + input_tokens
-```
-
-The `input_tokens` field in `message.usage` only reflects tokens *after the last cache breakpoint*. A common bug is logging `message.usage.input_tokens` as the total cost and seeing unexpectedly low numbers when a large system prompt is cached.
+The migration in `_run_migrations()` that rebuilds `consolidation_log` to add the `'subsumed'` CHECK constraint does: `DROP TABLE` → `CREATE TABLE` → Python loop of `INSERT`. If the process is killed between `DROP` and the loop completing, the log is permanently lost. Wrap in `db.atomic()`:
 
 ```python
-# BUG — undercounts total input when caching is active:
-print(f"Input tokens: {message.usage.input_tokens}")
+with db.atomic():
+    db.execute_sql("DROP TABLE consolidation_log")
+    db.execute_sql("CREATE TABLE consolidation_log (...)")
+    for r in rows:
+        db.execute_sql("INSERT INTO consolidation_log ...", list(r))
+```
 
-# CORRECT:
-total = (
+### Stale `_vec_store` singleton after `close_db()`
+
+`close_db()` closes the peewee connection but does not reset `_vec_store = None`. A subsequent `init_db()` with a different `db_path` creates a new `VecStore` and overwrites `_vec_store`, but any caller that cached `get_vec_store()` at module import time holds the stale reference. Always call `get_vec_store()` at use time, not once at startup.
+
+### `ThreadSafeDatabaseMetadata` not used
+
+The base `BaseModel.Meta` does not use `ThreadSafeDatabaseMetadata` from `playhouse.shortcuts`. This is fine for the current single-process design, but if `db.bind()` is ever called at runtime (e.g., to switch to a test database), the swap is not thread-safe. For future safety:
+
+```python
+from playhouse.shortcuts import ThreadSafeDatabaseMetadata
+
+class BaseModel(Model):
+    class Meta:
+        database = db
+        model_metadata_class = ThreadSafeDatabaseMetadata
+```
+
+---
+
+## 3. sqlite-vec via apsw
+
+### Dimension mismatch — silent wrong answers
+
+The vec0 table is declared `float[512]` but the INSERT accepts any blob length. If `DEFAULT_DIMENSIONS` changes (e.g., from 512 to 1024) or if a differently-dimensioned embedding is inserted, sqlite-vec returns garbage distances — not an exception. There is no runtime enforcement.
+
+*Fix — assert before every INSERT and query:*
+```python
+EXPECTED_BYTES = DEFAULT_DIMENSIONS * 4   # 512 * 4 = 2048
+
+def store_embedding(self, memory_id: str, embedding: bytes) -> None:
+    assert len(embedding) == EXPECTED_BYTES, (
+        f"Embedding size mismatch: expected {EXPECTED_BYTES} bytes, got {len(embedding)}"
+    )
+    ...
+```
+
+### Metadata column constraints (for future schema additions)
+
+If metadata columns are ever added to `vec_memories`:
+- Maximum 16 metadata columns per vec0 table
+- Only TEXT, INTEGER, FLOAT, BOOLEAN types supported
+- UNIQUE and NOT NULL constraints are not supported
+- KNN WHERE filters accept only `=`, `!=`, `>`, `>=`, `<`, `<=` — no `LIKE`, `IN`, or scalar functions
+
+### apsw `enable_load_extension` availability
+
+On some Linux distributions and CI environments, apsw is compiled without `enable_load_extension` support. If present but not compiled in, `conn.enable_load_extension(True)` raises `AttributeError` (not `ImportError`). The current `try/except ImportError` in `__init__` does not catch this. Wrap `_connect()` in a broader except:
+
+```python
+try:
+    conn = self._connect()
+    ...
+    self._available = True
+except (Exception,) as e:
+    logger.warning("sqlite-vec unavailable: %s", e)
+```
+
+### `INSERT OR REPLACE` on TEXT PRIMARY KEY behavior
+
+The `memory_id TEXT PRIMARY KEY` in vec0 uses user-defined rowids. `INSERT OR REPLACE` works correctly for upserts (deletes the old row, inserts the new). This is the right pattern for `store_embedding`. Do not use `INSERT OR IGNORE` — it would silently skip re-embedding on content updates.
+
+---
+
+## 4. Anthropic Python SDK
+
+### Stale embeddings after memory content update
+
+`Memory.save()` updates `content_hash` when content changes, but does not trigger re-embedding. If a memory's title, summary, or content changes during reconsolidation (e.g., `refined` action), the vector in `vec_memories` is stale. The next KNN query ranks that memory by its old embedding position. This is a correctness bug, not just a performance issue — the hybrid RRF result for semantically-changed memories will be wrong.
+
+*Fix:* In `Memory.save()`, detect content_hash change and enqueue re-embedding:
+```python
+old_hash = self.content_hash
+result = super().save(...)
+if self.content_hash != old_hash:
+    from .database import get_vec_store
+    vs = get_vec_store()
+    if vs:
+        from .embeddings import embed_for_memory
+        embedding = embed_for_memory(self.title or "", self.summary or "", self.content or "")
+        if embedding:
+            vs.store_embedding(self.id, embedding)
+```
+
+### `max_tokens` is required — no SDK default
+
+The Anthropic API requires `max_tokens` on every request. The SDK does not supply a default. Any call site that constructs a request dynamically and omits `max_tokens` raises `BadRequestError` at runtime, not at import time.
+
+### Model string staleness and centralization
+
+Model IDs like `"claude-3-5-sonnet-latest"` resolve to whatever Anthropic designates as latest at call time. Pinned dated IDs (e.g., `"claude-3-5-sonnet-20241022"`) are reproducible but will eventually 404 when deprecated. The codebase should define a single module-level constant:
+
+```python
+# core/llm.py
+CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
+```
+
+### Synchronous client and async mixing
+
+The codebase uses `Anthropic()` (synchronous) throughout. If `AsyncAnthropic` is ever introduced for streaming, do not mix sync calls inside an async event loop — they block the loop's thread. Use `AsyncAnthropic` exclusively once async is adopted.
+
+### No custom timeout or retry budget
+
+The SDK defaults to `max_retries=2` with exponential backoff. For the consolidation loop that may call the LLM for each of dozens of memories in sequence, a rate limit event will retry but consume wall-clock time silently. Configure explicitly:
+
+```python
+from anthropic import Anthropic, DefaultHttpxClient
+import httpx
+
+client = Anthropic(
+    http_client=DefaultHttpxClient(
+        timeout=httpx.Timeout(60.0, connect=5.0)
+    ),
+    max_retries=3,
+)
+```
+
+### Token usage not logged
+
+`message.usage.input_tokens` and `message.usage.output_tokens` are available on every non-streaming response. The codebase does not log them. Without this, cost attribution and budget anomaly detection are impossible. When prompt caching is active, `input_tokens` alone undercounts — total is:
+
+```python
+total_input = (
     message.usage.input_tokens
     + getattr(message.usage, 'cache_creation_input_tokens', 0)
     + getattr(message.usage, 'cache_read_input_tokens', 0)
 )
-print(f"Total input tokens: {total}")
 ```
 
-**ITPM rate limits and caching.** For most current models (without the `†` marker in the rate limit tables), `cache_read_input_tokens` do NOT count toward ITPM. This means a large cached system prompt (e.g., the consolidation prompt in `core/prompts.py`) effectively multiplies your throughput. Older deprecated models (Haiku 3, Haiku 3.5) count cached reads against ITPM — migrating away from them increases effective throughput.
+### Token counting before large prompts
 
-**`count_tokens` does not apply caching.** Calling `client.messages.count_tokens()` with `cache_control` blocks in the messages will return a higher count than the actual billed tokens during a real request where the cache is warm. The endpoint ignores caching state by design.
+`client.messages.count_tokens()` can check whether a constructed prompt fits the context window before making the full request. This is relevant in `pre_compact.py` where `conversation_text` (the full Claude session) is passed to reconsolidation and consolidation prompts. Very long sessions can exceed the 200K-token context window.
 
-**Extended thinking and context window accounting.** Thinking blocks from *previous* assistant turns are ignored and do not count toward input tokens for subsequent turns. Only the *current* assistant turn's thinking counts. Passing previous thinking blocks forward in a multi-turn conversation inflates `count_tokens` but not the actual billed call.
+### Rate limiting is token-bucket, not per-minute reset
 
-**`max_tokens` does not affect OTPM rate limits.** Setting a high `max_tokens` (e.g., 8192) as a ceiling does not consume your OTPM budget — only actual generated tokens do. There is no cost to setting `max_tokens` higher than you expect to use.
-
-### Deprecated SDK Patterns
-
-The `client.beta.messages.count_tokens()` path (requiring `?beta=true`) is the old beta API. The stable path is `client.messages.count_tokens()` as of `anthropic>=0.40.0`. Using the beta path requires the `anthropic-beta` header and the response schema may differ.
+The API enforces three independent dimensions: RPM, ITPM, OTPM. A burst of simultaneous requests will hit per-second enforcement even if the per-minute budget has headroom. The pre-compact loop is sequential, so this is currently low risk.
 
 ---
 
-## 4. pytest — Fixture Scoping and Database State
+## 5. NLTK
 
-### Scope Hierarchy and State Leakage
+### Network download on first call — airgap failure
 
-pytest scopes in ascending lifetime order: `function` < `class` < `module` < `package` < `session`. A fixture can only request fixtures of equal or broader scope. The trap: **a `session`-scoped fixture that creates a database will have its state accumulate across all tests that share it.**
+`core/relevance.py` and `core/feedback.py` both import nltk at module level and call `nltk.data.find('corpora/stopwords')` inside functions, with a `try/except LookupError` that triggers `nltk.download('stopwords', quiet=True)`. This means:
 
-**Anti-pattern: session-scoped MemoryStore shared across tests:**
+- On a cold machine, the first call to any relevance/feedback function blocks on a network download.
+- In environments without internet access (CI, containers, deployment boxes without outbound HTTP), `nltk.download` fails silently (returns `False`), and the code falls back to empty stopwords — which defeats the entire text normalization step without any log warning.
 
+*Fix:* Move `nltk.download` calls to a one-time setup step with explicit failure logging:
 ```python
-# BAD — database state leaks between tests
-@pytest.fixture(scope="session")
-def memory_store(tmp_path_factory):
-    tmp = tmp_path_factory.mktemp("db")
-    store = MemoryStore(base_dir=str(tmp))
-    yield store
-    store.close()
-
-def test_a(memory_store):
-    memory_store.create("a.md", "content A", {...})
-
-def test_b(memory_store):
-    # This test sees the record created by test_a — ORDER DEPENDENT
-    results = memory_store.search_fts("content A")
-    assert len(results) == 0  # FAILS if test_a ran first
+import nltk, sys
+for corpus in ['stopwords']:
+    try:
+        nltk.data.find(f'corpora/{corpus}')
+    except LookupError:
+        ok = nltk.download(corpus, quiet=False)
+        if not ok:
+            print(f"WARNING: NLTK corpus '{corpus}' unavailable", file=sys.stderr)
 ```
 
-The current `conftest.py` uses `function`-scoped `memory_store` (correct), but also `temp_dir` via `tempfile.mkdtemp()`. Note that `tempfile.mkdtemp()` does not integrate with pytest's cleanup tracking — the `shutil.rmtree` in the yield teardown is the only cleanup. If the test process is killed mid-run, temp dirs accumulate. Prefer `tmp_path` (built-in, function-scoped, auto-cleaned after 3 runs) for file-based fixtures.
+Or bundle the corpora and set `NLTK_DATA=/path/to/bundled` in the environment.
 
-**The `project_memory_store` fixture modifies `os.environ['HOME']`.** This is a process-global side effect. If tests run in parallel (e.g., with `pytest-xdist`), multiple workers will race on `HOME`. The fixture has a correct try/finally restore, but under parallelism the fixture setup and teardown from different tests interleave. Mitigation: scope this fixture to `function` only (already done) and avoid `pytest-xdist` unless the HOME mutation is moved to a monkeypatched scope.
+### `OSError` from download not caught
 
-**Scope mismatch raises an error at collection time.** A narrow-scoped fixture requesting a broader-scoped fixture works fine; the reverse raises:
-
-```python
-@pytest.fixture(scope="session")
-def session_db():
-    ...
-
-@pytest.fixture(scope="function")  # function cannot use session — this is fine
-def per_test_cursor(session_db):   # FINE: function requests session
-    ...
-
-# But this fails at collection:
-@pytest.fixture(scope="session")
-def session_helper(per_test_cursor):  # ERROR: session cannot use function
-    ...
-```
-
-**Autouse fixtures can silently apply to unintended tests.** An `autouse=True` fixture at module scope activates for every test in the module, including tests that explicitly set up their own state. This leads to double-initialization bugs that are hard to trace. Prefer explicit fixture requests over autouse for database fixtures.
-
-**Transaction rollback as an isolation pattern.** For tests that write to a shared SQLite database (e.g., integration tests using a pre-populated fixture DB), a common pattern is wrapping each test in a transaction that is rolled back at teardown:
+`nltk.download()` raises `OSError` if `~/nltk_data/` is read-only (common in containerized environments). The existing `try/except LookupError` does not catch `OSError`. Add it:
 
 ```python
-@pytest.fixture
-def db_transaction(shared_db_connection):
-    shared_db_connection.execute("BEGIN")
-    yield shared_db_connection
-    shared_db_connection.execute("ROLLBACK")
-```
-
-This does not work cleanly with `sqlite3.connect()` context managers (`with conn:` auto-commits on exit). It requires holding a persistent connection object across setup and teardown, which conflicts with the per-call connection pattern in `storage.py`.
-
----
-
-## 5. Markdown File I/O — TOCTOU Race Conditions
-
-### The TOCTOU Window
-
-Time-of-check to time-of-use (TOCTOU) races occur when a file's state is checked in one syscall and acted upon in a separate syscall, with another process able to modify the file between them.
-
-**Anti-pattern: check-then-act on files:**
-
-```python
-# VULNERABLE — another process can rename/delete between check and read:
-if file_path.exists():
-    content = file_path.read_text()  # FileNotFoundError if file deleted in the gap
-
-# VULNERABLE — another process can create the file between check and write:
-if not file_path.exists():
-    file_path.write_text(content)  # Overwrites if created in the gap
-```
-
-The codebase already avoids the write-side TOCTOU correctly by using atomic rename (`tempfile.mkstemp` + `shutil.move`), which is the standard POSIX idiom. However, the read side in `get()`, `update()`, and `delete()` reads files with `file_path.read_text()` after checking `file_path.exists()` — a two-syscall pattern with a TOCTOU window.
-
-**Correct read pattern (handle the race as an exception):**
-
-```python
-# SAFE — treat FileNotFoundError as the authoritative signal, not exists()
 try:
-    content = file_path.read_text(encoding="utf-8")
-except FileNotFoundError:
-    content = ""  # or raise, depending on caller semantics
+    nltk.download('stopwords', quiet=True)
+except OSError as e:
+    logger.warning("Could not download NLTK stopwords: %s", e)
 ```
 
-**Cross-filesystem atomicity.** `shutil.move()` is atomic only when source and destination are on the same filesystem. `tempfile.mkstemp(dir=file_path.parent)` ensures the temp file is in the same directory as the destination, which guarantees same-filesystem rename atomicity on POSIX. This is done correctly in `storage.py`. Do not use `tempfile.mkstemp()` without specifying `dir=` — the default `/tmp` may be a different filesystem (common on macOS with APFS volumes).
+### PorterStemmer instantiation pattern
 
-**Encoding consistency.** `file_path.read_text()` without an explicit `encoding` argument uses the platform locale default. On most macOS/Linux systems this is UTF-8, but it is not guaranteed. Always specify `encoding="utf-8"` for both reads and writes. The codebase specifies encoding on writes (`os.write(tmp_fd, full_content.encode('utf-8'))`) but uses bare `read_text()` on several read paths in `storage.py` — this is a latent cross-platform bug.
+The codebase instantiates `PorterStemmer()` inside functions (new instance per call). This is safe. A module-level `_stemmer = PorterStemmer()` would be a performance improvement but is safe to share across calls (PorterStemmer is stateless). Do not share across threads without validation against the installed NLTK version.
 
-**File descriptor leak on interrupted writes.** The `create()` and `update()` methods correctly close `tmp_fd` before the rename and handle exceptions by closing + unlinking. However, `os.write()` to a low-level fd and then `shutil.move()` bypasses Python's buffered I/O flush guarantees. The content is passed to the OS write buffer but not necessarily to the disk. For durability on crash, call `os.fsync(tmp_fd)` before `os.close(tmp_fd)`:
+### Stopword list is English-only
+
+`nltk_stopwords.words('english')` is hardcoded. If non-English content enters the memory store, stop-word filtering will be ineffective and keywords from other languages will inflate relevance scores.
+
+---
+
+## 6. scikit-learn TF-IDF
+
+### Lazy import pattern is correct but needs broad except
+
+`scripts/reduce.py` and `scripts/consolidate.py` import sklearn inside functions with a guard:
+```python
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except ImportError:
+    return []
+```
+
+This is intentional (sklearn is optional). The risk: a partial sklearn install (e.g., missing native C extensions on ARM, incomplete conda environment) may raise `ImportError` on a submodule rather than the top-level package. The outer `except ImportError` catches it correctly in Python 3.10+ (submodule ImportErrors propagate as ImportError), but verify the `except` is at the right scope.
+
+### Dense matrix O(n²) memory scaling
+
+`cosine_similarity(matrix)` with a sparse TF-IDF matrix materializes an `(n, n)` float64 dense array. For n=1000 observations that is 8MB; for n=10,000 it is 800MB. The current use is batch dedup at script time (not live pipeline), so risk is low now but grows with the observation store. Use chunked comparison for large batches:
 
 ```python
-os.write(tmp_fd, full_content.encode('utf-8'))
-os.fsync(tmp_fd)  # flush to disk before renaming
-os.close(tmp_fd)
-shutil.move(tmp_path, file_path)
+# Instead of full dense cosine_similarity(matrix):
+from sklearn.metrics.pairwise import cosine_similarity
+CHUNK = 100
+for i in range(0, len(corpus), CHUNK):
+    chunk_sims = cosine_similarity(matrix[i:i+CHUNK], matrix)
+    # process chunk_sims
 ```
 
-Note: `fsync` adds latency (~1–10ms per write on SSD). For high-throughput ingest, this is a trade-off; `synchronous=NORMAL` on SQLite WAL already provides crash safety at the DB level, so the markdown files are secondary truth.
+Do not call `.toarray()` on the TF-IDF sparse matrix before passing to `cosine_similarity` — sparse input is more memory-efficient and equally correct.
 
 ---
 
-## 6. pyproject.toml — Packaging Mistakes
+## 7. Memory Lifecycle Anti-Patterns
 
-### Required Fields and Fatal Mistakes
+These patterns are either present in the codebase or easy to introduce given the architecture.
 
-Per PEP 621, only `name` is unconditionally required. `version` is required unless listed in `[project.dynamic]` (for version-from-VCS workflows). The current `pyproject.toml` specifies both statically — correct.
+### Stale embeddings after content change (critical)
 
-**Fatal: specifying `name` in `dynamic`.** PEP 621 mandates that build backends raise an error if `name` appears in `dynamic`. This is a common copy-paste mistake when adopting dynamic versioning.
+Covered in section 4 above. `Memory.save()` does not re-embed when `content_hash` changes. KNN results for updated memories are wrong until the next full re-embed run.
 
-```toml
-# FATAL — build backend will error:
-[project]
-dynamic = ["version", "name"]  # name cannot be dynamic
+### FTS5 index drift on bulk operations
+
+`Memory.insert_many()`, `bulk_create()`, or raw `INSERT INTO memories` SQL bypass `Memory.save()` and do not update `memories_fts`. Any code added outside the `save()` override will silently diverge FTS.
+
+### Double-logging injections for tier1+tier2 overlap
+
+`inject_for_session` logs every memory in `tier1 + tier2` via `_record_injection`. A memory that is `instinctive` stage and also scores high on hybrid search (e.g., if it was recently crystallized from instinctive) could appear in both lists. `injection_count` would be overcounted. Add a `seen_ids` guard:
+
+```python
+seen = set()
+for memory in tier1 + tier2:
+    if memory.id not in seen:
+        _record_injection(memory.id, session_id, project_context=project_context)
+        seen.add(memory.id)
 ```
 
-**Fatal: specifying a field both statically and in `dynamic`.**
+### Thompson sampling non-determinism in tests
 
-```toml
-# FATAL — double-specification:
-[project]
-version = "0.1.0"
-dynamic = ["version"]  # version is already static above
+`_thompson_rerank` uses `random.betavariate` without seeding. Tests that depend on retrieval order will produce non-deterministic results. The existing tests do not test ranked order directly, but any test that asserts "first result is X" will flap. Seed the RNG in test fixtures or accept that rank-order tests require explicit mocking.
+
+### Crystallizer/rehydration tension (known)
+
+The crystallizer archives source memories after synthesis. The relevance engine immediately considers rehydrating them. Net effect is additive (crystal + potentially rehydrated sources), not the intended compression. Over time this inflates the store. Mitigation: unconditionally archive sources on crystallization and only rehydrate on explicit strong relevance signal (relevance > rehydrate_threshold + margin).
+
+### `consolidation_log` migration not atomic (critical)
+
+The `_run_migrations()` migration that rebuilds `consolidation_log` to add `'subsumed'` to the CHECK constraint does DROP TABLE + CREATE TABLE + Python INSERT loop without a wrapping transaction. A process kill during the loop permanently destroys the log.
+
+*Fix:*
+```python
+with db.atomic():
+    db.execute_sql("DROP TABLE consolidation_log")
+    db.execute_sql("CREATE TABLE consolidation_log (...)")
+    for r in rows:
+        db.execute_sql("INSERT INTO consolidation_log ...", list(r))
 ```
-
-**`build-system.requires` must include the backend package.** If `setuptools` is not listed in `requires`, a fresh `pip install --no-build-isolation` will fail in CI because the build environment is bootstrapped without it.
-
-```toml
-# CORRECT (current codebase):
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
-# WRONG — build backend package missing from requires:
-[build-system]
-requires = ["wheel"]
-build-backend = "setuptools.build_meta"  # setuptools not installed!
-```
-
-**Optional dependency groups must be installable independently.** All packages in `[project.optional-dependencies]` must be resolvable against the base `dependencies`. The `eval` group in this project (`inspect-ai`, `ragas`, `deepeval`) should be validated that their version constraints don't conflict with `anthropic>=0.40.0`. These are heavy ML packages with complex dependency trees.
-
-**Missing `requires-python` upper bound.** The current spec `requires-python = ">=3.10"` has no upper bound. This is a common deliberate choice, but means the package will be offered to Python 4.x when it exists. If you depend on CPython-specific behavior, add an upper bound like `>=3.10,<4`.
-
-**`tool.setuptools.packages.find` with `include` patterns.** The current config:
-
-```toml
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["core*", "hooks*"]
-```
-
-This correctly includes `core` and `hooks` packages. However, `eval` and `scripts` are not included. If `eval/__init__.py` or `scripts/` should be importable from an installed package, they need to be added. If they are standalone scripts only, this is correct — but `eval/` has an `__init__.py` which may suggest it is intended as an importable package.
-
-**`dev` dependencies belong in `[project.optional-dependencies]`, not `[tool.poetry.dev-dependencies]` or a separate `requirements-dev.txt`.** The current `dev` extra with `pytest>=8.0` is correct PEP 621 style. Do not also maintain a `requirements-dev.txt` that duplicates these — they will diverge.
-
-**Version specifiers: use `>=` for direct dependencies, avoid `==`.** Pinning with `==` in `[project.dependencies]` is correct for lockfiles (`requirements.txt`) but wrong for library/application `pyproject.toml` metadata — it prevents resolution for any downstream user. The current `anthropic>=0.40.0` is correct.
-
-**Missing `license` field.** PEP 621 makes `license` optional but its absence causes `unknown license` in PyPI metadata and may block some organizational package policies. Even for internal packages, adding `license = {text = "MIT"}` (or appropriate SPDX) avoids warnings.
 
 ---
 
-## Summary Table
+## Recommended Actions by Priority
 
-| Area | Risk | Severity | Codebase Status |
-|---|---|---|---|
-| SQLite WAL bug (3.7.0–3.51.2) | Silent corruption under concurrent writes | HIGH | Check `sqlite3.sqlite_version`; unmitigated |
-| WAL checkpoint starvation | Unbounded WAL growth, query slowdown | MEDIUM | `close()` truncates, but not after bulk writes |
-| Per-call connection + 5s timeout | Silent write drops under concurrent processes | MEDIUM | All methods open fresh connections; no retry |
-| FTS5 query injection (operator smuggling) | Wrong results / OperationalError from user input | HIGH | `search_fts()` passes raw query — unmitigated |
-| FTS5 content-table desync on crash | Stale search index | LOW | Manual FTS sync; no rebuild-on-startup |
-| Anthropic `input_tokens` undercounting | Wrong cost attribution when caching is active | MEDIUM | No caching currently; risk grows if added |
-| Rate limit burst (token bucket) | 429s in consolidation batch loops | MEDIUM | No application-level throttling in consolidator |
-| pytest `project_memory_store` env mutation | Parallel test failures | LOW | No xdist currently; risk if parallelism added |
-| File read TOCTOU (exists then read) | FileNotFoundError in concurrent scenarios | LOW | Low concurrency currently; pattern is fragile |
-| Missing `encoding=` on `read_text()` | Cross-platform encoding mismatch | LOW | Multiple read paths affected |
-| Missing `os.fsync()` before rename | Data loss on crash before OS flushes buffer | LOW | Trade-off against write latency |
-| pyproject.toml `eval` package not included | `eval/` importable in dev but not installed | LOW | `eval/__init__.py` exists but not in `find` |
+| Priority | Item | File(s) |
+|----------|------|---------|
+| HIGH | Add `conn.setbusytimeout(5000)` to `VecStore._connect()` | core/vec.py |
+| HIGH | Assert embedding dimension before INSERT and KNN | core/vec.py |
+| HIGH | Re-embed on content_hash change in `Memory.save()` | core/models.py |
+| HIGH | Wrap `consolidation_log` migration in `db.atomic()` | core/database.py |
+| HIGH | Verify system SQLite >= 3.51.3 at startup | core/database.py |
+| MEDIUM | Log WAL checkpoint result in `close_db()` | core/database.py |
+| MEDIUM | Standardize all datetimes to UTC-aware ISO | core/*.py |
+| MEDIUM | Move NLTK download to init; catch `OSError` | core/feedback.py, core/relevance.py |
+| MEDIUM | Log `message.usage` tokens in all LLM calls | core/llm.py and callers |
+| MEDIUM | Add `seen` guard against double-logging injections | core/retrieval.py |
+| LOW | Pool apsw connection for batch embedding loops | core/vec.py, hooks/pre_compact.py |
+| LOW | Add `ThreadSafeDatabaseMetadata` to `BaseModel.Meta` | core/models.py |
+| LOW | Centralize `CLAUDE_MODEL` constant | core/llm.py |
+| LOW | Guard against dense matrix in large-n TF-IDF | scripts/reduce.py, scripts/consolidate.py |
 
-**Gaps:** The setuptools and pytest readthedocs.io documentation was Cloudflare-blocked; pytest fixture scoping details were sourced from Context7's mirror of stable docs. The Anthropic SDK `anthropic>=0.40.0` changelog for exact deprecation timelines of beta endpoints was not independently verified beyond SDK source and official docs.
+---
+
+## Pitfalls Summary Table
+
+| Component | Pitfall | Severity | Mitigated in codebase? |
+|-----------|---------|----------|----------------------|
+| SQLite WAL | WAL-reset corruption bug (< 3.51.3) | HIGH | No — system SQLite not checked |
+| apsw VecStore | No busy timeout | HIGH | No |
+| sqlite-vec | Dimension mismatch silent wrong answers | HIGH | No |
+| Memory lifecycle | Stale embeddings after content update | HIGH | No |
+| peewee | `consolidation_log` migration not atomic | HIGH | No |
+| SQLite WAL | Checkpoint failure not logged | MEDIUM | No |
+| peewee | Naive vs. UTC datetime mixing | MEDIUM | No — mixed in retrieval.py |
+| peewee | `bulk_create` bypasses FTS sync | MEDIUM | Latent risk — not used yet |
+| Anthropic SDK | No usage token logging | MEDIUM | No |
+| Anthropic SDK | No custom timeout/retry config | MEDIUM | No |
+| NLTK | Network download blocks on first call | MEDIUM | Partial (quiet=True, not airgap-safe) |
+| NLTK | `OSError` from download not caught | MEDIUM | No |
+| Memory lifecycle | Double-logging tier1+tier2 overlap | LOW | No |
+| Memory lifecycle | Thompson sampling test non-determinism | LOW | No |
+| apsw VecStore | Extension loaded per-call (perf) | LOW | No |
+| apsw VecStore | `enable_load_extension` not available (some builds) | LOW | Partial (ImportError caught, not AttributeError) |
+| peewee | `_pk_exists()` N+1 SELECT on every save | LOW | No |
+| peewee | Stale `_vec_store` singleton after re-init | LOW | Avoidable at call sites |
+| sklearn | Dense matrix O(n²) at large n | LOW | Low risk at current store size |
+
+---
+
+**Gaps:**
+- apsw official documentation (readthedocs.io) was blocked by Cloudflare; apsw-specific threading guarantees beyond SQLite's thread-safety model were not verified from the official source. Thread-safety characterizations are from known SQLite behavior.
+- NLTK thread-safety across versions was not confirmed from official docs; `PorterStemmer` statelessness assessment is from known implementation behavior.
+- The macOS Sequoia system SQLite version was not confirmed in this session; `sqlite3.sqlite_version` at runtime is the authoritative check.
+- scikit-learn sparse matrix handling with `cosine_similarity` confirmed from sklearn API docs (accessed via prior Context7 checks) but not re-verified in this session.

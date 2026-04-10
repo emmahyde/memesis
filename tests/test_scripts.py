@@ -95,7 +95,8 @@ def _session_ids_in_sources(conn: sqlite3.Connection) -> set:
     rows = conn.execute("SELECT sources FROM observations").fetchall()
     ids: set = set()
     for (sources_json,) in rows:
-        ids.update(json.loads(sources_json))
+        for s in json.loads(sources_json):
+            ids.add(s["session"])
     return ids
 
 
@@ -179,11 +180,12 @@ class TestReduceDedup:
         """
         conn = _make_legacy_conn(tmp_path)
 
-        # Seed an observation manually with a known session in sources.
+        # Seed with structured source format
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("Legacy obs", "Content", "correction", "[]", json.dumps(["sess-legacy"])),
+            ("Legacy obs", "Content", "correction", "[]",
+             json.dumps([{"session": "sess-legacy"}])),
         )
         conn.commit()
 
@@ -205,14 +207,13 @@ class TestReduceDedup:
                 ).fetchall()
             )
         except sqlite3.OperationalError:
-            # Legacy path: scan sources.
             processed = set()
             for (sources_json,) in conn.execute(
                 "SELECT sources FROM observations"
             ).fetchall():
-                processed.update(json.loads(sources_json))
+                for s in json.loads(sources_json):
+                    processed.add(s["session"])
 
-        # The legacy session must appear in processed via the sources fallback.
         assert "sess-legacy" in processed
 
     def test_reinforce_increments_count_and_appends_session(self, tmp_path):
@@ -223,12 +224,13 @@ class TestReduceDedup:
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("Seed obs", "Content", "correction", "[]", json.dumps(["sess-1"])),
+            ("Seed obs", "Content", "correction", "[]",
+             json.dumps([{"session": "sess-1"}])),
         )
         conn.commit()
         obs_id = conn.execute("SELECT id FROM observations").fetchone()[0]
 
-        result = {"create": [], "reinforce": [{"id": obs_id}]}
+        result = {"create": [], "reinforce": [{"id": obs_id, "source_lines": [15]}]}
         apply_operations(conn, result, session_id="sess-2")
 
         row = conn.execute(
@@ -236,7 +238,12 @@ class TestReduceDedup:
         ).fetchone()
         count, sources_json = row
         assert count == 2
-        assert "sess-2" in json.loads(sources_json)
+        sources = json.loads(sources_json)
+        session_ids = {s["session"] for s in sources}
+        assert "sess-2" in session_ids
+        # Verify the new entry has line refs
+        sess2 = next(s for s in sources if s["session"] == "sess-2")
+        assert sess2["lines"] == [15]
 
     def test_reinforce_does_not_duplicate_same_session(self, tmp_path):
         """Reinforcing the same observation from the same session must not add the
@@ -246,7 +253,8 @@ class TestReduceDedup:
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("Seed obs", "Content", "correction", "[]", json.dumps(["sess-1"])),
+            ("Seed obs", "Content", "correction", "[]",
+             json.dumps([{"session": "sess-1"}])),
         )
         conn.commit()
         obs_id = conn.execute("SELECT id FROM observations").fetchone()[0]
@@ -261,7 +269,8 @@ class TestReduceDedup:
                 "SELECT sources FROM observations WHERE id = ?", (obs_id,)
             ).fetchone()[0]
         )
-        assert sources.count("sess-1") == 1
+        session_ids = [s["session"] for s in sources]
+        assert session_ids.count("sess-1") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +357,7 @@ class TestTFIDFDedup:
                 "word boundaries false positives prevent matching",
                 "correction",
                 "[]",
-                json.dumps(["sess-1"]),
+                json.dumps([{"session": "sess-1"}]),
             ),
         )
         # Second unrelated observation — needed so len(rows) >= 2 for TF-IDF
@@ -360,7 +369,7 @@ class TestTFIDFDedup:
                 "Never hit real external API endpoints in tests always mock import boundary.",
                 "workflow_pattern",
                 "[]",
-                json.dumps(["sess-1"]),
+                json.dumps([{"session": "sess-1"}]),
             ),
         )
         conn.commit()
@@ -409,7 +418,7 @@ class TestTFIDFDedup:
                 "for cleaner test isolation and automatic cleanup.",
                 "workflow_pattern",
                 "[]",
-                json.dumps(["sess-1"]),
+                json.dumps([{"session": "sess-1"}]),
             ),
         )
         conn.execute(
@@ -421,7 +430,7 @@ class TestTFIDFDedup:
                 "using unittest.mock.patch on the module import path.",
                 "workflow_pattern",
                 "[]",
-                json.dumps(["sess-1"]),
+                json.dumps([{"session": "sess-1"}]),
             ),
         )
         conn.commit()
@@ -452,12 +461,12 @@ class TestTFIDFDedup:
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("Obs A", "Content about topic A.", "correction", "[]", json.dumps(["sess-1"])),
+            ("Obs A", "Content about topic A.", "correction", "[]", json.dumps([{"session": "sess-1"}])),
         )
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("Obs B", "Content about topic B.", "correction", "[]", json.dumps(["sess-1"])),
+            ("Obs B", "Content about topic B.", "correction", "[]", json.dumps([{"session": "sess-1"}])),
         )
         conn.commit()
 
@@ -485,7 +494,7 @@ class TestTFIDFDedup:
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("Only observation", "Content.", "correction", "[]", json.dumps(["sess-1"])),
+            ("Only observation", "Content.", "correction", "[]", json.dumps([{"session": "sess-1"}])),
         )
         conn.commit()
 
@@ -578,7 +587,7 @@ class TestTFIDFDedup:
                 "content": "Content A.",
                 "count": 2,
                 "observation_type": "correction",
-                "sources": json.dumps(["sess-1", "sess-2"]),
+                "sources": json.dumps([{"session": "sess-1"}, {"session": "sess-2"}]),
             },
             {
                 "id": 2,
@@ -586,7 +595,7 @@ class TestTFIDFDedup:
                 "content": "Content B.",
                 "count": 1,
                 "observation_type": "workflow_pattern",
-                "sources": json.dumps(["sess-1"]),
+                "sources": json.dumps([{"session": "sess-1"}]),
             },
         ]
         clusters = {1: 0, 2: 1}
@@ -606,7 +615,7 @@ class TestTFIDFDedup:
                 "content": "Content A.",
                 "count": 1,
                 "observation_type": "correction",
-                "sources": json.dumps(["sess-1"]),
+                "sources": json.dumps([{"session": "sess-1"}]),
             }
         ]
         formatted = format_observations(obs)

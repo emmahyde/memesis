@@ -346,6 +346,93 @@ class ThreadNarrator:
         return content
 
 
+def _compute_arc_affect(valences: list[str], arc_type: str) -> dict:
+    """Compute arc affect trajectory from a sequence of somatic valences.
+
+    Detects emotional trajectory patterns across a thread's member memories.
+    The trajectory is inferred from the start and end valences and the
+    overall distribution of friction signals in the sequence.
+
+    Trajectory rules (applied in priority order):
+    - friction → delight  : "frustration_to_mastery"
+    - friction → neutral  : "frustration_to_resolution"
+    - neutral → delight   : "curiosity_to_mastery"
+    - surprise → neutral or delight : "discovery"
+    - all friction        : "sustained_struggle"
+    - default             : "neutral"
+
+    Args:
+        valences: Ordered list of somatic valence strings for thread members.
+            Each element is one of "friction", "delight", "surprise", "neutral".
+        arc_type: The narrative arc type from ThreadNarrator
+            (e.g. "correction_chain", "knowledge_building").
+
+    Returns:
+        dict with keys: trajectory, start, end, friction_ratio, arc_type.
+    """
+    if not valences:
+        return {
+            "trajectory": "neutral",
+            "start": "neutral",
+            "end": "neutral",
+            "friction_ratio": 0.0,
+            "arc_type": arc_type,
+        }
+
+    start = valences[0]
+    end = valences[-1]
+    friction_count = valences.count("friction")
+    friction_ratio = friction_count / len(valences)
+
+    if friction_ratio == 1.0:
+        trajectory = "sustained_struggle"
+    elif start in ("friction",) and end == "delight":
+        trajectory = "frustration_to_mastery"
+    elif start in ("friction",) and end == "neutral":
+        trajectory = "frustration_to_resolution"
+    elif start == "neutral" and end == "delight":
+        trajectory = "curiosity_to_mastery"
+    elif start == "surprise" and end in ("neutral", "delight"):
+        trajectory = "discovery"
+    else:
+        trajectory = "neutral"
+
+    return {
+        "trajectory": trajectory,
+        "start": start,
+        "end": end,
+        "friction_ratio": friction_ratio,
+        "arc_type": arc_type,
+    }
+
+
+def _get_member_valences(member_ids: list[str]) -> list[str]:
+    """Extract somatic valences from memory tags in position order.
+
+    Looks for tags matching "valence:<value>". If a memory has no valence
+    tag, "neutral" is used as the default.
+
+    Args:
+        member_ids: Memory IDs in chronological (position) order.
+
+    Returns:
+        List of valence strings, one per member_id.
+    """
+    valences = []
+    for mid in member_ids:
+        try:
+            mem = Memory.get_by_id(mid)
+            valence = "neutral"
+            for tag in mem.tag_list:
+                if tag.startswith("valence:"):
+                    valence = tag[len("valence:"):]
+                    break
+            valences.append(valence)
+        except Memory.DoesNotExist:
+            valences.append("neutral")
+    return valences
+
+
 def build_threads() -> list[dict]:
     """
     End-to-end thread building: detect clusters, narrate them, persist.
@@ -396,6 +483,19 @@ def build_threads() -> list[dict]:
             )
 
         result["id"] = thread.id
+
+        # Compute and store arc_affect when affect_signatures flag is enabled
+        if get_flag("affect_signatures"):
+            valences = _get_member_valences(valid_ids)
+            arc_affect = _compute_arc_affect(valences, result.get("arc_type", "knowledge_building"))
+            thread.arc_affect = json.dumps(arc_affect)
+            thread.save()
+            result["arc_affect"] = arc_affect
+            logger.info(
+                "Arc affect for thread %s: trajectory=%s friction_ratio=%.2f",
+                thread.id[:8], arc_affect["trajectory"], arc_affect["friction_ratio"],
+            )
+
         created.append(result)
 
         # Create resolved contradiction edges for correction_chain threads

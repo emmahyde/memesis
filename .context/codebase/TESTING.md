@@ -2,86 +2,104 @@
 
 ## Framework
 
-- **pytest**: `pytest>=8.0` in `[project.optional-dependencies] dev` (`pyproject.toml:21`). Installed; `__pycache__` shows `cpython-314-pytest-9.0.2.pyc` bytecode, so `pytest 9.0.2` is in use at runtime.
-- **No async test framework**: no `pytest-asyncio` dependency. All tests are synchronous.
-- **No xdist / parallelism**: no `pytest-xdist` dependency. Tests run in a single process.
-- **Runner**: `pytest` from the project root. `pytest.ini` sets `testpaths = tests eval`.
+- **pytest**: `pytest>=8.0` declared in `[project.optional-dependencies] dev` (`pyproject.toml:27`). Config in `pytest.ini`.
+- **No async test framework**: no `pytest-asyncio`. All tests are synchronous.
+- **No parallelism**: no `pytest-xdist`. Tests run in a single process.
+- **Runner**: `pytest` from the project root.
 
 ## Structure
 
-| Test Type   | Location         | Pattern                         |
-|-------------|------------------|---------------------------------|
-| Unit        | `tests/`         | `test_*.py` (class-grouped)     |
-| Integration | `tests/`         | `test_integration.py`           |
-| Eval        | `eval/`          | `*_test.py`, `*_audit.py`, `*_recall.py` |
+| Test Type   | Location  | Pattern                                     | Count |
+|-------------|-----------|---------------------------------------------|-------|
+| Unit        | `tests/`  | `test_<module>.py` (class-grouped)          | ~910  |
+| Integration | `tests/`  | `test_integration.py`                       | 5 classes |
+| Eval        | `eval/`   | `*_test.py`, `*_audit.py`, `*_recall.py`    | varies |
 
-- **`tests/`** contains 16 test modules, one per `core/` module or hook, plus `test_integration.py`.
-- **`eval/`** contains quality-oriented eval harnesses: `needle_test.py` (retrieval recall), `staleness_test.py`, `continuity_test.py`, `curation_audit.py`, `spontaneous_recall.py`.
-- Eval files use custom naming patterns; `eval/conftest.py` extends pytest collection via `pytest_collect_file` to include `*_audit.py` and `*_recall.py` (`eval/conftest.py:16-21`).
+- **`tests/`** contains ~22 test modules, one per `core/` module or hook, plus `test_integration.py` and `test_scripts.py`.
+- **`eval/`** contains quality-oriented eval harnesses: `needle_test.py`, `staleness_test.py`, `continuity_test.py`, `curation_audit.py`, `spontaneous_recall.py`, `live_retrieval_test.py`, `metrics_test.py`, `longmemeval_test.py`.
+- **`eval/conftest.py`** extends pytest collection via `pytest_collect_file` to include `*_audit.py` and `*_recall.py` files (`eval/conftest.py:18-23`).
+- **`pytest.ini`** configuration (`pytest.ini:1-6`):
+  ```ini
+  [pytest]
+  testpaths = tests eval
+  python_files = test_*.py *_test.py
+  python_classes = Test*
+  python_functions = test_*
+  ```
 
 ## Patterns
 
 ### Mocking
 
-- **Anthropic API**: always mocked; no test hits a real API endpoint. `tests/conftest.py` pops `CLAUDE_CODE_USE_BEDROCK` from `os.environ` at import time to prevent accidental Bedrock calls (`tests/conftest.py:12`).
-- **`unittest.mock.patch`** patches `anthropic.Anthropic` at the module level: `with patch("core.consolidator.anthropic.Anthropic") as mock_cls:`. The mock chain is `mock_cls.return_value.messages.create.return_value = <mock_msg>`. Example: `tests/test_consolidator.py:176`.
-- **`patch.object` for internal methods**: integration tests patch `consolidator._call_llm` directly as `with patch.object(consolidator, "_call_llm", return_value=decisions_list):` to skip the JSON-parse layer (`tests/test_integration.py:130`). This is the preferred pattern in integration tests where exact API call count is irrelevant.
-- **`side_effect` for multi-call sequences**: retry tests use `mock_cls.return_value.messages.create.side_effect = [bad_response, good_response]` to simulate first-call failure and second-call success (`tests/test_consolidator.py:549`).
-- **`wraps=` for spy pattern**: `patch.object(tmp_store, "update", wraps=tmp_store.update)` lets the real method run while recording call args (`tests/test_consolidator.py:376`).
-- **`capture_create` side effect**: some tests capture the exact prompt text sent to the LLM by using a closure as `side_effect` (`tests/test_consolidator.py:509-515`).
-- **`monkeypatch.setenv`**: used for `HOME` overrides in storage init tests (`tests/test_storage.py:22`). This is the pytest-native way; the `project_memory_store` fixture in `tests/conftest.py:36-50` uses raw `os.environ` mutation with manual restore instead (noted in `ecosystem-pitfalls.md` as a parallelism risk).
+- **Anthropic API always mocked**: no test hits a real API endpoint. `tests/conftest.py:12` pops `CLAUDE_CODE_USE_BEDROCK` from `os.environ` at import time to prevent accidental Bedrock calls.
+- **`unittest.mock.patch` on `call_llm`**: the standard pattern patches the transport function at the caller's module: `with patch("core.reconsolidation.call_llm", return_value=llm_response):`. The mock returns pre-built JSON strings that the caller parses as normal. Example: `tests/test_reconsolidation.py:46`.
+- **`patch.object` for internal methods**: integration tests patch higher-level methods like `consolidator._call_llm` directly to skip the JSON-parse layer. Example: `tests/test_integration.py`.
+- **`side_effect` for multi-call sequences**: retry tests use `side_effect = [bad_response, good_response]` to simulate first-call failure and second-call success (`tests/test_consolidator.py`).
+- **Capture closures**: some tests capture the exact prompt text sent to the LLM by using a closure as `side_effect` to record call arguments (`tests/test_consolidator.py`).
+- **No Bedrock embedding mocks**: tests that would exercise `embed_for_memory` skip or mock at the `get_vec_store()` level since Bedrock calls are not mocked at the boto3 layer.
 
 ### Fixtures
 
-- **`tests/conftest.py`** provides three shared fixtures:
-  - `temp_dir` — `function`-scoped, `tempfile.mkdtemp()` + `shutil.rmtree` teardown. Note: this is the manual pattern; `tmp_path` (pytest built-in) is preferred in newer tests such as `test_consolidator.py`.
-  - `memory_store` — `function`-scoped `MemoryStore(base_dir=str(temp_dir))` with `store.close()` in teardown. Calling `store.close()` is required to checkpoint the WAL and prevent EMFILE exhaustion under load.
-  - `project_memory_store` — `function`-scoped, mutates `os.environ['HOME']` with try/finally restore. Uses a fixed project context of `/Users/test/my-project`.
+- **Shared fixtures in `tests/conftest.py`** (`tests/conftest.py:20-50`):
+  - `temp_dir` -- `function`-scoped, `tempfile.mkdtemp()` + `shutil.rmtree` teardown.
+  - `memory_store` -- calls `init_db(base_dir=str(temp_dir))` + `close_db()` on teardown. Yields the `base_dir` Path.
+  - `project_memory_store` -- mutates `os.environ['HOME']` with try/finally restore; uses `init_db(project_context='/Users/test/my-project')`.
 
-- **`eval/conftest.py`** provides eval-specific fixtures:
-  - `eval_store` — clean `MemoryStore` per eval, WAL checkpoint on teardown.
-  - `seeded_store` — pre-seeded with 20 synthetic memories across all 4 stages (5 per stage), using `seed_store()` helper.
-  - `eval_engine` / `seeded_engine` — `RetrievalEngine` bound to the respective stores.
-  - `lifecycle` — `LifecycleManager` bound to `eval_store`.
-  - `FIXED_SEED = 42` constant for reproducible data generation (not yet wired into Python `random`; present for future use).
+- **Local `base` fixtures** redefined in most test modules using pytest's built-in `tmp_path`:
+  ```python
+  @pytest.fixture
+  def base(tmp_path):
+      init_db(base_dir=str(tmp_path / "memory"))
+      yield
+      close_db()
+  ```
+  This pattern is used in `test_retrieval.py`, `test_consolidator.py`, `test_reconsolidation.py`, `test_models.py`, `test_graph.py`, `test_causal_edges.py`, and others. Each test module defines its own `base` fixture for DB isolation.
 
-- **Local `tmp_store` fixtures** redefined in test modules that prefer `tmp_path` over the shared `temp_dir`/`memory_store` chain: `tests/test_consolidator.py:31-33`, `tests/test_relevance.py:22-24`. This avoids the `tempfile.mkdtemp` lifecycle mismatch with pytest's cleanup.
+- **Eval fixtures in `eval/conftest.py`** (`eval/conftest.py:248-361`):
+  - `eval_store` -- clean Peewee database per eval.
+  - `seeded_store` -- pre-seeded with 20 synthetic memories across 4 stages (5 per stage).
+  - `live_store` -- seeded from real observations DB (`eval/eval-observations.db`); skips if DB not found.
+  - `eval_engine` / `seeded_engine` / `live_engine` -- `RetrievalEngine` bound to respective stores.
+  - `lifecycle` -- `LifecycleManager` bound to `eval_store`.
+  - `FIXED_SEED = 42` constant for reproducible data generation.
+
+- **Helper factory functions**: most test modules define `_create_memory()` or `_make_memory()` helpers that call `Memory.create(...)` with sensible defaults. These are module-local, not shared fixtures. Examples in `test_retrieval.py:45-64`, `test_consolidator.py:62-74`, `test_integration.py:33-46`.
 
 ### Test class organization
 
-Unit tests are grouped into `class Test<Feature>:` blocks. Integration tests use `class Test<Scenario>:` with descriptive scenario names. This grouping is consistent throughout `test_storage.py` (`TestMemoryStoreCRUD`, `TestMemoryStoreSearch`, `TestMemoryStoreAtomicity`, `TestMemoryStoreFTS`, etc.) and `test_consolidator.py` (`TestConsolidateKeep`, `TestConsolidatePrune`, `TestConsolidatePromote`, `TestContradictionResolution`, etc.).
+Tests are grouped into `class Test<Feature>:` blocks named after the capability being tested. Examples:
+- `test_retrieval.py`: `TestHybridSearch`, `TestCrystallizedHybrid`, `TestThompsonSampling`, `TestProvenanceSignals`, `TestActiveTensions`, `TestAffectAwareThreadOrdering`
+- `test_consolidator.py`: `TestConsolidateKeep`, `TestConsolidatePrune`, `TestConsolidatePromote`, `TestContradictionResolution`, `TestMalformedJsonHandling`
+- `test_causal_edges.py`: `TestSchemaMigration`, `TestReconsolidationCausalEdges`, `TestContradictionEdges`, `TestArcAffect`
+- `test_models.py`: `TestDatabaseInit`, `TestMemoryCRUD`, `TestMemorySearch`, `TestFTS`, `TestContentHash`
 
-### Spacing effect: manual DB timestamp manipulation
+Integration tests use `class Test<Scenario>:` with descriptive scenario names: `TestFullLifecycleEphemeralToCrystallized`, `TestLearnMemoryExplicitly`, `TestForgetMemory` (`tests/test_integration.py`).
 
-The lifecycle integration test needs to prove that reinforcements span multiple calendar days. Since tests run in milliseconds, `test_integration.py` backdates `consolidation_log.timestamp` entries via raw SQL after the fact (`tests/test_integration.py:165-177`). This is an intentional test-only workaround; production sessions naturally span days.
+### Database isolation pattern
 
-### Schema migration tests
+Every test gets its own SQLite database via `tmp_path`. The standard teardown calls `close_db()` which issues `PRAGMA wal_checkpoint(TRUNCATE)` before closing. This prevents WAL file handle leaks across tests.
 
-`test_storage.py::TestMemoryStoreMetadata::test_schema_migration_adds_project_context_column` manually creates an old-schema SQLite DB (without `project_context` in `retrieval_log`) then initialises a `MemoryStore` pointing at it and asserts the column is added. This validates the `ALTER TABLE ... ADD COLUMN` migration guard (`tests/test_storage.py:383-409`).
+### Timestamp manipulation for time-dependent tests
 
-### Eval synthetic data
-
-`eval/conftest.py` defines `SYNTHETIC_MEMORIES` — a list of 20 dicts covering all four stages (5 ephemeral, 5 consolidated, 5 crystallized, 5 instinctive) with realistic content. `seed_store()` creates them all in a fresh store. Eval fixtures use `seeded_store` for read-heavy recall/audit tests and `eval_store` for write-heavy tests that need a clean slate.
+Tests that need to prove multi-day behavior (e.g., spacing effect, spaced repetition) backdate timestamps via raw SQL or direct field assignment since tests complete in milliseconds. Example: `test_integration.py` backdates `consolidation_log.timestamp` entries.
 
 ## Running Tests
 
-- **All tests (unit + eval)**: `pytest` from project root. `pytest.ini` covers both `tests` and `eval` directories.
+- **All tests (unit + eval)**: `pytest`
 - **Unit tests only**: `pytest tests/`
 - **Eval suite only**: `pytest eval/`
-- **Single file**: `pytest tests/test_storage.py`
-- **Single test**: `pytest tests/test_consolidator.py::TestConsolidateKeep::test_keep_calls_store_create`
+- **Single file**: `pytest tests/test_retrieval.py`
 - **Single class**: `pytest tests/test_consolidator.py::TestContradictionResolution`
-- **Watch mode**: `watchexec -e py -- pytest tests/` (uses `watchexec` from `CLAUDE.md` tools)
+- **Single test**: `pytest tests/test_consolidator.py::TestConsolidateKeep::test_keep_calls_store_create`
+- **Watch mode**: `watchexec -e py -- pytest tests/`
 - **Verbose output**: `pytest -v`
 - **Stop on first failure**: `pytest -x`
-- **No real API calls**: guaranteed by `os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)` in `tests/conftest.py:12` and the mock pattern used in every test that exercises LLM code paths.
+- **No real API calls**: guaranteed by `os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)` in `tests/conftest.py:12` and the mock pattern in every test that exercises LLM code paths.
 
 ## Coverage Gaps
 
-The following areas have no dedicated test files:
-
-- `hooks/append_observation.py`, `hooks/consolidate_cron.py`, `hooks/session_start.py` — tested only indirectly via `tests/test_hooks.py` (which covers `pre_compact.py` and `user_prompt_inject.py`).
-- `scripts/` — `consolidate.py`, `diagnose.py`, `heartbeat.py`, `reduce.py`, `scan.py`, `seed.py` — no `tests/test_scripts.py`.
-- `core/ingest.py` — has `tests/test_ingest.py` but `NativeMemoryIngestor.ingest()` depends on a real `~/.claude/memory` directory structure, so tests likely mock filesystem access.
-- FTS5 query injection — `search_fts()` passes raw user-supplied query strings to FTS5 without sanitization. The `ecosystem-pitfalls.md` flags this as HIGH severity but there are no tests covering the injection boundary.
-- `busy_timeout` absence — no test asserts that concurrent write operations behave correctly under contention; the missing `PRAGMA busy_timeout` (noted in `ecosystem-stack.md`) is untested.
+- **Hooks**: `hooks/append_observation.py`, `hooks/consolidate_cron.py`, `hooks/session_start.py` are tested indirectly via `tests/test_hooks.py` (which covers `pre_compact.py` and `user_prompt_inject.py` directly).
+- **Scripts**: `scripts/scan.py`, `scripts/reduce.py`, `scripts/consolidate.py` have partial coverage via `tests/test_scripts.py`. `scripts/diagnose.py`, `scripts/heartbeat.py`, `scripts/seed.py`, `scripts/dashboard.py`, `scripts/cost.py`, `scripts/compare.py` have no test coverage.
+- **Embedding/VecStore integration**: vector operations are tested only via `test_models.py::TestVecEnabled` and `test_models.py::TestVecUnavailableFallback`. No tests exercise `VecStore.search_vector` with actual embeddings (Bedrock calls not mocked at boto3 layer).
+- **Thompson sampling non-determinism**: `_thompson_rerank` uses `random.betavariate` without seeding. Tests that depend on retrieval order will produce non-deterministic results. Current tests avoid asserting ranked order.
+- **Concurrent write contention**: no tests exercise dual-connection (peewee + apsw) contention scenarios.

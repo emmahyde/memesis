@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memesis Memory Lifecycle</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a0f; color: #c8c8d0; padding: 40px; }
+  h1 { font-size: 24px; color: #e0e0e8; margin-bottom: 8px; }
+  .subtitle { font-size: 13px; color: #666; margin-bottom: 40px; }
+
+  .pipeline { display: flex; gap: 0; align-items: flex-start; margin: 40px 0; }
+
+  .stage-box {
+    flex: 1;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 20px;
+    position: relative;
+    min-height: 200px;
+  }
+  .stage-box.ephemeral { border-color: #444; background: #111118; }
+  .stage-box.consolidated { border-color: #3a5a3a; background: #0f1a0f; }
+  .stage-box.crystallized { border-color: #3a3a6a; background: #0f0f1a; }
+  .stage-box.instinctive { border-color: #6a3a3a; background: #1a0f0f; }
+
+  .stage-header {
+    font-size: 14px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+  .ephemeral .stage-header { color: #888; }
+  .consolidated .stage-header { color: #6a9a6a; }
+  .crystallized .stage-header { color: #7a7aaa; }
+  .instinctive .stage-header { color: #aa6a6a; }
+
+  .stage-desc { font-size: 11px; color: #555; margin-bottom: 16px; line-height: 1.4; }
+
+  .criteria {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 4px;
+    padding: 12px;
+    margin-bottom: 12px;
+  }
+  .criteria-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .criteria ul { font-size: 12px; color: #999; list-style: none; }
+  .criteria li { margin-bottom: 4px; }
+  .criteria li::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 8px; }
+  .ephemeral .criteria li::before { background: #444; }
+  .consolidated .criteria li::before { background: #4a7a4a; }
+  .crystallized .criteria li::before { background: #5a5a8a; }
+  .instinctive .criteria li::before { background: #8a4a4a; }
+
+  .arrow-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100px;
+    min-height: 200px;
+    position: relative;
+  }
+  .arrow-up {
+    font-size: 11px;
+    color: #4a8a4a;
+    text-align: center;
+    line-height: 1.3;
+  }
+  .arrow-down {
+    font-size: 11px;
+    color: #8a4a4a;
+    text-align: center;
+    line-height: 1.3;
+    margin-top: 12px;
+  }
+  .arrow-symbol { font-size: 20px; }
+
+  .flags-section { margin-top: 40px; }
+  .flags-section h2 { font-size: 16px; color: #e0e0e8; margin-bottom: 16px; }
+
+  .flag-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .flag-card {
+    border: 1px solid #252530;
+    border-radius: 6px;
+    padding: 14px;
+    background: #111118;
+  }
+  .flag-name { font-size: 13px; font-weight: 600; color: #aaa; margin-bottom: 4px; }
+  .flag-stage { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .flag-desc { font-size: 11px; color: #777; line-height: 1.4; }
+
+  .flag-card.retrieval .flag-name { color: #7a7aaa; }
+  .flag-card.lifecycle .flag-name { color: #6a9a6a; }
+  .flag-card.observation .flag-name { color: #aa8a4a; }
+  .flag-card.quality .flag-name { color: #aa6a6a; }
+
+  .demotion-section { margin-top: 40px; }
+  .demotion-section h2 { font-size: 16px; color: #e0e0e8; margin-bottom: 16px; }
+
+  .flow-diagram {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 20px 0;
+    flex-wrap: wrap;
+  }
+  .flow-step {
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 8px 14px;
+    font-size: 12px;
+    color: #999;
+    background: #111118;
+  }
+  .flow-step.active { border-color: #4a8a4a; color: #6a9a6a; }
+  .flow-arrow { color: #444; font-size: 16px; }
+
+  table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+  th { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 1px; text-align: left; padding: 8px 12px; border-bottom: 1px solid #252530; }
+  td { font-size: 12px; color: #999; padding: 8px 12px; border-bottom: 1px solid #1a1a22; }
+  td.action { color: #6a9a6a; }
+  td.demote { color: #aa6a6a; }
+</style>
+</head>
+<body>
+
+<h1>Memesis Memory Lifecycle</h1>
+<p class="subtitle">How observations are promoted, demoted, and deprecated across stages</p>
+
+<!-- Main pipeline -->
+<div class="pipeline">
+  <div class="stage-box ephemeral">
+    <div class="stage-header">Ephemeral</div>
+    <div class="stage-desc">Raw session observations. Created during reduce from transcripts. Short-lived — promoted or pruned during consolidation.</div>
+    <div class="criteria">
+      <div class="criteria-label">Entry criteria</div>
+      <ul>
+        <li>Any observation extracted by reduce</li>
+        <li>No quality gate — everything starts here</li>
+      </ul>
+    </div>
+    <div class="criteria">
+      <div class="criteria-label">Exit triggers</div>
+      <ul>
+        <li>Consolidation (LLM decides keep/prune/promote)</li>
+        <li>Deprecation after 30 days of no activity</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="arrow-container">
+    <div class="arrow-up">
+      <div class="arrow-symbol">&rarr;</div>
+      LLM consolidation<br>decides "keep"
+    </div>
+    <div class="arrow-down">
+      <div class="arrow-symbol">&larr;</div>
+      deprecated if<br>stale 30 days
+    </div>
+  </div>
+
+  <div class="stage-box consolidated">
+    <div class="stage-header">Consolidated</div>
+    <div class="stage-desc">Validated observations that passed the LLM quality gate. Accumulate reinforcement count as they're seen in more sessions.</div>
+    <div class="criteria">
+      <div class="criteria-label">Entry criteria</div>
+      <ul>
+        <li>LLM consolidation marked "keep" or "promote"</li>
+        <li>Or: direct creation by reduce with count &ge; 1</li>
+      </ul>
+    </div>
+    <div class="criteria">
+      <div class="criteria-label">Promotion criteria (to crystallized)</div>
+      <ul>
+        <li>reinforcement_count &ge; 3</li>
+        <li>Spaced reinforcement: reinforcements span &ge; 2 distinct days</li>
+        <li>Purpose: spacing effect prevents flash-in-the-pan patterns</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="arrow-container">
+    <div class="arrow-up">
+      <div class="arrow-symbol">&rarr;</div>
+      3+ reinforcements<br>across 2+ days
+    </div>
+    <div class="arrow-down">
+      <div class="arrow-symbol">&larr;</div>
+      10+ injections,<br>0 usage
+    </div>
+  </div>
+
+  <div class="stage-box crystallized">
+    <div class="stage-header">Crystallized</div>
+    <div class="stage-desc">Durable patterns confirmed by repetition. Eligible for token-budgeted Tier 2 injection. Query-aware retrieval can surface these.</div>
+    <div class="criteria">
+      <div class="criteria-label">Entry criteria</div>
+      <ul>
+        <li>Promoted from consolidated (3+ spaced reinforcements)</li>
+      </ul>
+    </div>
+    <div class="criteria">
+      <div class="criteria-label">Promotion criteria (to instinctive)</div>
+      <ul>
+        <li>importance &ge; 0.85</li>
+        <li>usage_count &ge; 1 (model actually referenced it)</li>
+        <li>Manual curation / self-reflection can also promote</li>
+      </ul>
+    </div>
+    <div class="criteria">
+      <div class="criteria-label">Demotion criteria (back to consolidated)</div>
+      <ul>
+        <li>injection_count &ge; 10 AND usage_count = 0</li>
+        <li>"Injected 10 times but never used" = not valuable</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="arrow-container">
+    <div class="arrow-up">
+      <div class="arrow-symbol">&rarr;</div>
+      importance &ge; 0.85<br>+ actually used
+    </div>
+    <div class="arrow-down">
+      <div class="arrow-symbol">&larr;</div>
+      self-reflection<br>invalidation
+    </div>
+  </div>
+
+  <div class="stage-box instinctive">
+    <div class="stage-header">Instinctive</div>
+    <div class="stage-desc">Core identity memories. Always injected into every session — no query needed, no token budget. The "this is who you are" layer.</div>
+    <div class="criteria">
+      <div class="criteria-label">Entry criteria</div>
+      <ul>
+        <li>Promoted from crystallized (high importance + proven usage)</li>
+        <li>Or: self-reflection creates directly</li>
+      </ul>
+    </div>
+    <div class="criteria">
+      <div class="criteria-label">Protection</div>
+      <ul>
+        <li>Ghost coherence checks validate consistency</li>
+        <li>Self-reflection can demote if no longer accurate</li>
+        <li>Reconsolidation can update content while preserving stage</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- Processing pipeline flow -->
+<h2 style="margin-top: 50px; font-size: 16px; color: #e0e0e8;">Processing Pipeline</h2>
+<div class="flow-diagram">
+  <div class="flow-step">transcripts/</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step active">scan.py</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step">summaries-*.jsonl</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step active">reduce.py</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step">observations.db</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step active">consolidator.py</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step">memory store</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step active">lifecycle.py</div>
+  <div class="flow-arrow">&rarr;</div>
+  <div class="flow-step">promotions / demotions</div>
+</div>
+
+<!-- Flag influence map -->
+<div class="flags-section">
+  <h2>Feature Flags &mdash; Where They Act</h2>
+  <div class="flag-grid">
+    <div class="flag-card observation">
+      <div class="flag-name">habituation_baseline</div>
+      <div class="flag-stage">Acts at: consolidation (pre-LLM)</div>
+      <div class="flag-desc">Suppresses routine events before the LLM sees them. Prevents common-but-uninteresting observations from entering the store. Acts as a noise gate on the input to consolidation.</div>
+    </div>
+    <div class="flag-card observation">
+      <div class="flag-name">orienting_detector</div>
+      <div class="flag-stage">Acts at: consolidation (pre-LLM)</div>
+      <div class="flag-desc">Detects novel or surprising events that warrant attention. Biases toward observations that break established patterns. Complements habituation by amplifying the unusual.</div>
+    </div>
+    <div class="flag-card observation">
+      <div class="flag-name">somatic_markers</div>
+      <div class="flag-stage">Acts at: consolidation (post-LLM)</div>
+      <div class="flag-desc">Assigns emotional valence and importance based on affect signals. Sets the importance score that later determines promotion eligibility. High-affect events get higher importance.</div>
+    </div>
+    <div class="flag-card observation">
+      <div class="flag-name">replay_priority</div>
+      <div class="flag-stage">Acts at: consolidation (pre-LLM)</div>
+      <div class="flag-desc">Sorts observations by salience before the LLM processes them. Affects attention ordering — salient observations appear first in the prompt and get more careful LLM treatment.</div>
+    </div>
+    <div class="flag-card retrieval">
+      <div class="flag-name">prompt_aware_tier2</div>
+      <div class="flag-stage">Acts at: retrieval (Tier 2)</div>
+      <div class="flag-desc">Gates whether the query-aware hybrid RRF path is used when a user prompt is available. Without it, Tier 2 always uses the static importance-sorted path regardless of query.</div>
+    </div>
+    <div class="flag-card retrieval">
+      <div class="flag-name">thompson_sampling</div>
+      <div class="flag-stage">Acts at: retrieval (reranking)</div>
+      <div class="flag-desc">Stochastic reranking using Thompson sampling (Beta distribution). Trades precision for exploration — may push well-ranked memories out of the token budget in favor of less-seen ones.</div>
+    </div>
+    <div class="flag-card retrieval">
+      <div class="flag-name">graph_expansion</div>
+      <div class="flag-stage">Acts at: retrieval (candidate pool)</div>
+      <div class="flag-desc">Adds 1-hop neighbor memories (connected by shared narrative threads or tag co-occurrence) to the candidate pool. Surfaces related context but can displace direct matches under tight budgets.</div>
+    </div>
+    <div class="flag-card lifecycle">
+      <div class="flag-name">sm2_spaced_injection</div>
+      <div class="flag-stage">Acts at: retrieval (filtering)</div>
+      <div class="flag-desc">SM-2 scheduling algorithm that puts recently-injected memories on cooldown. Prevents the same memories from appearing every session. Filters candidates before token budget is applied.</div>
+    </div>
+    <div class="flag-card lifecycle">
+      <div class="flag-name">saturation_decay</div>
+      <div class="flag-stage">Acts at: lifecycle (relevance scoring)</div>
+      <div class="flag-desc">Decays relevance score of memories that have been injected many times without being used. Part of compute_relevance() in the lifecycle engine, not the retrieval path.</div>
+    </div>
+    <div class="flag-card lifecycle">
+      <div class="flag-name">integration_factor</div>
+      <div class="flag-stage">Acts at: lifecycle (relevance scoring)</div>
+      <div class="flag-desc">Boosts relevance for memories that share tags or threads with the current context. Measures how well a memory integrates with the broader memory graph.</div>
+    </div>
+    <div class="flag-card lifecycle">
+      <div class="flag-name">provenance_signals</div>
+      <div class="flag-stage">Acts at: retrieval (context formatting)</div>
+      <div class="flag-desc">Adds provenance metadata (when created, how many times reinforced, source sessions) to injected memory context. Affects context size but not which memories are selected.</div>
+    </div>
+    <div class="flag-card quality">
+      <div class="flag-name">reconsolidation</div>
+      <div class="flag-stage">Acts at: lifecycle (post-session)</div>
+      <div class="flag-desc">Allows existing memories to be updated with new information from current session, not just reinforced. Enables content evolution without creating new memories.</div>
+    </div>
+    <div class="flag-card quality">
+      <div class="flag-name">ghost_coherence</div>
+      <div class="flag-stage">Acts at: lifecycle (validation)</div>
+      <div class="flag-desc">Validates that instinctive-tier self-model claims are coherent with observed behavior. Catches contradictions between what the system "believes" and what it does.</div>
+    </div>
+    <div class="flag-card quality">
+      <div class="flag-name">affect_awareness</div>
+      <div class="flag-stage">Acts at: consolidation + retrieval</div>
+      <div class="flag-desc">Tracks emotional valence of sessions and memories. Affects both what gets stored (emotional salience) and what gets retrieved (affect-matching).</div>
+    </div>
+  </div>
+</div>
+
+<!-- Transition rules table -->
+<div class="demotion-section">
+  <h2>All Transition Rules</h2>
+  <table>
+    <thead>
+      <tr><th>Transition</th><th>Direction</th><th>Trigger</th><th>Criteria</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>ephemeral &rarr; consolidated</td>
+        <td class="action">promote</td>
+        <td>consolidator.py (LLM decision)</td>
+        <td>LLM marks observation as "keep" during PreCompact</td>
+      </tr>
+      <tr>
+        <td>ephemeral &rarr; archived</td>
+        <td class="demote">deprecate</td>
+        <td>lifecycle.get_deprecation_candidates()</td>
+        <td>No injection or usage for 30+ days</td>
+      </tr>
+      <tr>
+        <td>consolidated &rarr; crystallized</td>
+        <td class="action">promote</td>
+        <td>lifecycle.get_promotion_candidates()</td>
+        <td>reinforcement_count &ge; 3, spanning &ge; 2 distinct days</td>
+      </tr>
+      <tr>
+        <td>crystallized &rarr; instinctive</td>
+        <td class="action">promote</td>
+        <td>lifecycle.can_promote() + self_reflection</td>
+        <td>importance &ge; 0.85 AND usage_count &ge; 1</td>
+      </tr>
+      <tr>
+        <td>crystallized &rarr; consolidated</td>
+        <td class="demote">demote</td>
+        <td>lifecycle.get_demotion_candidates()</td>
+        <td>injection_count &ge; 10 AND usage_count = 0 (injected but never used)</td>
+      </tr>
+      <tr>
+        <td>instinctive &rarr; crystallized</td>
+        <td class="demote">demote</td>
+        <td>self_reflection / ghost_coherence</td>
+        <td>Self-model contradiction detected, or no longer accurate</td>
+      </tr>
+      <tr>
+        <td>any &rarr; archived</td>
+        <td class="demote">deprecate</td>
+        <td>lifecycle.deprecate()</td>
+        <td>Manual or automated deprecation with rationale</td>
+      </tr>
+      <tr>
+        <td>any (content update)</td>
+        <td style="color: #aa8a4a;">reconsolidate</td>
+        <td>reconsolidation.py</td>
+        <td>New session evidence updates content while preserving stage</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p style="margin-top: 40px; font-size: 11px; color: #444;">
+  Key insight from eval: reinforcement count &ne; quality. 35% of top-20 most-reinforced observations
+  are codebase-derivable mechanics, not durable patterns. The promotion criteria (3+ spaced reinforcements)
+  gate on frequency, but need a quality gate too.
+</p>
+
+</body>
+</html>

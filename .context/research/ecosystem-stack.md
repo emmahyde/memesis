@@ -1,577 +1,624 @@
-# Research: Python 3.10+ Ecosystem Stack
+# Research: Python AI Memory Agent Ecosystem Stack
+
+> This file was originally created 2026-03-28 covering SQLite WAL, FTS5, Anthropic SDK async patterns, and pytest.
+> Updated 2026-03-30 to cover the full stack as deployed: Anthropic SDK, peewee ORM, sqlite-vec, apsw, scikit-learn, NLTK, and cross-cutting patterns for memory/AI agent systems, spaced repetition, graph-based knowledge, and reconsolidation.
+
+---
+
+## Part 1: Foundational Stack (2026-03-28)
 
 **Confidence:** HIGH (SQLite/WAL: official docs; FTS5: official docs; Anthropic SDK: Context7 + official; pytest: Context7 + official; atomic writes: official Python docs + codebase observation)
-**Date:** 2026-03-28
 
 **Sources:**
 - https://www.sqlite.org/wal.html
 - https://www.sqlite.org/fts5.html
-- https://context7.com/anthropics/anthropic-sdk-python (HIGH reputation)
-- https://context7.com/pytest-dev/pytest (HIGH reputation)
-- https://context7.com/pytest-dev/pytest-asyncio (HIGH reputation)
-- https://docs.python.org/3/library/tempfile.html
-- Codebase: `/Users/emma.hyde/projects/memesis/core/storage.py`
-- Codebase: `/Users/emma.hyde/projects/memesis/tests/conftest.py`
+- Context7: `/anthropics/anthropic-sdk-python` (High reputation)
+- Context7: `/pytest-dev/pytest` (High reputation)
+- Codebase: `core/database.py`, `core/models.py`, `core/vec.py`
 
----
+### 1. SQLite WAL Mode
 
-## 1. SQLite WAL Mode — Concurrency Patterns
-
-### Enabling and Configuration
-
-WAL mode is persistent once set — it survives connection restarts.
-
+WAL mode is persistent once set. The codebase correctly uses:
 ```python
-import sqlite3
-
-conn = sqlite3.connect("app.db")
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA synchronous=NORMAL")   # Fewer fsyncs; safe with WAL
-conn.execute("PRAGMA busy_timeout=5000")    # 5 s before raising OperationalError
-conn.execute("PRAGMA wal_autocheckpoint=1000")  # Checkpoint after ~4 MB
+db.init(str(dp), pragmas={
+    "journal_mode": "wal",
+    "synchronous": "normal",
+    "busy_timeout": 5000,
+})
 ```
 
-`synchronous=NORMAL` is safe with WAL because durability is provided by the checkpoint fsync, not by every write. This is a meaningful throughput improvement over the default `FULL`.
+`synchronous=NORMAL` is safe with WAL. `busy_timeout=5000` prevents immediate `OperationalError` on concurrent access. Shutdown pattern: `PRAGMA wal_checkpoint(TRUNCATE)` before close (implemented in `close_db()`).
 
-### Concurrency Model
+**Concurrency model:**
+- Multiple simultaneous readers: fully concurrent
+- Reader + writer: concurrent
+- Two simultaneous writers: second blocks (single WAL)
 
-| Scenario | WAL behaviour |
-|---|---|
-| Multiple simultaneous readers | Fully concurrent — readers never block each other |
-| Reader + active writer | Both proceed concurrently |
-| Two simultaneous writers | Second writer blocks (single WAL file) |
-| Reader blocking checkpoint | Checkpoint cannot complete until reader releases |
+**Limitations:** No network filesystems (requires `-shm` file). Not a concern for local `~/.claude/memory/index.db`.
 
-The main concurrency risk is **checkpoint starvation**: a long-running read transaction prevents the WAL from being truncated, causing unbounded file growth. Mitigate by:
-- Keeping read transactions short
-- Running `PRAGMA wal_checkpoint(TRUNCATE)` on explicit close/shutdown
-- Using `busy_timeout` so writers back off gracefully
+### 2. SQLite FTS5 External Content Tables
 
-### Shutdown / Close Pattern
+The `memories_fts` table uses `content='memories', content_rowid='rowid'` — the FTS index stores only the inverted index; text is read from the content table on demand. This is the correct pattern for keeping DB compact.
 
-The codebase already implements the correct close pattern — checkpoint on explicit `close()` and again in `__del__`:
-
-```python
-def close(self) -> None:
-    try:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.OperationalError:
-        pass
-```
-
-`TRUNCATE` is preferred over `PASSIVE` when the goal is to reclaim disk space at shutdown. `PASSIVE` is preferred during normal operation (non-blocking).
-
-### WAL Limitations
-
-- **No network filesystems.** WAL requires shared-memory (`-shm` file); NFS/SMB/cloud storage will corrupt. Local disk only.
-- **Page size is fixed** once WAL mode is enabled.
-- **Transactions >1 GB** risk I/O errors. Not a concern for this codebase.
-- **Read-only mounts** require write access to the `-shm` file (or a directory it can create one in). Relaxed in SQLite 3.22.0+.
-
-### SQLITE_BUSY Handling
-
-```python
-import sqlite3
-import time
-
-def execute_with_retry(conn, sql, params=(), max_attempts=3):
-    """Retry on SQLITE_BUSY with exponential backoff."""
-    for attempt in range(max_attempts):
-        try:
-            return conn.execute(sql, params)
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_attempts - 1:
-                time.sleep(0.1 * (2 ** attempt))
-                continue
-            raise
-```
-
-Prefer `busy_timeout` (via PRAGMA) over manual retry for most cases — it handles the busy spin inside SQLite's C layer. Manual retry is appropriate only when you need custom backoff or circuit-breaker logic.
-
----
-
-## 2. SQLite FTS5 — Ranking and Tokenization
-
-### Tokenizer Selection
-
-| Tokenizer | Best for | Notes |
-|---|---|---|
-| `unicode61` (default) | General multilingual text | Strips diacritics; respects Unicode 6.1 separators |
-| `ascii` | ASCII-only content, code snippets | Faster; treats all non-ASCII as token chars |
-| `porter` | English prose where stemming helps recall | Wraps another tokenizer; query `run` matches `running` |
-| `trigram` | Substring/LIKE/GLOB queries | Each 3-char sequence is indexed; larger index |
-
-For this codebase (English markdown memories), `unicode61` is the right default. Add `porter` as a wrapper if fuzzy recall matters more than precision:
-
+**Tokenizer choice:** `unicode61` (default) is correct for English markdown. Adding `porter` as a wrapper gives stemmed recall (`running` matches `run`):
 ```sql
-CREATE VIRTUAL TABLE memories_fts USING fts5(
-    title, summary, tags, content,
-    content='memories',
-    content_rowid='rowid',
-    tokenize='porter unicode61 remove_diacritics 1'
-);
+tokenize='porter unicode61 remove_diacritics 1'
 ```
 
-The `content=` and `content_rowid=` options create a **content table** — the FTS index stores only the inverted index, not the text, keeping the DB compact. The tradeoff is that the index must be manually kept in sync with the content table (which `storage.py` already does via `_fts_insert` / `_fts_delete`).
-
-### Ranking with bm25()
-
-`rank` in FTS5 queries maps directly to `bm25()`. Lower is better (it returns a negative value scaled by match quality). The existing query pattern is correct:
-
-```sql
-SELECT m.*, rank
-FROM memories_fts
-JOIN memories m ON memories_fts.rowid = m.rowid
-WHERE memories_fts MATCH ?
-ORDER BY rank          -- ascending = best matches first
-LIMIT ?
-```
-
-**Column weighting** lets you boost title/tag matches over body matches:
-
+**Column weighting** for relevance tuning:
 ```sql
 ORDER BY bm25(memories_fts, 10.0, 5.0, 3.0, 1.0)
 -- weights:              title  summary  tags  content
 ```
 
-### Auxiliary Functions
-
-```sql
--- Highlighted snippet (good for UI display)
-SELECT snippet(memories_fts, 3, '<b>', '</b>', '…', 20)
-FROM memories_fts WHERE memories_fts MATCH ?;
-
--- Highlight full column
-SELECT highlight(memories_fts, 0, '[', ']')
-FROM memories_fts WHERE memories_fts MATCH ?;
-```
-
-### Optimization After Bulk Inserts
-
-```sql
-INSERT INTO memories_fts(memories_fts) VALUES('optimize');
-```
-
-Run this after bulk loading (e.g., a full re-index). It merges internal b-tree segments and reduces query latency.
-
-### detail Level Tradeoffs
-
-| detail | Index size | NEAR/phrase queries |
-|---|---|---|
-| `full` (default) | 100% | Supported |
-| `column` | ~50% | No position-sensitive queries |
-| `none` | ~18% | Only term existence |
-
-For this use case (semantic relevance, not exact phrase matching), `detail=column` is a worthwhile optimization if index size becomes a concern.
-
-### FTS5 Content Table Sync — Known Gap
-
-The current schema uses `content='memories'` but does **not** have database triggers keeping FTS in sync automatically. Instead, sync is done manually in Python (`_fts_insert`, `_fts_delete`). This is correct and intentional (triggers require `rowid` access that standard Python sqlite3 builds may not expose cleanly), but means any direct SQL writes to `memories` (e.g., in migrations or scripts) that bypass the Python layer will leave FTS stale. Document this constraint or add a `rebuild` helper:
-
+**FTS sync via Python vs triggers:** The codebase syncs manually in `Memory.save()` and `delete_instance()`. The SQLite FTS5 docs recommend SQL triggers (atomic with row writes, cannot be skipped by direct SQL). The risk: any `Memory.update(...).execute()` bulk call that touches FTS-indexed columns will desync the index. Currently safe because bulk updates only touch `last_injected_at`, `injection_count`, etc. (non-indexed). Add a `rebuild_fts()` utility for post-migration safety:
 ```python
-def rebuild_fts(self) -> None:
-    """Rebuild FTS index from scratch — use after bulk migrations."""
-    with sqlite3.connect(self.db_path) as conn:
-        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-        conn.commit()
+def rebuild_fts():
+    db.execute_sql("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
 ```
 
----
+**detail level tradeoff:**
+| detail | Index size | Phrase queries |
+|--------|-----------|----------------|
+| `full` (current default) | 100% | Yes |
+| `column` | ~50% | No |
+| `none` | ~18% | No |
 
-## 3. Anthropic Python SDK — Async Patterns and Error Handling
+`detail=column` is a worthwhile optimization if index size becomes a concern. For OR-joined keyword queries (current pattern), `column` is sufficient.
 
-### Client Instantiation
+### 3. Anthropic SDK — Sync vs Async, Error Handling
 
-| Client | Use case |
-|---|---|
-| `anthropic.Anthropic()` | Synchronous (scripts, hooks, cron jobs) |
-| `anthropic.AsyncAnthropic()` | Async applications, concurrent requests |
-| `anthropic.AnthropicBedrock()` | AWS Bedrock routing (as used in this codebase) |
+The codebase uses synchronous `Anthropic()` in scripts and hooks — correct for sequential, non-event-loop contexts.
 
-The existing codebase uses synchronous `Anthropic()` / `AnthropicBedrock()`. This is correct for the hook/cron context where calls are sequential and there is no event loop.
-
-### Async Pattern (for future async consumers)
-
-```python
-import asyncio
-from anthropic import AsyncAnthropic
-
-client = AsyncAnthropic()  # Reads ANTHROPIC_API_KEY from env
-
-async def call_claude(prompt: str) -> str:
-    message = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        temperature=0,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text
-
-asyncio.run(call_claude("Hello"))
-```
-
-For streaming (token-by-token output, long generations):
-
-```python
-async def stream_claude(prompt: str) -> str:
-    async with client.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        async for text in stream.text_stream:
-            print(text, end="", flush=True)
-    final = await stream.get_final_message()
-    return final.usage.output_tokens
-```
-
-### Error Handling — Full Hierarchy
-
+**Error hierarchy:**
 ```python
 from anthropic import (
-    Anthropic,
-    APIError,            # Base for all API errors
-    APIConnectionError,  # Network-level failure
-    RateLimitError,      # 429 — back off and retry
-    APIStatusError,      # 4xx/5xx not otherwise classified
-    AuthenticationError, # 401 — bad or missing API key
-    BadRequestError,     # 400 — invalid request parameters
-)
-
-def call_with_handling(client, prompt: str) -> str | None:
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.content[0].text
-    except AuthenticationError:
-        raise  # Configuration error; don't retry
-    except RateLimitError:
-        raise  # Caller should back off; SDK auto-retries by default
-    except APIConnectionError as e:
-        # Transient network failure; SDK will retry automatically
-        raise
-    except BadRequestError as e:
-        # Prompt too long, bad parameters, etc — not retriable
-        raise ValueError(f"Bad request: {e.message}") from e
-    except APIStatusError as e:
-        raise RuntimeError(f"API error {e.status_code}: {e.message}") from e
-```
-
-The SDK performs **automatic retries** with exponential backoff for transient errors (429, 5xx, network errors) by default. You can configure retry count:
-
-```python
-client = Anthropic(max_retries=3)  # default is 2
-```
-
-### Retry and Timeout Configuration
-
-```python
-import httpx
-from anthropic import Anthropic, DefaultHttpxClient
-
-client = Anthropic(
-    timeout=httpx.Timeout(60.0, connect=5.0),  # 60s read, 5s connect
-    max_retries=3,
-    http_client=DefaultHttpxClient(
-        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)
-    ),
+    APIConnectionError,  # Network; SDK auto-retries
+    RateLimitError,      # 429; SDK auto-retries
+    AuthenticationError, # 401; don't retry
+    BadRequestError,     # 400; prompt too long, bad params
+    APIStatusError,      # Other 4xx/5xx
 )
 ```
 
-### JSON Response Extraction Pattern
+SDK default: 2 retries with exponential backoff for transient errors. Configure: `Anthropic(max_retries=3)`.
 
-The codebase's `_parse_decisions` / retry-on-malformed-JSON pattern is a documented production pattern. Codify it as a reusable utility:
-
+**JSON extraction pattern** (used in `reconsolidation.py`, `consolidator.py`):
 ```python
-import json
-import re
+import re, json
 
-def extract_json(text: str) -> dict | list:
-    """Strip optional markdown fences and parse JSON."""
+def extract_json(text: str):
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
     text = re.sub(r"^```(?:json)?\s*\n", "", text)
     text = re.sub(r"\n```$", "", text.strip())
     return json.loads(text)
 ```
 
----
+### 4. pytest — Fixtures and Database Testing
 
-## 4. pytest — Fixtures and Database Testing
+The codebase uses `function`-scoped fixtures with `tmp_path` — correct for per-test isolation. Always call `close_db()` in teardown to checkpoint WAL and release file handles.
 
-### Fixture Scope Strategy
-
-| Scope | When to use | Notes |
-|---|---|---|
-| `function` (default) | Per-test isolation; mutating state | Most tests; safe default |
-| `module` | Shared read-only setup within a file | Schema creation, seeding |
-| `session` | Expensive one-time setup | Test infrastructure, external services |
-
-The codebase uses `function`-scoped `memory_store` — correct because tests write to the store and need isolation.
-
-### Recommended DB Test Fixtures
-
-```python
-# conftest.py
-import shutil
-import tempfile
-from pathlib import Path
-import pytest
-from core.storage import MemoryStore
-
-@pytest.fixture
-def temp_dir(tmp_path):
-    """Use pytest's built-in tmp_path — cleaner than mkdtemp."""
-    return tmp_path
-
-@pytest.fixture
-def memory_store(tmp_path):
-    """Isolated MemoryStore per test. WAL checkpoint on teardown."""
-    store = MemoryStore(base_dir=str(tmp_path))
-    yield store
-    store.close()  # Checkpoint WAL, release file handles
-
-@pytest.fixture(scope="session")
-def read_only_store(tmp_path_factory):
-    """Session-scoped store for read-only tests — faster when seeding is expensive."""
-    base = tmp_path_factory.mktemp("readonly_store")
-    store = MemoryStore(base_dir=str(base))
-    # Seed once here
-    store.create("seed.md", "Seed content", {"stage": "consolidated", "title": "Seed"})
-    yield store
-    store.close()
-```
-
-**Why `tmp_path` over `tempfile.mkdtemp`:** `tmp_path` is managed by pytest (auto-cleanup, unique per test, pathlib.Path already), reducing boilerplate. The existing conftest uses `mkdtemp` manually — migrating to `tmp_path` removes the manual `shutil.rmtree` in the fixture.
-
-### Parameterization Patterns
-
-```python
-import pytest
-
-# Simple parametrize
-@pytest.mark.parametrize("stage", ["ephemeral", "consolidated", "crystallized", "instinctive"])
-def test_create_in_stage(memory_store, stage):
-    mid = memory_store.create("test.md", "content", {"stage": stage, "title": "T"})
-    result = memory_store.get(mid)
-    assert result["stage"] == stage
-
-# Indirect parametrize — fixture receives param
-@pytest.fixture
-def staged_store(request, tmp_path):
-    store = MemoryStore(base_dir=str(tmp_path))
-    store.create("seed.md", "content", {"stage": request.param, "title": "Seed"})
-    yield store
-    store.close()
-
-@pytest.mark.parametrize("staged_store", ["ephemeral", "consolidated"], indirect=True)
-def test_list_by_stage(staged_store):
-    results = staged_store.list_by_stage("ephemeral")
-    # ...
-
-# ID-labelled params for readable test names
-@pytest.mark.parametrize("query,expected_count", [
-    pytest.param("python", 1, id="single-term"),
-    pytest.param("python AND memory", 1, id="and-query"),
-    pytest.param("nonexistent_xyzzy", 0, id="no-match"),
-])
-def test_fts_search(memory_store, query, expected_count):
-    ...
-```
-
-### Async Test Pattern (pytest-asyncio)
-
-```toml
-# pyproject.toml
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-```
-
-```python
-import pytest_asyncio
-from anthropic import AsyncAnthropic
-
-@pytest_asyncio.fixture
-async def async_client():
-    client = AsyncAnthropic()
-    yield client
-    await client.close()
-
-async def test_async_call(async_client):
-    # With asyncio_mode=auto, no @pytest.mark.asyncio needed
-    response = await async_client.messages.create(...)
-    assert response.content
-```
-
-### Mocking Anthropic in Tests
-
-The existing conftest strips `CLAUDE_CODE_USE_BEDROCK` to prevent accidental real API calls. For unit tests that exercise LLM-calling code paths, use `unittest.mock`:
-
-```python
-from unittest.mock import MagicMock, patch
-
-def test_consolidate_calls_llm(memory_store):
-    mock_response = MagicMock()
-    mock_response.content = [MagicMock(text='{"decisions": []}')]
-
-    with patch("anthropic.Anthropic.messages") as mock_messages:
-        mock_messages.create.return_value = mock_response
-        # test Consolidator...
-```
-
-Or use `pytest-httpx` (already resolvable via Context7) to intercept at the HTTP layer for more realistic tests.
-
-### Test Isolation for WAL Databases
-
-Key: always call `store.close()` in fixture teardown. Without it:
-- `-wal` and `-shm` files accumulate in `tmp_path`
-- On macOS, open file handles may prevent `tmp_path` cleanup
-- Under heavy parallel test runs, EMFILE (too many open files) can occur
-
-The existing `conftest.py` already calls `store.close()` — maintain this pattern.
+Key: `playhouse.migrate` and `SqliteExtDatabase` tests should mock `db.init()` to a tmp path, not use a real `~/.claude` path.
 
 ---
 
-## 5. Atomic File Writes in Python
+## Part 2: Full Stack Ecosystem (2026-03-30)
 
-### The Problem
+**Confidence:** HIGH for library APIs (Context7, official docs) / MEDIUM for cross-cutting agent patterns
+**Sources:**
+- Context7: `/anthropics/anthropic-sdk-python` (127 snippets, High reputation)
+- Context7: `/asg017/sqlite-vec` (294 snippets, High reputation)
+- Context7: `/coleifer/peewee` (2199 snippets, High reputation)
+- Official SQLite FTS5 docs: https://www.sqlite.org/fts5.html
+- Python 3.10 changelog: https://docs.python.org/3.10/whatsnew/3.10.html
+- Direct codebase analysis: all `core/*.py`, `scripts/reduce.py`, `scripts/consolidate.py`, `requirements.txt`
 
-`Path.write_text()` and `open(..., 'w')` are **not atomic**. A crash mid-write leaves a truncated or corrupt file. For memory files (markdown), a corrupt write could silently lose data.
+---
 
-### Canonical Pattern: mkstemp + os.replace
+## Current Landscape
 
-This is what the codebase uses, and it is the correct approach:
+### Python 3.10+ Feature Adoption in This Codebase
 
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `X \| Y` union types | Partially adopted | Newer files use `bytes \| None`; older use `Optional[bytes]` |
+| `match`/`case` | Not used | Would clean up action routing in `reconsolidation.py` |
+| `@dataclass(slots=True)` | Not used | No dataclasses in codebase; Peewee Models used instead |
+| `tuple[A, B]` return hints | Adopted in newer files | `core/database.py` uses `tuple[Path, Path]` |
+| Parenthesized context managers | Not used | Single `with` blocks throughout |
+
+**Recommended adoption:** Use `match` for the `confirmed|contradicted|refined|unmentioned` action routing in `reconsolidation.py`. Use `X | Y` union syntax consistently across all new code.
+
+---
+
+## Library-by-Library Best Practices
+
+### Anthropic SDK (>=0.40.0)
+
+**Confidence:** HIGH (Context7, 127 snippets)
+
+**1. Tool runner loop (not yet used)**
+
+The SDK's `client.beta.messages.tool_runner` handles agentic tool loops automatically, with optional `compaction_control` for long-running agents:
 ```python
-import os
-import tempfile
+runner = client.beta.messages.tool_runner(
+    model="claude-sonnet-4-5-20250929",
+    max_tokens=4096,
+    tools=[search, done],
+    messages=[{"role": "user", "content": "..."}],
+    compaction_control={"enabled": True, "context_token_threshold": 5000}
+)
+for message in runner:
+    print(f"Stop reason: {message.stop_reason}")
+```
+This is the recommended upgrade path if memesis grows an agentic pipeline.
 
-def atomic_write(target_path: Path, content: str, encoding: str = "utf-8") -> None:
-    """Write content to target_path atomically via tmp file + rename."""
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=target_path.parent,  # Same filesystem — guarantees atomic rename
-        suffix=".tmp",
+**2. Token counting before injection**
+
+Pre-flight injection string size before sending to the model:
+```python
+token_count = client.messages.count_tokens(
+    model="claude-sonnet-4-5-20250929",
+    messages=[{"role": "user", "content": injection_string}],
+    system="..."
+)
+```
+Currently the codebase approximates `1 token ≈ 4 chars`. The SDK's exact counter is more reliable, especially for non-English content.
+
+**3. Extended thinking for reconsolidation**
+
+For complex contradiction resolution (deciding whether to merge vs. flag), `thinking={"type": "enabled", "budget_tokens": 2000}` gives the model space to reason before committing to a JSON decision array. Budget tokens are consumed from `max_tokens`. Minimum useful budget: ~2000 tokens.
+
+**4. Structured outputs via Pydantic**
+
+The SDK integrates Pydantic for typed JSON extraction, which would harden `reconsolidation.py`'s `json.loads(strip_markdown_fences(raw))` pattern. At the cost of a Pydantic dependency.
+
+**5. Model naming**
+
+Current usage: `claude-sonnet-4-6`. Explicit date-versioned IDs (`claude-sonnet-4-5-20250929`) are more stable for reproducibility in CI/test environments. The codebase's alias is valid for production.
+
+---
+
+### Peewee ORM (>=3.17)
+
+**Confidence:** HIGH (Context7, 2199 snippets)
+
+**1. Deferred database — correct pattern**
+
+`SqliteDatabase(None)` + `db.init(path, pragmas={...})` is canonical for library code. The codebase implements this correctly in `core/models.py` + `core/database.py`.
+
+**2. WAL pragmas — complete set**
+
+Current pragmas are good. The full recommended set for production:
+```python
+db.init(str(dp), pragmas={
+    "journal_mode": "wal",
+    "synchronous": "normal",
+    "busy_timeout": 5000,
+    "cache_size": -64000,   # 64MB — not currently set
+    "foreign_keys": 1,      # Not set; codebase uses TextField FKs intentionally
+})
+```
+`cache_size` omission is a minor performance gap. `foreign_keys` omission is intentional (TextField FKs bypass enforcement).
+
+**3. Schema migrations via `playhouse.migrate`**
+
+The codebase uses raw `ALTER TABLE` in `_run_migrations()`. The `playhouse.migrate.SqliteMigrator` is the canonical approach:
+```python
+from playhouse.migrate import SqliteMigrator, migrate
+migrator = SqliteMigrator(db)
+with db.atomic():
+    migrate(
+        migrator.add_column('memories', 'new_field', TextField(null=True)),
     )
-    try:
-        os.write(tmp_fd, content.encode(encoding))
-        os.close(tmp_fd)
-        os.replace(tmp_path, target_path)  # Atomic on POSIX; best-effort on Windows
-    except Exception:
-        try:
-            os.close(tmp_fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
 ```
+The manual approach works but is harder to audit. The playhouse version is self-documenting and wraps atomically.
 
-Critical requirements:
-1. **`dir=target_path.parent`** — temp file must be on the same filesystem as the target. Cross-device renames are not atomic.
-2. **`os.replace()`** — POSIX-atomic (rename syscall). Overwrites the destination in a single syscall. `shutil.move()` works but calls `os.rename` internally, which also works on same-filesystem — the codebase's use of `shutil.move` is functionally equivalent on POSIX.
-3. **Always `os.close(tmp_fd)` before `os.replace()`** — the file descriptor must be closed first to flush OS buffers.
+**4. `playhouse.sqlite_ext.SqliteExtDatabase`**
 
-### Python 3.12+ Alternative (delete_on_close)
+Extends `SqliteDatabase` with BM25 rank functions, `REGEXP`, and `json_contains()`. Since FTS5 is managed manually (for control over the content table pattern), upgrading is optional. The BM25 rank functions become useful if peewee ORM queries need to order by FTS rank without raw SQL.
 
+**5. N+1 prevention — current code is correct**
+
+The retrieval engine uses `.in_(ids)` batch queries and `{m.id: m for m in ...}` dict lookup. Peewee's `prefetch()` helper is an alternative for nested join hydration patterns.
+
+**6. `Memory._pk_exists()` cost**
+
+Called on every `save()` to determine insert vs update:
 ```python
-import tempfile, os
+# Current (2 queries per save):
+is_update = not force_insert and self.id and self._pk_exists()
 
-def atomic_write_312(target_path: Path, content: str) -> None:
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        dir=target_path.parent,
-        suffix=".tmp",
-        delete_on_close=False,   # Python 3.12+
-        encoding="utf-8",
-    ) as f:
-        f.write(content)
-        temp_name = f.name
-    os.replace(temp_name, target_path)
+# Better (1 query, lighter):
+is_update = not force_insert and self.id and Memory.select(Memory.id).where(Memory.id == self.id).exists()
 ```
+For high-frequency saves (batch reconsolidation), this matters.
 
-`delete_on_close=False` means the file persists after `close()` within the `with` block, enabling the subsequent `os.replace`. The file is still deleted if the context manager exits abnormally without reaching `os.replace`.
+**7. DateTime as `TextField` — known tradeoff**
 
-### Codebase Note
+All timestamps stored as ISO strings in `TextField`. Works correctly for ISO format string comparison. Loses peewee `DateTimeField` helpers (`.year`, `.month`, range queries). Not worth changing retroactively.
 
-The current `storage.py` implementation writes bytes via the `tmp_fd` file descriptor (`os.write(tmp_fd, content.encode('utf-8'))`), then uses `shutil.move`. This is correct. One minor improvement: add `os.fsync(tmp_fd)` before `os.close(tmp_fd)` if durability against power loss matters:
+**8. `playhouse.apsw_ext.APSWDatabase`**
 
-```python
-os.write(tmp_fd, content.encode('utf-8'))
-os.fsync(tmp_fd)   # Flush kernel buffers to disk
-os.close(tmp_fd)
-os.replace(tmp_path, target_path)
-```
-
-`os.fsync` has a performance cost (~1–5 ms per write on SSD). For memory files where data loss at the granularity of a power failure is acceptable, it can be omitted. For instinctive/crystallized memories that are hard to regenerate, `fsync` is advisable.
-
-### Markdown File I/O Best Practices
-
-- Always specify `encoding="utf-8"` explicitly — do not rely on locale-default encoding (varies on Windows).
-- Use `pathlib.Path` throughout; avoid mixing `str`-path and `Path` operations.
-- For reading, `Path.read_text(encoding="utf-8")` is fine (reads are inherently atomic at the OS page-cache level for normal file sizes).
-- Store files in the **same directory as the target** when creating temp files, not in `/tmp`, to guarantee same-filesystem atomicity.
+Peewee ships a playhouse adapter for apsw. The codebase separates apsw (for vec) from peewee (for relational) rather than unifying. This is the cleaner design given the extension-loading requirement.
 
 ---
 
-## 6. Cross-Cutting Patterns and Gaps
+### sqlite-vec (>=0.1.6) + apsw (>=3.46)
 
-### Connection-Per-Operation vs. Connection Pool
+**Confidence:** HIGH (Context7, 294 snippets)
 
-The current pattern (`with sqlite3.connect(...)`) opens a new connection per operation. This is safe and correct for WAL mode (each connection gets a consistent snapshot), but has overhead for high-frequency write paths. If write throughput becomes a bottleneck, consider a thread-local connection pool:
+**Why apsw over stdlib sqlite3:**
+On macOS, the system Python ships `sqlite3` without `enable_load_extension`. `apsw` bundles its own SQLite amalgamation and always enables extension loading. The codebase correctly routes all vec operations through apsw (`core/vec.py`).
 
+**1. Extension loading — correct pattern**
 ```python
-import threading
-
-_local = threading.local()
-
-def _get_conn(db_path: Path) -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(db_path, check_same_thread=False)
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute("PRAGMA synchronous=NORMAL")
-        _local.conn.execute("PRAGMA busy_timeout=5000")
-    return _local.conn
+conn = apsw.Connection(path)
+conn.enable_load_extension(True)
+conn.load_extension(sqlite_vec.loadable_path())
 ```
+`sqlite_vec.loadable_path()` returns the OS-correct path (`.so`/`.dylib`/`.dll`).
 
-This is only needed if profiling shows connection overhead. For the current use case (hooks run infrequently), per-operation connections are appropriate.
+**2. `serialize_float32` idiom**
 
-### Missing: pytest.ini / pyproject.toml Test Config
-
-The project does not have `[tool.pytest.ini_options]` in `pyproject.toml`. Recommended additions:
-
-```toml
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-# If using pytest-asyncio in future:
-# asyncio_mode = "auto"
-```
-
-### Missing: FTS Rebuild Utility
-
-Direct SQL writes (migrations, seed scripts) bypass `_fts_insert`. Add a `rebuild_fts()` method that issues `INSERT INTO memories_fts(memories_fts) VALUES('rebuild')` to resync from the content table. FTS5's `rebuild` command re-reads from `content='memories'` and regenerates the entire index.
-
-### Missing: Explicit busy_timeout
-
-`storage.py` enables WAL mode and `synchronous=NORMAL` but does not set `busy_timeout`. Under concurrent test runs or if a cron job and a hook overlap, writes without a timeout will immediately raise `OperationalError: database is locked`. Add:
-
+The codebase uses `struct.pack(f"{n}f", *vec)` manually. `sqlite_vec.serialize_float32(list)` is the idiomatic equivalent and slightly more readable:
 ```python
-conn.execute("PRAGMA busy_timeout=5000")
+from sqlite_vec import serialize_float32
+embedding_bytes = serialize_float32([0.1, 0.2, 0.3, ...])
 ```
 
-to `_init_db()`.
+**3. Metadata columns in vec0 — gap in current schema**
 
-**Gaps:**
-- FTS5 porter stemmer impact on recall has not been empirically measured for this codebase's actual memory content.
-- Anthropic SDK `max_retries` and `timeout` are not explicitly configured in `consolidator.py` — relies on SDK defaults (2 retries, 10 min timeout).
-- No benchmark exists for `detail=column` vs `detail=full` index size on real data.
-- `pytest-asyncio` and async test patterns are not yet needed but should be added to `dev` deps if async Anthropic calls are introduced.
+The current vec0 table:
+```sql
+CREATE VIRTUAL TABLE vec_memories USING vec0(
+    memory_id TEXT PRIMARY KEY,
+    embedding float[512]
+)
+```
+Filtered KNN requires a post-query JOIN to the `memories` table. Adding metadata columns enables in-scan filtering:
+```sql
+CREATE VIRTUAL TABLE vec_memories USING vec0(
+    memory_id TEXT PRIMARY KEY,
+    embedding float[512],
+    stage TEXT,
+    importance FLOAT
+);
+
+-- Then filtered KNN:
+SELECT memory_id, distance FROM vec_memories
+WHERE embedding MATCH ? AND k = 20 AND stage = 'crystallized'
+ORDER BY distance;
+```
+This would eliminate the Python-side filtering in `_crystallized_hybrid`. **Migration caveat:** vec0 tables cannot be `ALTER TABLE`'d; a new table + data copy is required.
+
+**4. Hybrid FTS + vector in pure SQL (alternative to Python RRF)**
+
+The standard SQL CTE pattern for hybrid search:
+```sql
+WITH fts_results AS (
+    SELECT rowid, rank FROM memories_fts WHERE memories_fts MATCH ?
+),
+vec_results AS (
+    SELECT memory_id, distance FROM vec_memories WHERE embedding MATCH ? AND k = 20
+),
+combined AS (
+    SELECT rowid AS id FROM fts_results
+    UNION ALL
+    SELECT memory_id AS id FROM vec_results
+)
+SELECT id FROM combined GROUP BY id;
+```
+The codebase implements RRF in Python. Both approaches are valid; Python RRF is more testable and debuggable.
+
+**5. Connection-per-operation**
+
+`VecStore` opens and closes an apsw connection per call. For the current use case (low-frequency memory lifecycle operations), this is correct and simpler than a pool. For higher-throughput scenarios, a persistent connection with a mutex would help.
+
+**6. `INSERT OR REPLACE` for upsert**
+
+The codebase uses `INSERT OR REPLACE INTO vec_memories` — correct for vec0 tables with a PRIMARY KEY column. Standard `ON CONFLICT DO UPDATE` syntax is not supported by vec0.
+
+---
+
+### scikit-learn (>=1.4)
+
+**Confidence:** HIGH for APIs, MEDIUM for optimization guidance
+
+**How it is used:**
+- `scripts/reduce.py`: `TfidfVectorizer` + `cosine_similarity` for near-duplicate detection within a batch before LLM review.
+- `scripts/consolidate.py`: Same TF-IDF clustering to group observations thematically before the consolidation LLM call.
+
+**1. Lazy import with graceful degradation — correct pattern**
+```python
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except ImportError:
+    return []  # or {}
+```
+sklearn is a soft quality-of-life dependency. The system degrades gracefully without it.
+
+**2. `TfidfVectorizer` parameters for small corpora**
+
+Current: `TfidfVectorizer(min_df=1, stop_words='english')` — correct for batches of tens to low hundreds. At scale: `min_df=2` reduces noise; `max_features=10000` caps memory.
+
+**3. Near-duplicate threshold**
+
+Standard thresholds for short-text (observation/memory) dedup:
+- `>= 0.92`: near-identical phrasing
+- `>= 0.85`: same idea, different words
+- `>= 0.75`: thematically related (not a duplicate)
+
+The 0.85–0.90 range is typical for dedup before LLM clustering.
+
+**4. Alternative: embedding-based dedup**
+
+Once vec embeddings exist in `VecStore`, TF-IDF can be replaced with cosine similarity over Titan v2 embeddings. This is semantically richer and reuses existing infrastructure:
+```python
+# Pseudo-code: compute pairwise cosine over stored embeddings
+embeddings = [vec_store.get_embedding(mid) for mid in batch_ids]
+# then struct.unpack + numpy or manual dot products
+```
+
+**5. Alternative clustering: `AgglomerativeClustering`**
+
+For thematic grouping before consolidation, agglomerative clustering produces cleaner topic clusters than threshold-based grouping when cluster count is unknown:
+```python
+from sklearn.cluster import AgglomerativeClustering
+clustering = AgglomerativeClustering(
+    n_clusters=None,
+    distance_threshold=0.3,
+    metric='cosine',
+    linkage='average'
+)
+labels = clustering.fit_predict(tfidf_matrix.toarray())
+```
+
+**6. `linear_kernel` vs `cosine_similarity` for sparse matrices**
+
+`cosine_similarity(tfidf)` computes on dense output. For sparse TF-IDF matrices, `linear_kernel` (assumes L2-normalized input) is faster:
+```python
+from sklearn.metrics.pairwise import linear_kernel
+tfidf_normalized = TfidfVectorizer(norm='l2').fit_transform(texts)
+sims = linear_kernel(tfidf_normalized)
+```
+
+---
+
+### NLTK (>=3.8)
+
+**Confidence:** HIGH for APIs
+
+**How it is used:**
+- `core/feedback.py`: Stopword removal + Porter stemming for keyword extraction from feedback text.
+- `core/relevance.py`: Same — for relevance/rehydration term matching.
+
+**1. Lazy download guard — correct pattern**
+```python
+try:
+    nltk.data.find('corpora/stopwords')
+    stop = set(nltk_stopwords.words('english'))
+except LookupError:
+    nltk.download('stopwords', quiet=True)
+    stop = set(nltk_stopwords.words('english'))
+```
+Do not call `download()` unconditionally in module bodies — it hits the network on every import in fresh environments.
+
+**2. `LookupError` fallback — correct**
+
+Both `core/feedback.py` and `core/relevance.py` handle `LookupError` (NLTK data unavailable) by degrading gracefully. This is the right pattern for environments with no internet access.
+
+**3. Stopword duplication**
+
+The codebase has two separate stopword sets:
+- NLTK `stopwords.words('english')` in `core/feedback.py` and `core/relevance.py`
+- Hardcoded `_STOP_WORDS` set in `core/models.py` (`Memory.tokenize_fts_query`)
+
+These are not identical. A single shared source (e.g., exporting from `core/feedback.py` or a `core/nlp.py` utility) would reduce drift risk.
+
+**4. `PorterStemmer` vs `SnowballStemmer`**
+
+`PorterStemmer` (current) is the original 1980 algorithm. `SnowballStemmer('english')` is its successor and produces more linguistically accurate stems. For keyword matching the difference is minor; either is acceptable.
+
+**5. `word_tokenize` vs `re.findall`**
+
+`core/models.py` uses `re.findall(r"[a-zA-Z0-9_'-]+", ...)`. NLTK's `word_tokenize` handles contractions more correctly (`"don't"` → `["do", "n't"]`) but requires the `punkt_tab` corpus download. For keyword extraction, the regex is faster and sufficient.
+
+**6. If sentence tokenization is added**
+
+`nltk.sent_tokenize` requires the `punkt_tab` corpus. Add to the download guard if this is introduced:
+```python
+nltk.download('punkt_tab', quiet=True)
+```
+
+---
+
+## Memory/AI Agent System Patterns
+
+### SM-2 Spaced Repetition (`core/spaced.py`)
+
+**Confidence:** HIGH (implementation confirmed; algorithm literature verified)
+
+The SM-2 algorithm is implemented correctly:
+- `injection_ease_factor` starts at 2.5 (standard)
+- `injection_interval_days` grows multiplicatively
+- Ease factor clamped `>= 1.3` (standard)
+- Binary feedback: "used" (q=5) and "not used" (q=1)
+
+**Algorithm comparison:**
+
+| Algorithm | Fit | Key difference | Effort to adopt |
+|-----------|-----|----------------|-----------------|
+| SM-2 (current) | Good | Proven, simple | — |
+| FSRS | Better | Probabilistic; models stability + retrievability separately | Medium |
+| Leitner boxes | Too simple | Categorical, not continuous | N/A |
+| Thompson sampling (current, in retrieval) | Complementary | Bandit-based explore/exploit; already implemented | — |
+
+**FSRS as upgrade path:** FSRS models `stability` (≈ `injection_interval_days`) and `retrievability` (`e^(-t/S)`) as separate parameters. Better calibrated for irregular review schedules. Four parameters per memory vs two for SM-2. Python implementation: search PyPI for `fsrs` or `py-fsrs` — not verified during this research.
+
+**SM-2 correctness note:** The current "refined" action in reconsolidation does not update the SM-2 schedule. A refinement is evidence the memory was actively processed — this could be treated as a successful recall (bump interval) rather than leaving the schedule untouched.
+
+---
+
+### Graph-Based Knowledge (`core/graph.py`, `core/models.py`)
+
+**Confidence:** HIGH (direct codebase analysis)
+
+**Current edge topology:**
+
+| Edge type | Direction | How created | Preserved across rebuild |
+|-----------|-----------|-------------|--------------------------|
+| `thread_neighbor` | bidirectional | `compute_edges()` | No (recomputable) |
+| `tag_cooccurrence` | bidirectional | `compute_edges()` | No (recomputable) |
+| `caused_by` | directed | reconsolidation | Yes (incremental) |
+| `refined_from` | directed | reconsolidation | Yes (incremental) |
+| `subsumed_into` | directed | crystallizer | Yes (incremental) |
+| `contradicts` | bidirectional | reconsolidation | Yes (incremental) |
+| `echo` | TBD | not yet wired | Yes (incremental) |
+
+**Established patterns this codebase follows correctly:**
+
+1. **Separation of recomputable vs incremental edges** — `RECOMPUTABLE_TYPES` is the right design. Structural edges (thread/tag) can be rebuilt; causal/semantic edges accumulate evidence.
+
+2. **Priority-tiered 1-hop expansion** — `_EDGE_PRIORITY` gives causal edges priority over structural. Matches "semantic neighborhood" pattern from GraphRAG literature.
+
+3. **Centroid similarity for neighbor re-ranking** — Computing centroid of seed embeddings then scoring neighbors is standard for "more like this set" retrieval. The manual implementation in `_centroid_similarities` is correct.
+
+4. **Contradiction resolution lifecycle** — `resolved`/`resolution` metadata on `contradicts` edges with `"superseded"` as a resolution type mirrors epistemic status tracking in knowledge management systems.
+
+**Patterns not yet implemented:**
+
+| Pattern | Description | Effort |
+|---------|-------------|--------|
+| Transitive closure (2-hop) | 1-hop currently; 2-hop increases recall for distant causal chains | Medium |
+| Edge weight decay | Static `weight` from creation time; decaying by age would improve neighbor ranking | Low |
+| Confidence decay on contradiction | Each contradiction flag decrements `importance` by a small delta | Low |
+| Resolution prompt | When tension unresolved for N sessions, trigger LLM to propose merged position | Medium |
+
+**Tag co-occurrence limit:** `if len(mids) < 2 or len(mids) > 20` skips singletons and overly-common tags. The upper bound of 20 prevents the `combinations(mids, 2)` from generating O(400) edges per popular tag. This is a correct optimization.
+
+---
+
+### Reconsolidation Pattern (`core/reconsolidation.py`)
+
+**Confidence:** HIGH (direct analysis + literature alignment)
+
+This is the most architecturally distinctive part of the system. It maps to neuroscience reconsolidation: retrieved memories are compared against new evidence and updated or flagged.
+
+**Design decisions that are correct:**
+
+1. **Batched LLM call per session** — One call for all injected memories. Correct cost/quality tradeoff.
+
+2. **Pre-flagged vs first-time contradictions** — The `pre_flagged_ids` snapshot before the main loop correctly distinguishes first-time contradictions (`resolved=False`) from repeat ones (`resolved=True, resolution="superseded"`). This prevents stale tensions accumulating indefinitely.
+
+3. **Causal edges + contradiction edges as complementary systems** — `causal_edges` tracks *why* a memory changed (directed, toward semantic neighbors); `contradiction_tensors` tracks *what it conflicts with* (bidirectional, surfaced in Tier 2.6).
+
+4. **Cosine similarity fallback** — When embeddings are unavailable, `_rank_by_similarity` falls back to `[(cid, 0.5) for cid in candidates[:limit]]`. Correct graceful degradation.
+
+**Gaps / improvement opportunities:**
+
+| Pattern | Description | Effort |
+|---------|-------------|--------|
+| Refined memories update SM-2 | Refinement should count as successful recall — bump interval | Low |
+| Confidence decay on contradiction | `importance -= 0.05` on contradiction flag | Low |
+| Resolution LLM prompt | After N sessions of unresolved tension, propose merged position | Medium |
+| Multi-session contradiction evidence | Track how many sessions contradict a memory before auto-deprecating | Medium |
+
+---
+
+### Hybrid Retrieval (`core/retrieval.py`)
+
+**Confidence:** HIGH (direct analysis + algorithm literature)
+
+**RRF constant `rrf_k=60`:** From the original RRF paper (Cormack et al., 2009). Values 20–80 produce similar rankings; 60 is the de-facto standard. Correct.
+
+**`rrf_k` duplication:** The constant is defined as a default argument in `hybrid_search` and re-defined as `_RRF_K = 60` in `_crystallized_hybrid`. A module-level constant would prevent drift.
+
+**Thompson sampling** (`_thompson_rerank`): The `Beta(usage_count+1, max(injection-usage,0)+1)` formulation is correct. `Beta(1,1)` is uniform for cold-start memories — this gives unproven memories a fair chance of exploration. The `max(..., 0)+1` guard handles data anomalies.
+
+**Token budget:** `200_000 * 4` approximates 200K-token context at 4 chars/token. This is appropriate for English prose. Should be updated if the deployed model's context window changes.
+
+**Three-tier architecture (Tier 1/2/2.5/2.6):**
+| Tier | Content | Decision |
+|------|---------|----------|
+| 1 | Instinctive (behavioral guidelines) | Always inject, no filter |
+| 2 | Crystallized (context knowledge) | Hybrid RRF + SM-2 + Thompson sampling + budget |
+| 2.5 | Narrative threads | Thread arcs for injected memories, affect-aware ordering |
+| 2.6 | Active tensions | Unresolved contradiction edges, greedy budget packed |
+
+The affective reordering in Tier 2.5 (frustration > 0.3 → prioritize `frustration_to_mastery` arcs) is a novel pattern with no direct literature analog — it is a reasonable heuristic grounded in motivational psychology.
+
+---
+
+## Recommended Stack
+
+| Technology | Purpose | Why | Confidence |
+|------------|---------|-----|------------|
+| `anthropic>=0.40.0` | LLM calls | Standard, type-safe, streaming; `tool_runner` for future agentic pipelines | HIGH |
+| `peewee>=3.17` + `SqliteDatabase(None)` | Relational storage | Deferred init, `db.atomic()` for FTS sync, `playhouse.migrate` for migrations | HIGH |
+| `playhouse.migrate.SqliteMigrator` | Schema migrations | Replace raw `ALTER TABLE` with typed, transactional migration helpers | HIGH |
+| `sqlite-vec>=0.1.6` + `apsw>=3.46` | Vector search | Required combo on macOS; `loadable_path()` for cross-platform extension loading | HIGH |
+| `struct.pack` / `sqlite_vec.serialize_float32` | Embedding serialization | Either works; `serialize_float32` is slightly more idiomatic | HIGH |
+| SM-2 (current) or FSRS | Spaced injection scheduling | SM-2 is proven for binary feedback; FSRS for richer stability modeling | MEDIUM |
+| `sklearn.TfidfVectorizer` + `cosine_similarity` | Pre-LLM dedup + clustering | Lazy import + graceful degradation; correct for small batches | HIGH |
+| `nltk.corpus.stopwords` + `PorterStemmer` | Keyword extraction | Lazy download + `LookupError` fallback is the right pattern | HIGH |
+| Python `match`/`case` (3.10+) | Action routing | Not yet adopted; would clean up `if action == "confirmed"` chains in reconsolidation | MEDIUM |
+
+---
+
+## Patterns to Follow
+
+### FTS5 External Content Table (confirmed correct)
+
+Manual sync via `_fts_insert`/`_fts_delete`/`_fts_delete_from_db` in overridden `save()` and `delete_instance()`. The key constraint: bulk `Memory.update(...).execute()` bypasses sync. Currently safe; add a `rebuild_fts()` for post-migration recovery.
+
+### Deferred Singleton Database
+
+`SqliteDatabase(None)` + `db.init(path, pragmas)` is canonical for library/tool code. Never initialize a real database at module import time.
+
+### Feature Flag Guards
+
+`from .flags import get_flag` before optional behavior is a clean, low-overhead toggle system. All new optional behaviors should follow this pattern.
+
+### Embedding Availability Guard
+
+`VecStore.available` as a property checked before any vector operation. `VecStore.__init__` sets `self._available = False` on any failure. This makes the vector subsystem an optional enhancement with no hard runtime dependency.
+
+### Graceful Degradation for Optional Dependencies
+
+All optional imports (`sklearn`, `sqlite_vec`, `boto3`) follow try/except + capability flag or return-early patterns. This is the correct approach for a system that must function in constrained environments.
+
+---
+
+## Pitfalls
+
+1. **apsw connection leak on exception** — Requires `try/finally: conn.close()`. The codebase implements this correctly. Omitting `finally` would leak connections.
+
+2. **FTS desync on bulk writes** — `Memory.update(...).execute()` bypasses `save()` override. Safe today (bulk updates touch non-FTS fields). A footgun if future bulk updates touch `title`, `summary`, `tags`, or `content`.
+
+3. **NLTK `punkt_tab` not downloaded** — `stopwords` is guarded. If `word_tokenize` or `sent_tokenize` is added, `punkt_tab` must also be downloaded separately.
+
+4. **sklearn TF-IDF on empty corpus** — `TfidfVectorizer.fit_transform([])` raises `ValueError`. The codebase wraps in try/except and returns `[]`/`{}`. Correct.
+
+5. **`Memory._pk_exists()` on every save** — One extra `SELECT` per save. For batch reconsolidation, this adds query overhead. Optimize with `.exists()` query.
+
+6. **ISO datetime string comparison** — All timestamps are `TextField`. ISO format string ordering (`"2026-01-01" < "2026-02-01"`) happens to be correct for UTC strings. Fragile if format inconsistencies are introduced (timezone suffixes, etc.).
+
+7. **vec0 metadata columns not used for filtering** — All KNN results fetched then post-filtered in Python (`exclude_ids`). Adding `stage` and `importance` as metadata columns would push filtering into the KNN scan, reducing result set before Python processing.
+
+8. **`rrf_k=60` in two places** — `hybrid_search` default and `_crystallized_hybrid`'s `_RRF_K = 60`. Extract to module-level constant.
+
+9. **Stopword set duplication** — Hardcoded `_STOP_WORDS` in `models.py` and NLTK `stopwords.words('english')` in `feedback.py`/`relevance.py` are not identical. Consolidate into a shared utility.
+
+10. **Titan v2 embedding dimensions** — `DEFAULT_DIMENSIONS = 512` in `embeddings.py`, hardcoded `embedding float[512]` in `VecStore`. These must stay in sync. A shared constant or config value would prevent drift.
+
+---
+
+## Gaps
+
+- **FSRS Python library:** No specific PyPI package (`py-fsrs`, `fsrs`) was verified as actively maintained. Would need direct evaluation before recommending.
+- **apsw 3.46 changelog:** readthedocs was blocked by Cloudflare during research. apsw best practices inferred from sqlite-vec docs and codebase inspection.
+- **scikit-learn 1.4+ new features:** The 1.4 release introduced `set_output` API and metadata routing. Not relevant to current usage patterns; stable TF-IDF/cosine_similarity APIs verified.
+- **NLTK 3.8+ changelog:** No specific new features verified. Usage is stable API surface (`stopwords`, `PorterStemmer`).
+- **RRF empirical tuning:** The `rrf_k=60` default has not been empirically evaluated against this codebase's actual memory corpus. A small evaluation over retrieval logs could determine if a different constant improves precision.

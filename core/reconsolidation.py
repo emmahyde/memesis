@@ -50,6 +50,7 @@ def reconsolidate(
     session_content: str,
     session_id: str,
     model: str = "claude-sonnet-4-6",
+    session_affect: dict | None = None,
 ) -> dict:
     """Run reconsolidation for injected memories against session content.
 
@@ -58,6 +59,10 @@ def reconsolidate(
         session_content: Combined conversation + ephemeral text.
         session_id: Current session identifier.
         model: LLM model to use.
+        session_affect: Optional AffectState dict from the current session.
+            When provided and the affect_signatures flag is True, edge
+            metadata will include an "affect" key with frustration,
+            momentum, and dominant_valence.
 
     Returns:
         {"confirmed": [id, ...], "contradicted": [id, ...], "refined": [id, ...]}
@@ -151,15 +156,48 @@ def reconsolidate(
 
     # Create causal edges for refined/contradicted memories
     if get_flag("causal_edges"):
-        _create_causal_edges(decisions, mem_by_id, injected_ids, session_id, now)
+        _create_causal_edges(
+            decisions, mem_by_id, injected_ids, session_id, now,
+            session_affect=session_affect,
+        )
 
     # Create bidirectional contradiction edges
     if get_flag("contradiction_tensors"):
         _create_contradiction_edges(
-            decisions, mem_by_id, result["confirmed"], pre_flagged_ids, session_id, now
+            decisions, mem_by_id, result["confirmed"], pre_flagged_ids, session_id, now,
+            session_affect=session_affect,
         )
 
     return result
+
+
+def _build_affect_meta(session_affect: dict | None) -> dict | None:
+    """Build affect sub-dict for edge metadata from a session_affect dict.
+
+    Returns a dict with frustration, momentum, and dominant_valence keys,
+    or None if affect_signatures flag is off or session_affect is missing.
+    """
+    from .flags import get_flag
+
+    if session_affect is None or not get_flag("affect_signatures"):
+        return None
+
+    frustration = session_affect.get("frustration", 0.0)
+    satisfaction = session_affect.get("satisfaction", 0.0)
+    momentum = session_affect.get("momentum", 0.0)
+
+    if frustration > 0.4:
+        dominant_valence = "friction"
+    elif satisfaction > 0.6:
+        dominant_valence = "delight"
+    else:
+        dominant_valence = "neutral"
+
+    return {
+        "frustration": frustration,
+        "momentum": momentum,
+        "dominant_valence": dominant_valence,
+    }
 
 
 def _create_causal_edges(
@@ -168,6 +206,7 @@ def _create_causal_edges(
     injected_ids: list[str],
     session_id: str,
     timestamp: str,
+    session_affect: dict | None = None,
 ) -> None:
     """Create directed causal edges from reconsolidation decisions.
 
@@ -206,11 +245,15 @@ def _create_causal_edges(
         # Use sqlite-vec to rank the pool by similarity to the affected memory
         targets = _rank_by_similarity(mid, list(pool), limit=_MAX_CAUSAL_EDGES)
 
-        meta = json.dumps({
+        meta_dict = {
             "evidence": evidence,
             "session_id": session_id,
             "created_at": timestamp,
-        })
+        }
+        affect_meta = _build_affect_meta(session_affect)
+        if affect_meta is not None:
+            meta_dict["affect"] = affect_meta
+        meta = json.dumps(meta_dict)
 
         for target_id, similarity in targets:
             # Avoid duplicate edges
@@ -240,6 +283,7 @@ def _create_contradiction_edges(
     pre_flagged_ids: set[str],
     session_id: str,
     timestamp: str,
+    session_affect: dict | None = None,
 ) -> None:
     """Create bidirectional contradicts edges from reconsolidation decisions.
 
@@ -285,7 +329,7 @@ def _create_contradiction_edges(
             if confirmed_id == mid:
                 continue
 
-            meta = json.dumps({
+            meta_dict = {
                 "evidence": evidence,
                 "session_id": session_id,
                 "created_at": timestamp,
@@ -293,7 +337,11 @@ def _create_contradiction_edges(
                 "resolution": resolution,
                 "detected_by": "reconsolidation",
                 "detected_at": timestamp,
-            })
+            }
+            affect_meta = _build_affect_meta(session_affect)
+            if affect_meta is not None:
+                meta_dict["affect"] = affect_meta
+            meta = json.dumps(meta_dict)
 
             # A → B
             a_to_b_exists = MemoryEdge.select().where(

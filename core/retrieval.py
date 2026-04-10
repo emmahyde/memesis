@@ -15,13 +15,14 @@ from typing import TYPE_CHECKING, Optional
 from peewee import fn
 
 from .database import get_base_dir, get_vec_store
-from .models import Memory, NarrativeThread, RetrievalLog, ThreadMember, db
+from .models import Memory, MemoryEdge, NarrativeThread, RetrievalLog, ThreadMember, db
 
 if TYPE_CHECKING:
     from .vec import VecStore
 
 CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens x 4 chars/token
 THREAD_BUDGET_CHARS = 8_000
+TENSION_BUDGET_CHARS = 2_000
 _THREAD_NARRATIVE_CAP = 1_000
 
 
@@ -75,6 +76,7 @@ class RetrievalEngine:
         project_context: str = None,
         query: str = None,
         query_embedding: bytes | None = None,
+        session_affect: dict | None = None,
     ) -> str:
         """
         Build the full memory context string for injection into a session.
@@ -136,7 +138,7 @@ class RetrievalEngine:
                     sections.append(content)
 
         # Tier 2.5 — Narrative threads (episodic arcs for injected memories)
-        thread_narratives = self._get_thread_narratives(tier2)
+        thread_narratives = self._get_thread_narratives(tier2, session_affect=session_affect)
         if thread_narratives:
             sections.append("")
             sections.append("## Narrative Threads (how understanding evolved)")
@@ -147,6 +149,19 @@ class RetrievalEngine:
                 narrative = (thread.narrative or "").strip()
                 if narrative:
                     sections.append(narrative)
+
+        # Tier 2.6 — Active Tensions (unresolved contradictions)
+        from .flags import get_flag as _get_flag_tensions
+        if _get_flag_tensions("contradiction_tensors") and tier2:
+            tension_blocks = self._get_active_tensions(tier2)
+            if tension_blocks:
+                sections.append("")
+                sections.append(
+                    "## Active Tensions (conflicting memories — context determines which applies)"
+                )
+                for block in tension_blocks:
+                    sections.append("")
+                    sections.append(block)
 
         sections.append("")
         sections.append("---END MEMORY CONTEXT---")
@@ -167,26 +182,6 @@ class RetrievalEngine:
         ranking.  Hydrates Memory objects from the ranked IDs and returns them
         as dicts with progressive-disclosure fields.
         """
-        from .flags import get_flag
-
-        if not get_flag("hybrid_rrf"):
-            # Feature disabled — use plain FTS
-            results = Memory.search_fts(query, limit=limit)
-            disclosed = []
-            for memory in results:
-                disclosed.append({
-                    "id": memory.id,
-                    "title": memory.title,
-                    "summary": memory.summary,
-                    "content": memory.content or "",
-                    "importance": memory.importance or 0.5,
-                    "stage": memory.stage,
-                    "tags": memory.tag_list,
-                    "rank": getattr(memory, '_rank', None),
-                    "project_context": memory.project_context,
-                })
-            return disclosed
-
         # Attempt to get query embedding (lazy import avoids import-time Bedrock dependency)
         query_embedding = None
         try:
@@ -264,7 +259,8 @@ class RetrievalEngine:
             limited to at most ``k`` entries.
         """
         # --- FTS leg -------------------------------------------------------
-        fts_results = Memory.search_fts(query, limit=k)
+        fts_query = Memory.tokenize_fts_query(query)
+        fts_results = Memory.search_fts(fts_query, limit=k)
         # Build {memory_id: 1-based rank} from FTS order
         fts_ranks: dict[str, int] = {
             mem.id: rank for rank, mem in enumerate(fts_results, start=1)
@@ -301,9 +297,19 @@ class RetrievalEngine:
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return ranked[:k]
 
-    def _get_thread_narratives(self, tier2_memories: list) -> list:
+    def _get_thread_narratives(
+        self,
+        tier2_memories: list,
+        session_affect: dict | None = None,
+    ) -> list:
         """
         Find narrative threads whose members appear in tier2_memories.
+
+        When session_affect is provided and frustration > 0.3, and the
+        affect_signatures flag is enabled, threads are reordered:
+          - frustration_to_mastery threads are prioritized (surfaced first)
+          - sustained_struggle threads are deprioritized (sorted last)
+        Threads with arc_affect = NULL are treated as neutral.
         """
         if not tier2_memories:
             return []
@@ -331,8 +337,38 @@ class RetrievalEngine:
                     truncated = truncated[:last_period + 1]
                 t.narrative = truncated
 
-        # Greedy budget: shortest first maximises arc count
-        candidates_sorted = sorted(candidates, key=lambda t: len(t.narrative or ""))
+        # Affect-aware ordering: when frustration > 0.3 and flag is on
+        from .flags import get_flag as _get_flag_affect
+        frustration = (session_affect or {}).get("frustration", 0.0)
+        if frustration > 0.3 and _get_flag_affect("affect_signatures"):
+            def _affect_sort_key(thread):
+                """Return (priority_bucket, narrative_length).
+
+                Bucket 0 = frustration_to_mastery (highest priority)
+                Bucket 1 = neutral / NULL / unrecognised trajectory
+                Bucket 2 = sustained_struggle (deprioritized)
+                """
+                arc_affect_raw = thread.arc_affect
+                if not arc_affect_raw:
+                    return (1, len(thread.narrative or ""))
+                try:
+                    import json as _json
+                    arc_data = _json.loads(arc_affect_raw)
+                    trajectory = arc_data.get("trajectory", "")
+                except Exception:
+                    trajectory = ""
+                if trajectory == "frustration_to_mastery":
+                    return (0, len(thread.narrative or ""))
+                elif trajectory == "sustained_struggle":
+                    return (2, len(thread.narrative or ""))
+                else:
+                    return (1, len(thread.narrative or ""))
+
+            candidates_sorted = sorted(candidates, key=_affect_sort_key)
+        else:
+            # Greedy budget: shortest first maximises arc count
+            candidates_sorted = sorted(candidates, key=lambda t: len(t.narrative or ""))
+
         budget_remaining = THREAD_BUDGET_CHARS
         selected = []
         for thread in candidates_sorted:
@@ -348,6 +384,125 @@ class RetrievalEngine:
             NarrativeThread.update(last_surfaced_at=now).where(
                 NarrativeThread.id.in_(thread_ids)
             ).execute()
+
+        return selected
+
+    def _get_active_tensions(self, tier2_memories: list) -> list[str]:
+        """
+        Surface unresolved contradiction edges for Tier 2.6 (Active Tensions).
+
+        Queries MemoryEdge for edge_type="contradicts" where source_id or
+        target_id is in the injected set.  Only includes edges where
+        metadata.resolved == false (or metadata is absent / unparseable, which
+        is treated as unresolved).
+
+        Returns a list of formatted tension block strings, packed greedily
+        within TENSION_BUDGET_CHARS.
+        """
+        import json as _json
+
+        if not tier2_memories:
+            return []
+
+        memory_ids = set(m.id for m in tier2_memories)
+
+        # Single batch query: all contradicts edges where source or target is
+        # in the injected set.  Avoids N+1 by fetching all at once.
+        edges = list(
+            MemoryEdge.select()
+            .where(
+                MemoryEdge.edge_type == "contradicts",
+                (MemoryEdge.source_id.in_(memory_ids)) | (MemoryEdge.target_id.in_(memory_ids)),
+            )
+        )
+
+        if not edges:
+            return []
+
+        # Filter to unresolved edges only (D-02)
+        unresolved_edges = []
+        for edge in edges:
+            if not edge.metadata:
+                # No metadata means resolution state unknown — treat as unresolved
+                unresolved_edges.append(edge)
+                continue
+            try:
+                meta = _json.loads(edge.metadata)
+            except (ValueError, TypeError):
+                unresolved_edges.append(edge)
+                continue
+            if meta.get("resolved") is not True:
+                unresolved_edges.append(edge)
+
+        if not unresolved_edges:
+            return []
+
+        # Batch-load Memory objects for all referenced IDs in one query
+        all_referenced_ids = set()
+        for edge in unresolved_edges:
+            all_referenced_ids.add(edge.source_id)
+            all_referenced_ids.add(edge.target_id)
+
+        memories_by_id = {
+            m.id: m
+            for m in Memory.select(Memory.id, Memory.title, Memory.summary).where(
+                Memory.id.in_(all_referenced_ids)
+            )
+        }
+
+        # Deduplicate: same pair may appear as both (A→B) and (B→A)
+        seen_pairs: set[frozenset] = set()
+        formatted_blocks: list[str] = []
+
+        for edge in unresolved_edges:
+            pair = frozenset([edge.source_id, edge.target_id])
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            source_mem = memories_by_id.get(edge.source_id)
+            target_mem = memories_by_id.get(edge.target_id)
+
+            # Build position descriptions using title + summary
+            def _describe(mem) -> str:
+                if mem is None:
+                    return "(memory not found)"
+                title = mem.title or "Untitled"
+                summary = (mem.summary or "").strip()
+                if summary:
+                    return f"{title}: {summary}"
+                return title
+
+            position_a = _describe(source_mem)
+            position_b = _describe(target_mem)
+
+            # Parse context from edge metadata if available
+            context_note = ""
+            if edge.metadata:
+                try:
+                    meta = _json.loads(edge.metadata)
+                    context = meta.get("context", "")
+                    if context:
+                        context_note = f"\nContext: {context}"
+                except (ValueError, TypeError):
+                    pass
+
+            block = (
+                f"### Tension\n"
+                f"Position A: {position_a}\n"
+                f"Position B: {position_b}"
+                f"{context_note}"
+            )
+            formatted_blocks.append(block)
+
+        # Greedy budget packing
+        budget_remaining = TENSION_BUDGET_CHARS
+        selected: list[str] = []
+        for block in formatted_blocks:
+            cost = len(block)
+            if cost <= budget_remaining:
+                selected.append(block)
+                budget_remaining -= cost
 
         return selected
 
@@ -377,9 +532,7 @@ class RetrievalEngine:
         if token_limit is None:
             token_limit = self.token_limit
 
-        from .flags import get_flag
-
-        if query is not None and get_flag("hybrid_rrf"):
+        if query is not None:
             return self._crystallized_hybrid(
                 query=query,
                 query_embedding=query_embedding,
@@ -415,6 +568,7 @@ class RetrievalEngine:
         )
 
         # Thompson sampling re-rank: stochastic explore/exploit on top of ranked list
+        from .flags import get_flag
         if get_flag("thompson_sampling"):
             records_sorted = self._thompson_rerank(records_sorted)
 
@@ -593,7 +747,7 @@ class RetrievalEngine:
 
         # 1-hop graph expansion: add thread/tag neighbors to candidate pool
         from .graph import expand_neighbors
-        neighbor_ids = expand_neighbors(ranked_ids, max_expansion=10)
+        neighbor_ids = expand_neighbors(ranked_ids, max_expansion=10, vec_store=get_vec_store())
         if neighbor_ids:
             # Neighbors get a reduced RRF score (half of the lowest seed score)
             min_score = min(s for _, s in ranked) if ranked else 0.0
@@ -602,23 +756,33 @@ class RetrievalEngine:
                 ranked.append((nid, neighbor_score))
             ranked_ids = ranked_ids + neighbor_ids
 
+        # Include both crystallized and consolidated memories — both have been
+        # through quality gates. Crystallized get a boost in the scoring below.
         memories_by_id = {
             m.id: m
-            for m in Memory.select().where(Memory.id.in_(ranked_ids))
+            for m in Memory.select().where(
+                Memory.id.in_(ranked_ids),
+                Memory.stage.in_(["crystallized", "consolidated"]),
+            )
         }
 
         # Filter by SM-2 eligibility
         from .spaced import is_injection_eligible
 
-        # Build score table with optional project_context boost
+        # Crystallized memories get a small RRF boost over consolidated
+        CRYSTAL_BOOST = 1.0 / (_RRF_K + 1)  # ~0.01639
+
+        # Build score table with boosts
         scored: list[tuple[float, Memory]] = []
         for memory_id, rrf_score in ranked:
             memory = memories_by_id.get(memory_id)
             if memory is None or not is_injection_eligible(memory):
                 continue
             boost = 0.0
+            if memory.stage == "crystallized":
+                boost += CRYSTAL_BOOST
             if project_context is not None and memory.project_context == project_context:
-                boost = PROJECT_BOOST
+                boost += PROJECT_BOOST
             scored.append((rrf_score + boost, memory))
 
         scored.sort(key=lambda x: x[0], reverse=True)

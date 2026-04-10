@@ -65,7 +65,38 @@ def init_db(reset: bool = False):
         )
     """)
     conn.commit()
+    # Migration: add manifest tracking columns
+    try:
+        conn.execute("ALTER TABLE processed_sessions ADD COLUMN manifest_hash TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE processed_sessions ADD COLUMN obs_count_at_time INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    _migrate_sources(conn)
     return conn
+
+
+def _migrate_sources(conn: sqlite3.Connection):
+    """Migrate flat string sources to structured format: ["sid"] -> [{"session": "sid"}]."""
+    rows = conn.execute("SELECT id, sources FROM observations").fetchall()
+    migrated = 0
+    for oid, sources_json in rows:
+        sources = json.loads(sources_json)
+        if not sources or isinstance(sources[0], dict):
+            continue
+        # Flat strings — migrate
+        new_sources = [{"session": s} for s in sources]
+        conn.execute(
+            "UPDATE observations SET sources = ? WHERE id = ?",
+            (json.dumps(new_sources), oid),
+        )
+        migrated += 1
+    if migrated:
+        conn.commit()
+        print(f"  [migrate] converted {migrated} observations to structured sources", file=sys.stderr)
 
 
 def get_store_manifest(conn: sqlite3.Connection, limit: int = 50) -> str:
@@ -122,12 +153,49 @@ def _find_near_duplicates(
     return [rows[i][0] for i, sim in enumerate(sims) if sim >= threshold]
 
 
-def apply_operations(conn: sqlite3.Connection, result: dict, session_id: str):
+def _source_entry(
+    session_id: str,
+    source_lines: list | None = None,
+    action: str = "reinforce",
+    rationale: str | None = None,
+    confidence: str | None = None,
+) -> dict:
+    """Build a structured source entry with full provenance."""
+    from datetime import datetime
+    entry = {"session": session_id, "action": action, "at": datetime.now().isoformat()}
+    if source_lines:
+        entry["lines"] = source_lines
+    if rationale:
+        entry["rationale"] = rationale
+    if confidence:
+        entry["confidence"] = confidence
+    return entry
+
+
+def _append_source(
+    sources: list,
+    session_id: str,
+    source_lines: list | None = None,
+    action: str = "reinforce",
+    rationale: str | None = None,
+    confidence: str | None = None,
+) -> list:
+    """Append a source entry, deduplicating by session ID."""
+    existing_sessions = {s["session"] for s in sources if isinstance(s, dict)}
+    if session_id not in existing_sessions:
+        sources.append(_source_entry(session_id, source_lines, action, rationale, confidence))
+    return sources
+
+
+def apply_operations(conn: sqlite3.Connection, result: dict, session_id: str, manifest: str = ""):
     """Apply CREATE and REINFORCE operations from LLM response."""
     creates = result.get("create", [])
     reinforcements = result.get("reinforce", [])
 
     for obs in creates:
+        source_lines = obs.get("source_lines")
+        rationale = obs.get("rationale")
+        confidence = obs.get("confidence")
         text = f"{obs.get('title', '')} {obs.get('content', '')}"
         dupes = _find_near_duplicates(conn, text)
         if dupes:
@@ -135,18 +203,18 @@ def apply_operations(conn: sqlite3.Connection, result: dict, session_id: str):
                 f"  [tfidf] near-duplicate detected, reinforcing #{dupes[0]} instead",
                 file=sys.stderr,
             )
-            # Treat as reinforcement of the closest match instead of creating
             oid = dupes[0]
             row = conn.execute("SELECT sources FROM observations WHERE id = ?", (oid,)).fetchone()
             if row:
-                sources = json.loads(row[0])
-                if session_id not in sources:
-                    sources.append(session_id)
+                sources = _append_source(
+                    json.loads(row[0]), session_id, source_lines,
+                    action="create-deduped", rationale=rationale, confidence=confidence,
+                )
                 conn.execute(
                     "UPDATE observations SET count = count + 1, sources = ? WHERE id = ?",
                     (json.dumps(sources), oid),
                 )
-            continue  # Skip the INSERT
+            continue
 
         conn.execute(
             "INSERT INTO observations (title, content, observation_type, tags, sources) VALUES (?, ?, ?, ?, ?)",
@@ -155,35 +223,44 @@ def apply_operations(conn: sqlite3.Connection, result: dict, session_id: str):
                 obs.get("content", ""),
                 obs.get("observation_type", ""),
                 json.dumps(obs.get("tags", [])),
-                json.dumps([session_id]),
+                json.dumps([_source_entry(
+                    session_id, source_lines,
+                    action="create", rationale=rationale, confidence=confidence,
+                )]),
             ),
         )
 
     for ref in reinforcements:
-        # Handle both {"id": 7} and bare 7
         if isinstance(ref, dict):
             oid = ref.get("id")
+            source_lines = ref.get("source_lines")
+            rationale = ref.get("rationale")
+            confidence = ref.get("confidence")
         elif isinstance(ref, int):
             oid = ref
+            source_lines = rationale = confidence = None
         else:
             continue
         if oid is None:
             continue
-        # Increment count and append session to sources
         row = conn.execute("SELECT sources FROM observations WHERE id = ?", (oid,)).fetchone()
         if row:
-            sources = json.loads(row[0])
-            if session_id not in sources:
-                sources.append(session_id)
+            sources = _append_source(
+                json.loads(row[0]), session_id, source_lines,
+                action="reinforce", rationale=rationale, confidence=confidence,
+            )
             conn.execute(
                 "UPDATE observations SET count = count + 1, sources = ? WHERE id = ?",
                 (json.dumps(sources), oid),
             )
 
     conn.commit()
+    import hashlib
+    manifest_hash = hashlib.md5(manifest.encode()).hexdigest()[:12] if manifest else None
+    obs_count = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
     conn.execute(
-        "INSERT OR IGNORE INTO processed_sessions (session_id) VALUES (?)",
-        (session_id,),
+        "INSERT OR IGNORE INTO processed_sessions (session_id, manifest_hash, obs_count_at_time) VALUES (?, ?, ?)",
+        (session_id, manifest_hash, obs_count),
     )
     conn.commit()
 
@@ -239,7 +316,16 @@ WHAT TO SKIP:
 
 IMPORTANT: Don't strip the humanity out of observations. "User prefers rebase" is worse than "Emma rebases even when it's painful — she values linear history enough to eat the conflict resolution cost, including generated lockfile churn." The texture matters.
 
+LINE REFERENCES: Each message is tagged with its transcript line (e.g., [USER:L7]). Cite the 1-3 lines that MOST directly evidence each observation in "source_lines". Pick the single strongest moment — the line where the person *said* or *did* the thing, not every line that's tangentially related. If one line is the smoking gun, cite just that one.
+
+DISPATCH STUBS: If a session consists primarily of agent dispatch instructions (e.g., "Read the file ... instructions.md ... and follow all the instructions"), these are routing messages with no behavioral signal. Emit no operations for them.
+
 {focus_block}
+
+PROVENANCE: For every operation, include:
+- "source_lines": 1-3 transcript line numbers — the strongest evidence only, not an exhaustive list
+- "rationale": one sentence — why this observation matters or why this session reinforces it
+- "confidence": "high" (unambiguous signal), "medium" (reasonable inference), or "low" (borderline, could be noise)
 
 Respond ONLY with valid JSON:
 {{
@@ -248,20 +334,26 @@ Respond ONLY with valid JSON:
       "title": "Short pattern-level title",
       "content": "The observation — dense, textured, capturing the person not just the pattern. 1-3 sentences.",
       "observation_type": "correction|preference_signal|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic",
-      "tags": ["tag1", "tag2"]
+      "tags": ["tag1", "tag2"],
+      "source_lines": [7, 42],
+      "rationale": "Why this matters — what would go wrong without it",
+      "confidence": "high|medium|low"
     }}
   ],
   "reinforce": [
-    {{"id": 7}}
+    {{"id": 7, "source_lines": [15], "rationale": "Session confirms same pattern in new context", "confidence": "high"}}
   ]
 }}
 
 Empty arrays are fine. Most sessions should mostly reinforce, not create."""
 
 
-def reduce_session(session_summary: str, store_manifest: str, focus: str = None) -> dict:
+def reduce_session(session_summary: str, store_manifest: str, focus: str = None, debug: bool = False, model: str = "haiku") -> dict:
     """Process one session through the reduce prompt."""
-    import anthropic
+    import asyncio
+    from claude_agent_sdk import query, ClaudeAgentOptions
+
+    t0 = time.time()
 
     focus_block = ""
     if focus:
@@ -276,29 +368,62 @@ def reduce_session(session_summary: str, store_manifest: str, focus: str = None)
         focus_block=focus_block,
     )
 
-    if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-        client = anthropic.AnthropicBedrock()
-        model = "us.anthropic.claude-sonnet-4-6"
-    else:
-        client = anthropic.Anthropic()
-        model = "claude-sonnet-4-6"
+    t_prompt = time.time()
 
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text.strip()
+        async def _run():
+            result_text = ""
+            async for message in query(
+                prompt=prompt,
+                options=ClaudeAgentOptions(
+                    model=model,
+                    max_turns=1,
+                    allowed_tools=[],
+                ),
+            ):
+                if hasattr(message, "result") and message.result:
+                    result_text = message.result
+            return result_text
+
+        text = asyncio.run(_run()).strip()
+        t_llm = time.time()
+
         if text.startswith("```"):
             lines = text.splitlines()[1:]
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
-        return {"ok": True, **json.loads(text)}
+        # Haiku sometimes emits trailing text after the JSON — find the closing brace
+        brace_depth = 0
+        json_end = None
+        for ci, ch in enumerate(text):
+            if ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+                if brace_depth == 0:
+                    json_end = ci + 1
+                    break
+        if json_end and json_end < len(text):
+            text = text[:json_end]
+        parsed = json.loads(text)
+
+        t_parse = time.time()
+
+        result = {"ok": True, **parsed}
+        if debug:
+            result["_bench"] = {
+                "prompt_chars": len(prompt),
+                "summary_chars": len(session_summary),
+                "manifest_chars": len(store_manifest),
+                "prompt_build_s": round(t_prompt - t0, 3),
+                "llm_call_s": round(t_llm - t_prompt, 3),
+                "parse_s": round(t_parse - t_llm, 3),
+                "total_s": round(t_parse - t0, 3),
+            }
+        return result
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "_raw": text[:500] if 'text' in dir() else "(no response)"}
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +461,11 @@ def print_report(conn: sqlite3.Connection):
         oid, title, otype, count, sources = r
         sources_list = json.loads(sources)
         sessions = len(sources_list)
+        # Count how many source entries have line references
+        with_lines = sum(1 for s in sources_list if isinstance(s, dict) and s.get("lines"))
+        lines_str = f", {with_lines} with line refs" if with_lines else ""
         type_str = f"[{otype[:12]}]" if otype else "[?]"
-        print(f"    #{oid:3d} x{count:2d} ({sessions} sessions) {type_str:14s} {title}")
+        print(f"    #{oid:3d} x{count:2d} ({sessions} sessions{lines_str}) {type_str:14s} {title}")
 
     if len(rows) > 20:
         print(f"\n  ... and {len(rows) - 20} more")
@@ -354,6 +482,8 @@ def main():
     limit, focus, dry_run, report_only, reset, project = None, None, False, False, False, None
     db_path, summaries_dir = None, None
     sample_pct, sample_seed = None, 42
+    debug, target_obs = False, None
+    model, session_id_filter = "haiku", None
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -377,6 +507,14 @@ def main():
             report_only = True; i += 1
         elif args[i] == "--reset":
             reset = True; i += 1
+        elif args[i] == "--debug":
+            debug = True; i += 1
+        elif args[i] == "--target" and i + 1 < len(args):
+            target_obs = int(args[i + 1]); i += 2
+        elif args[i] == "--model" and i + 1 < len(args):
+            model = args[i + 1]; i += 2
+        elif args[i] == "--session" and i + 1 < len(args):
+            session_id_filter = args[i + 1]; i += 2
         else:
             print(f"Unknown: {args[i]}", file=sys.stderr); sys.exit(1)
 
@@ -414,6 +552,11 @@ def main():
         n = max(1, int(total * sample_pct / 100))
         summaries = rng.sample(summaries, n)
         print(f"Sampled {n}/{total} sessions ({sample_pct}%, seed={sample_seed})", file=sys.stderr)
+    else:
+        # Default: shuffle for random selection
+        import random
+        rng = random.Random(sample_seed)
+        rng.shuffle(summaries)
 
     if limit:
         summaries = summaries[:limit]
@@ -424,11 +567,17 @@ def main():
             row[0] for row in conn.execute("SELECT session_id FROM processed_sessions").fetchall()
         )
     except sqlite3.OperationalError:
-        # Legacy DB without processed_sessions table — fall back to sources scan
         processed = set()
         for r in conn.execute("SELECT sources FROM observations").fetchall():
             for s in json.loads(r[0]):
-                processed.add(s)
+                processed.add(s["session"])
+
+    if session_id_filter:
+        summaries = [s for s in summaries if session_id_filter in s["session_id"]]
+        if not summaries:
+            print(f"No session matching '{session_id_filter}' found.", file=sys.stderr)
+            conn.close()
+            return
 
     remaining = [s for s in summaries if s["session_id"] not in processed]
     if not remaining:
@@ -437,7 +586,9 @@ def main():
         conn.close()
         return
 
-    print(f"Reducing {len(remaining)} sessions ({len(processed)} already processed)...", file=sys.stderr)
+    current_obs = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    target_str = f", target={target_obs} obs" if target_obs else ""
+    print(f"Reducing {len(remaining)} sessions ({len(processed)} already processed, {current_obs} obs{target_str})...", file=sys.stderr)
     if focus:
         print(f"Focus: {focus}", file=sys.stderr)
 
@@ -452,27 +603,55 @@ def main():
         conn.close()
         return
 
+    total_time = 0
     for i, sess in enumerate(remaining):
-        print(f"  [{i+1}/{len(remaining)}] {sess['session_id'][:8]}... ", end="", file=sys.stderr, flush=True)
+        # Check target
+        if target_obs:
+            current_obs = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            if current_obs >= target_obs:
+                print(f"\n  Target reached: {current_obs} observations.", file=sys.stderr)
+                break
 
+        summary_chars = len(sess["summary"])
+        print(f"  [{i+1}/{len(remaining)}] {sess['session_id'][:8]} ({summary_chars:,}ch)... ",
+              end="", file=sys.stderr, flush=True)
+
+        t_start = time.time()
         manifest = get_store_manifest(conn)
-        result = reduce_session(sess["summary"], manifest, focus=focus)
+        t_manifest = time.time()
+
+        result = reduce_session(sess["summary"], manifest, focus=focus, debug=debug, model=model)
+        t_end = time.time()
+        elapsed = t_end - t_start
+        total_time += elapsed
 
         if result.get("ok"):
             created = len(result.get("create", []))
             reinforced = len(result.get("reinforce", []))
-            apply_operations(conn, result, sess["session_id"])
+            apply_operations(conn, result, sess["session_id"], manifest=manifest)
+
+            t_apply = time.time()
+            obs_now = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
 
             parts = []
             if created: parts.append(f"+{created} new")
             if reinforced: parts.append(f"↑{reinforced} reinforced")
-            print(" ".join(parts) or "skip", file=sys.stderr)
+            parts.append(f"[{obs_now} total]")
+            parts.append(f"{elapsed:.1f}s")
+
+            if debug and "_bench" in result:
+                b = result["_bench"]
+                parts.append(f"(llm={b['llm_call_s']:.1f}s, in={b['input_tokens']}tok, out={b['output_tokens']}tok, apply={t_apply - t_end:.2f}s)")
+
+            print(" ".join(parts), file=sys.stderr)
         else:
-            print(f"ERROR: {result.get('error', '?')[:50]}", file=sys.stderr)
+            print(f"ERROR: {result.get('error', '?')[:50]} ({elapsed:.1f}s)", file=sys.stderr)
 
         time.sleep(0.5)
 
-    print(f"\nDone.", file=sys.stderr)
+    sessions_done = min(i + 1, len(remaining))
+    avg = total_time / max(sessions_done, 1)
+    print(f"\nDone. {sessions_done} sessions in {total_time:.0f}s (avg {avg:.1f}s/session).", file=sys.stderr)
     print_report(conn)
     conn.close()
 

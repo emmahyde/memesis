@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Prune — d2 Diagram Playground</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    height: 100vh;
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    grid-template-rows: 1fr auto;
+  }
+
+  /* --- Controls Panel --- */
+  .controls {
+    grid-row: 1 / 3;
+    background: #161b22;
+    border-right: 1px solid #30363d;
+    padding: 20px;
+    overflow-y: auto;
+  }
+  .controls h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: #8b949e;
+    margin-bottom: 16px;
+  }
+  .control-group {
+    margin-bottom: 20px;
+  }
+  .control-group label {
+    display: block;
+    font-size: 12px;
+    color: #8b949e;
+    margin-bottom: 6px;
+  }
+  .control-group select, .control-group input[type="range"] {
+    width: 100%;
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+  .control-group input[type="range"] {
+    padding: 0;
+    accent-color: #58a6ff;
+  }
+  .preset-btn {
+    display: block;
+    width: 100%;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    font-size: 12px;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.15s;
+  }
+  .preset-btn:hover { background: #30363d; }
+  .preset-btn.active { border-color: #58a6ff; background: #1a2332; }
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .toggle-row input[type="checkbox"] { accent-color: #58a6ff; }
+  .toggle-row label { margin: 0; font-size: 13px; color: #c9d1d9; cursor: pointer; }
+  .divider {
+    border: none;
+    border-top: 1px solid #30363d;
+    margin: 16px 0;
+  }
+  .val { color: #58a6ff; font-variant-numeric: tabular-nums; }
+
+  /* --- Preview --- */
+  .preview {
+    padding: 24px;
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #diagram {
+    font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* --- Prompt Output --- */
+  .prompt-bar {
+    grid-column: 2;
+    background: #161b22;
+    border-top: 1px solid #30363d;
+    padding: 14px 20px;
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  #prompt-output {
+    flex: 1;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: #8b949e;
+    white-space: pre-wrap;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .copy-btn {
+    padding: 6px 14px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s;
+  }
+  .copy-btn:hover { background: #30363d; }
+  .copy-btn.copied { background: #238636; border-color: #2ea043; }
+</style>
+</head>
+<body>
+
+<div class="controls">
+  <h2>Presets</h2>
+  <div class="control-group">
+    <button class="preset-btn active" onclick="applyPreset('full')">Full Operation</button>
+    <button class="preset-btn" onclick="applyPreset('before')">Before State</button>
+    <button class="preset-btn" onclick="applyPreset('after')">After State</button>
+    <button class="preset-btn" onclick="applyPreset('quality')">Quality Gradient</button>
+    <button class="preset-btn" onclick="applyPreset('cleanup')">Cleanup Detail</button>
+  </div>
+
+  <hr class="divider">
+  <h2>Diagram View</h2>
+  <div class="control-group">
+    <label>Direction</label>
+    <select id="direction" onchange="updateAll()">
+      <option value="right">Left → Right</option>
+      <option value="down">Top → Down</option>
+    </select>
+  </div>
+
+  <hr class="divider">
+  <h2>Show Layers</h2>
+  <div class="toggle-row"><input type="checkbox" id="showBefore" checked onchange="updateAll()"><label for="showBefore">Before state</label></div>
+  <div class="toggle-row"><input type="checkbox" id="showOperation" checked onchange="updateAll()"><label for="showOperation">Prune operation</label></div>
+  <div class="toggle-row"><input type="checkbox" id="showAfter" checked onchange="updateAll()"><label for="showAfter">After state</label></div>
+  <div class="toggle-row"><input type="checkbox" id="showCleanup" checked onchange="updateAll()"><label for="showCleanup">Filesystem cleanup</label></div>
+  <div class="toggle-row"><input type="checkbox" id="showQuality" checked onchange="updateAll()"><label for="showQuality">Quality annotations</label></div>
+
+  <hr class="divider">
+  <h2>Style</h2>
+  <div class="control-group">
+    <label>Border radius <span class="val" id="radiusVal">8</span></label>
+    <input type="range" id="radius" min="0" max="20" value="8" onchange="updateAll()">
+  </div>
+  <div class="control-group">
+    <label>Opacity (deleted) <span class="val" id="deletedOpVal">0.35</span></label>
+    <input type="range" id="deletedOp" min="0" max="100" value="35" onchange="updateAll()">
+  </div>
+  <div class="control-group">
+    <label>Theme</label>
+    <select id="theme" onchange="updateAll()">
+      <option value="dark">Dark Neutral</option>
+      <option value="green">Terminal Green</option>
+      <option value="blue">Blueprint</option>
+    </select>
+  </div>
+</div>
+
+<div class="preview">
+  <svg id="diagram" viewBox="0 0 1100 600" xmlns="http://www.w3.org/2000/svg"></svg>
+</div>
+
+<div class="prompt-bar">
+  <pre id="prompt-output"></pre>
+  <button class="copy-btn" onclick="copyPrompt()">Copy d2</button>
+</div>
+
+<script>
+const DEFAULTS = {
+  direction: 'right',
+  showBefore: true, showOperation: true, showAfter: true, showCleanup: true, showQuality: true,
+  radius: 8, deletedOp: 35, theme: 'dark'
+};
+
+const THEMES = {
+  dark: { bg: '#0d1117', container: '#161b22', border: '#30363d', text: '#c9d1d9', dim: '#484f58',
+          kept: '#238636', deleted: '#da3633', operation: '#8957e5', crystal: '#58a6ff', instinct: '#d2a8ff',
+          arrow: '#484f58', label: '#8b949e' },
+  green: { bg: '#0a120a', container: '#0f1a0f', border: '#1a3a1a', text: '#4eff4e', dim: '#1a5a1a',
+           kept: '#2ecc40', deleted: '#cc3333', operation: '#9966ff', crystal: '#33cccc', instinct: '#cccc33',
+           arrow: '#1a5a1a', label: '#338833' },
+  blue: { bg: '#0a0f1a', container: '#0f1622', border: '#1a2a4a', text: '#a0c4ff', dim: '#1a3a6a',
+          kept: '#2196f3', deleted: '#f44336', operation: '#9c27b0', crystal: '#00bcd4', instinct: '#ffeb3b',
+          arrow: '#1a3a6a', label: '#4477aa' }
+};
+
+const state = { ...DEFAULTS };
+
+function readState() {
+  state.direction = document.getElementById('direction').value;
+  state.showBefore = document.getElementById('showBefore').checked;
+  state.showOperation = document.getElementById('showOperation').checked;
+  state.showAfter = document.getElementById('showAfter').checked;
+  state.showCleanup = document.getElementById('showCleanup').checked;
+  state.showQuality = document.getElementById('showQuality').checked;
+  state.radius = +document.getElementById('radius').value;
+  state.deletedOp = +document.getElementById('deletedOp').value / 100;
+  state.theme = document.getElementById('theme').value;
+  document.getElementById('radiusVal').textContent = state.radius;
+  document.getElementById('deletedOpVal').textContent = state.deletedOp.toFixed(2);
+}
+
+function applyPreset(name) {
+  const presets = {
+    full:    { direction:'right', showBefore:true, showOperation:true, showAfter:true, showCleanup:true, showQuality:true },
+    before:  { direction:'down', showBefore:true, showOperation:false, showAfter:false, showCleanup:false, showQuality:true },
+    after:   { direction:'down', showBefore:false, showOperation:false, showAfter:true, showCleanup:false, showQuality:true },
+    quality: { direction:'right', showBefore:true, showOperation:false, showAfter:true, showCleanup:false, showQuality:true },
+    cleanup: { direction:'right', showBefore:false, showOperation:true, showAfter:false, showCleanup:true, showQuality:false },
+  };
+  const p = presets[name];
+  document.getElementById('direction').value = p.direction;
+  document.getElementById('showBefore').checked = p.showBefore;
+  document.getElementById('showOperation').checked = p.showOperation;
+  document.getElementById('showAfter').checked = p.showAfter;
+  document.getElementById('showCleanup').checked = p.showCleanup;
+  document.getElementById('showQuality').checked = p.showQuality;
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  updateAll();
+}
+
+function renderDiagram() {
+  const t = THEMES[state.theme];
+  const svg = document.getElementById('diagram');
+  const horiz = state.direction === 'right';
+  let parts = [];
+  const r = state.radius;
+  const dop = state.deletedOp;
+  const mono = "'SF Mono', 'Fira Code', monospace";
+  const sans = "system-ui, sans-serif";
+
+  const sections = [];
+  if (state.showBefore) sections.push('before');
+  if (state.showOperation) sections.push('operation');
+  if (state.showAfter) sections.push('after');
+
+  if (sections.length === 0) {
+    svg.innerHTML = `<text x="550" y="300" text-anchor="middle" fill="${t.dim}" font-size="16" font-family="${sans}">Toggle layers to show diagram</text>`;
+    return;
+  }
+
+  const totalW = horiz ? sections.length * 360 + 60 : 420;
+  const totalH = horiz ? 600 : sections.length * 380 + 60;
+  svg.setAttribute('viewBox', `0 0 ${totalW} ${totalH}`);
+
+  parts.push(`<rect width="${totalW}" height="${totalH}" fill="${t.bg}" rx="4"/>`);
+
+  // d2 shape helpers
+  function cylinder(x, y, w, h, fill, stroke, op=1, multi=false) {
+    const ry = 10;
+    const s = [];
+    if (multi) {
+      s.push(`<ellipse cx="${x+w/2+4}" cy="${y+ry-4}" rx="${w/2}" ry="${ry}" fill="${fill}" stroke="${stroke}" stroke-width="1" opacity="${op*0.4}"/>`);
+      s.push(`<rect x="${x+4}" y="${y+ry-4}" width="${w}" height="${h-2*ry}" fill="${fill}" stroke="none" opacity="${op*0.4}"/>`);
+    }
+    s.push(`<ellipse cx="${x+w/2}" cy="${y+ry}" rx="${w/2}" ry="${ry}" fill="${fill}" stroke="${stroke}" stroke-width="1.5" opacity="${op}"/>`);
+    s.push(`<rect x="${x}" y="${y+ry}" width="${w}" height="${h-2*ry}" fill="${fill}" stroke="${stroke}" stroke-width="1.5" opacity="${op}"/>`);
+    s.push(`<ellipse cx="${x+w/2}" cy="${y+h-ry}" rx="${w/2}" ry="${ry}" fill="${fill}" stroke="${stroke}" stroke-width="1.5" opacity="${op}"/>`);
+    s.push(`<rect x="${x}" y="${y+ry}" width="${w}" height="${h-2*ry}" fill="${fill}" stroke="none" opacity="${op}"/>`);
+    return s.join('\n');
+  }
+
+  function storedData(x, y, w, h, fill, stroke, op=1, multi=false) {
+    const curve = 14;
+    const s = [];
+    if (multi) {
+      const o = 5;
+      s.push(`<path d="M${x+curve+o},${y-o} Q${x+o},${y-o} ${x+o},${y+h/2-o} Q${x+o},${y+h-o} ${x+curve+o},${y+h-o} L${x+w+o},${y+h-o} L${x+w+o},${y-o} Z" fill="${fill}" stroke="${stroke}" stroke-width="1" opacity="${op*0.4}"/>`);
+    }
+    s.push(`<path d="M${x+curve},${y} Q${x},${y} ${x},${y+h/2} Q${x},${y+h} ${x+curve},${y+h} L${x+w},${y+h} L${x+w},${y} Z" fill="${fill}" stroke="${stroke}" stroke-width="1.5" opacity="${op}"/>`);
+    return s.join('\n');
+  }
+
+  function hexagon(x, y, w, h, fill, stroke, op=1) {
+    const dx = w * 0.2;
+    return `<polygon points="${x+dx},${y} ${x+w-dx},${y} ${x+w},${y+h/2} ${x+w-dx},${y+h} ${x+dx},${y+h} ${x},${y+h/2}" fill="${fill}" stroke="${stroke}" stroke-width="1.5" opacity="${op}"/>`;
+  }
+
+  function page(x, y, w, h, fill, stroke, op=1, multi=false) {
+    const fold = 12;
+    const s = [];
+    if (multi) {
+      s.push(`<path d="M${x+4},${y-4} L${x+w-fold+4},${y-4} L${x+w+4},${y+fold-4} L${x+w+4},${y+h-4} L${x+4},${y+h-4} Z" fill="${fill}" stroke="${stroke}" stroke-width="1" opacity="${op*0.4}"/>`);
+    }
+    s.push(`<path d="M${x},${y} L${x+w-fold},${y} L${x+w},${y+fold} L${x+w},${y+h} L${x},${y+h} Z" fill="${fill}" stroke="${stroke}" stroke-width="1.5" opacity="${op}"/>`);
+    s.push(`<path d="M${x+w-fold},${y} L${x+w-fold},${y+fold} L${x+w},${y+fold}" fill="none" stroke="${stroke}" stroke-width="1" opacity="${op}"/>`);
+    return s.join('\n');
+  }
+
+  function arrow(x1, y1, x2, y2, color, dash=false, animated=false) {
+    const a = [];
+    const id = `arr${Math.random().toString(36).slice(2,6)}`;
+    let extra = dash ? ` stroke-dasharray="6 3"` : '';
+    if (animated) extra += ` stroke-dasharray="8 4"`;
+    a.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="1.5"${extra} marker-end="url(#ah)"/>`);
+    if (animated) {
+      a.push(`<animate xlink:href="#${id}" attributeName="stroke-dashoffset" from="24" to="0" dur="1s" repeatCount="indefinite"/>`);
+    }
+    return a.join('\n');
+  }
+
+  function edgeLabel(x, y, text, color) {
+    return `<text x="${x}" y="${y}" fill="${color}" font-size="9" font-family="${mono}" text-anchor="middle">${text}</text>`;
+  }
+
+  // arrowhead
+  parts.push(`<defs><marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="${t.arrow}"/></marker></defs>`);
+
+  let si = 0;
+  const positions = {};
+
+  function sx(i) { return horiz ? 30 + i * 360 : 30; }
+  function sy(i) { return horiz ? 30 : 30 + i * 380; }
+
+  // ── BEFORE ──
+  if (state.showBefore) {
+    const bx = sx(si), by = sy(si), bw = 320, bh = 540;
+    positions.before = { x: bx, y: by, w: bw, h: bh, cx: bx+bw/2, cy: by+bh/2, r: bx+bw, b: by+bh };
+
+    parts.push(`<rect x="${bx}" y="${by}" width="${bw}" height="${bh}" rx="${r}" fill="${t.container}" stroke="${t.border}" stroke-width="1"/>`);
+    parts.push(`<text x="${bx+14}" y="${by+24}" fill="${t.text}" font-size="14" font-weight="700" font-family="${sans}">before</text>`);
+
+    // consolidated container
+    const cx = bx+14, cy = by+40, cw = bw-28, ch = 280;
+    parts.push(`<rect x="${cx}" y="${cy}" width="${cw}" height="${ch}" rx="${r}" fill="${t.bg}44" stroke="${t.border}" stroke-width="1"/>`);
+    parts.push(`<text x="${cx+10}" y="${cy+18}" fill="${t.label}" font-size="11" font-family="${sans}">consolidated</text>`);
+
+    // early (stored_data shape)
+    const ew = cw-20, eh = 90;
+    const ex = cx+10, ey = cy+30;
+    parts.push(storedData(ex, ey, ew, eh, `${t.kept}22`, t.kept, 1, true));
+    parts.push(`<text x="${ex+20}" y="${ey+28}" fill="${t.kept}" font-size="12" font-weight="600" font-family="${sans}">Feb 26-28</text>`);
+    parts.push(`<text x="${ex+20}" y="${ey+46}" fill="${t.label}" font-size="10" font-family="${mono}">18 memories  avg: 0.81</text>`);
+    if (state.showQuality) {
+      parts.push(`<text x="${ex+20}" y="${ey+64}" fill="${t.kept}" font-size="9" font-family="${mono}">variance: high  KEPT</text>`);
+    }
+
+    // bulk (stored_data, faded)
+    const dx = cx+10, dy = ey+eh+24, dw = cw-20, dh = 100;
+    parts.push(storedData(dx, dy, dw, dh, `${t.deleted}18`, t.deleted, dop+0.2, true));
+    parts.push(`<text x="${dx+20}" y="${dy+28}" fill="${t.deleted}" font-size="12" font-weight="600" font-family="${sans}" opacity="${dop+0.4}">Mar 1-27</text>`);
+    parts.push(`<text x="${dx+20}" y="${dy+46}" fill="${t.label}" font-size="10" font-family="${mono}" opacity="${dop+0.3}">204 memories  avg: 0.65</text>`);
+    if (state.showQuality) {
+      parts.push(`<text x="${dx+20}" y="${dy+64}" fill="${t.deleted}" font-size="9" font-family="${mono}" opacity="${dop+0.4}">variance: ~0  DELETED</text>`);
+      parts.push(`<line x1="${dx}" y1="${dy}" x2="${dx+dw}" y2="${dy+dh}" stroke="${t.deleted}" stroke-width="1" opacity="0.25"/>`);
+      parts.push(`<line x1="${dx+dw}" y1="${dy}" x2="${dx}" y2="${dy+dh}" stroke="${t.deleted}" stroke-width="1" opacity="0.25"/>`);
+    }
+
+    // arrow early->bulk
+    const aMid = ex+ew/2;
+    parts.push(arrow(aMid, ey+eh, aMid, dy, t.arrow));
+    parts.push(edgeLabel(aMid+50, ey+eh+(dy-ey-eh)/2+4, 'pipeline iterations', t.label));
+
+    // crystallized (cylinder)
+    const kx = bx+14, ky = cy+ch+16, kw = bw-28, kh = 80;
+    parts.push(cylinder(kx, ky, kw, kh, `${t.crystal}18`, t.crystal, 1, true));
+    parts.push(`<text x="${kx+kw/2}" y="${ky+kh/2+2}" fill="${t.crystal}" font-size="12" font-weight="600" font-family="${sans}" text-anchor="middle">crystallized</text>`);
+    parts.push(`<text x="${kx+kw/2}" y="${ky+kh/2+18}" fill="${t.label}" font-size="10" font-family="${mono}" text-anchor="middle">57 memories  avg: 0.75</text>`);
+
+    // instinctive (hexagon)
+    const ix = bx+60, iy = ky+kh+16, iw = bw-120, ih = 56;
+    parts.push(hexagon(ix, iy, iw, ih, `${t.instinct}18`, t.instinct));
+    parts.push(`<text x="${ix+iw/2}" y="${iy+ih/2+2}" fill="${t.instinct}" font-size="12" font-weight="600" font-family="${sans}" text-anchor="middle">instinctive</text>`);
+    parts.push(`<text x="${ix+iw/2}" y="${iy+ih/2+17}" fill="${t.label}" font-size="10" font-family="${mono}" text-anchor="middle">3 memories  avg: 0.85</text>`);
+
+    si++;
+  }
+
+  // ── OPERATION ──
+  if (state.showOperation) {
+    const ox = sx(si), oy = sy(si), ow = 320, oh = 540;
+    positions.operation = { x: ox, y: oy, w: ow, h: oh, cx: ox+ow/2, cy: oy+oh/2, l: ox, r: ox+ow, b: oy+oh };
+
+    parts.push(`<rect x="${ox}" y="${oy}" width="${ow}" height="${oh}" rx="${r}" fill="${t.operation}0c" stroke="${t.operation}" stroke-width="1.5"/>`);
+    parts.push(`<text x="${ox+14}" y="${oy+24}" fill="${t.operation}" font-size="14" font-weight="700" font-family="${sans}">Surgical Prune</text>`);
+
+    // SQL block (code shape)
+    const sqx = ox+14, sqy = oy+44, sqw = ow-28, sqh = 130;
+    parts.push(`<rect x="${sqx}" y="${sqy}" width="${sqw}" height="${sqh}" rx="2" fill="${t.bg}" stroke="${t.border}" stroke-width="1"/>`);
+    parts.push(`<text x="${sqx+10}" y="${sqy+18}" fill="${t.dim}" font-size="9" font-family="${mono}">query</text>`);
+    parts.push(`<text x="${sqx+10}" y="${sqy+38}" fill="${t.deleted}" font-size="11" font-weight="600" font-family="${mono}">DELETE FROM memories</text>`);
+    parts.push(`<text x="${sqx+10}" y="${sqy+56}" fill="${t.label}" font-size="11" font-family="${mono}">WHERE stage = 'consolidated'</text>`);
+    parts.push(`<text x="${sqx+10}" y="${sqy+74}" fill="${t.label}" font-size="11" font-family="${mono}">AND date(created_at)</text>`);
+    parts.push(`<text x="${sqx+10}" y="${sqy+92}" fill="${t.label}" font-size="11" font-family="${mono}">  >= '2026-03-01'</text>`);
+    parts.push(`<text x="${sqx+10}" y="${sqy+116}" fill="${t.deleted}" font-size="12" font-weight="700" font-family="${mono}">-- 204 rows</text>`);
+
+    if (state.showCleanup) {
+      // orphans container
+      const fy = sqy + sqh + 20;
+      parts.push(`<rect x="${sqx}" y="${fy}" width="${sqw}" height="120" rx="${r}" fill="${t.bg}44" stroke="${t.border}" stroke-width="1"/>`);
+      parts.push(`<text x="${sqx+10}" y="${fy+18}" fill="${t.text}" font-size="11" font-weight="600" font-family="${sans}">orphans</text>`);
+
+      // page shapes for files
+      parts.push(page(sqx+10, fy+28, 120, 60, `${t.bg}`, t.border, 0.7, true));
+      parts.push(`<text x="${sqx+22}" y="${fy+58}" fill="${t.label}" font-size="9" font-family="${mono}">204 .md files</text>`);
+
+      parts.push(page(sqx+150, fy+28, 120, 60, `${t.bg}`, t.border, 0.7, true));
+      parts.push(`<text x="${sqx+162}" y="${fy+58}" fill="${t.label}" font-size="9" font-family="${mono}">632 temp dirs</text>`);
+
+      // FTS (cylinder, dashed)
+      const ny = fy + 140;
+      parts.push(cylinder(sqx+40, ny, sqw-80, 60, `${t.bg}`, t.dim, 0.5));
+      parts.push(`<text x="${ox+ow/2}" y="${ny+36}" fill="${t.dim}" font-size="10" font-family="${sans}" text-anchor="middle">FTS Index</text>`);
+      parts.push(`<text x="${ox+ow/2}" y="${ny+50}" fill="${t.dim}" font-size="8" font-family="${mono}" text-anchor="middle">rebuild failed</text>`);
+
+      // arrows from query
+      parts.push(arrow(sqx+sqw/2, sqy+sqh, sqx+sqw/2, fy, t.arrow));
+      parts.push(edgeLabel(sqx+sqw/2+35, sqy+sqh+12, 'cascade', t.label));
+      parts.push(arrow(sqx+sqw/2, fy+120, sqx+sqw/2, ny, t.arrow, true));
+      parts.push(edgeLabel(sqx+sqw/2+50, fy+132, 'rebuild failed', t.dim));
+    }
+
+    if (state.showQuality) {
+      const ry = state.showCleanup ? sqy+sqh+360 : sqy+sqh+30;
+      if (ry + 70 < oy + oh) {
+        parts.push(`<text x="${ox+ow/2}" y="${ry}" fill="${t.operation}" font-size="9" font-weight="600" font-family="${sans}" text-anchor="middle">RATIONALE</text>`);
+        parts.push(`<text x="${ox+ow/2}" y="${ry+16}" fill="${t.label}" font-size="9" font-family="${sans}" text-anchor="middle">flat importance = no retrieval signal</text>`);
+        parts.push(`<text x="${ox+ow/2}" y="${ry+30}" fill="${t.label}" font-size="9" font-family="${sans}" text-anchor="middle">mixed pipeline versions</text>`);
+        parts.push(`<text x="${ox+ow/2}" y="${ry+44}" fill="${t.label}" font-size="9" font-family="${sans}" text-anchor="middle">rebuild organically</text>`);
+      }
+    }
+
+    si++;
+  }
+
+  // ── AFTER ──
+  if (state.showAfter) {
+    const ax = sx(si), ay = sy(si), aw = 320, ah = 540;
+    positions.after = { x: ax, y: ay, w: aw, h: ah, cx: ax+aw/2, cy: ay+ah/2, l: ax, r: ax+aw };
+
+    parts.push(`<rect x="${ax}" y="${ay}" width="${aw}" height="${ah}" rx="${r}" fill="${t.kept}08" stroke="${t.kept}" stroke-width="1.5"/>`);
+    parts.push(`<text x="${ax+14}" y="${ay+24}" fill="${t.kept}" font-size="14" font-weight="700" font-family="${sans}">after</text>`);
+
+    // consolidated (stored_data)
+    const cex = ax+14, cey = ay+50, cew = aw-28, ceh = 90;
+    parts.push(storedData(cex, cey, cew, ceh, `${t.kept}22`, t.kept, 1, true));
+    parts.push(`<text x="${cex+20}" y="${cey+30}" fill="${t.kept}" font-size="12" font-weight="600" font-family="${sans}">consolidated</text>`);
+    parts.push(`<text x="${cex+20}" y="${cey+48}" fill="${t.label}" font-size="10" font-family="${mono}">18 memories  avg: 0.81</text>`);
+    if (state.showQuality) {
+      parts.push(`<text x="${cex+20}" y="${cey+66}" fill="${t.kept}" font-size="9" font-family="${mono}">differentiated, high-signal</text>`);
+    }
+
+    // crystallized (cylinder)
+    const ckx = ax+14, cky = cey+ceh+24, ckw = aw-28, ckh = 80;
+    parts.push(cylinder(ckx, cky, ckw, ckh, `${t.crystal}18`, t.crystal, 1, true));
+    parts.push(`<text x="${ckx+ckw/2}" y="${cky+ckh/2+2}" fill="${t.crystal}" font-size="12" font-weight="600" font-family="${sans}" text-anchor="middle">crystallized</text>`);
+    parts.push(`<text x="${ckx+ckw/2}" y="${cky+ckh/2+18}" fill="${t.label}" font-size="10" font-family="${mono}" text-anchor="middle">57 memories  avg: 0.75</text>`);
+
+    // instinctive (hexagon)
+    const cix = ax+60, ciy = cky+ckh+24, ciw = aw-120, cih = 56;
+    parts.push(hexagon(cix, ciy, ciw, cih, `${t.instinct}18`, t.instinct));
+    parts.push(`<text x="${cix+ciw/2}" y="${ciy+cih/2+2}" fill="${t.instinct}" font-size="12" font-weight="600" font-family="${sans}" text-anchor="middle">instinctive</text>`);
+    parts.push(`<text x="${cix+ciw/2}" y="${ciy+cih/2+17}" fill="${t.label}" font-size="10" font-family="${mono}" text-anchor="middle">3 memories  avg: 0.85</text>`);
+
+    // delta text
+    const dy = ciy + cih + 40;
+    parts.push(`<text x="${ax+aw/2}" y="${dy}" fill="${t.kept}" font-size="22" font-weight="700" font-family="${mono}" text-anchor="middle">282 → 78</text>`);
+    parts.push(`<text x="${ax+aw/2}" y="${dy+22}" fill="${t.dim}" font-size="12" font-family="${mono}" text-anchor="middle">-72% · quality retained</text>`);
+
+    si++;
+  }
+
+  // ── INDEX.DB (central cylinder) ──
+  if (state.showBefore || state.showAfter) {
+    // place below all sections
+    const dbx = totalW/2 - 50, dby = totalH - 70;
+    // only draw if there's room
+    if (false) { // skip for now, connections below handle semantics
+      parts.push(cylinder(dbx, dby, 100, 50, t.bg, t.border));
+      parts.push(`<text x="${dbx+50}" y="${dby+30}" fill="${t.text}" font-size="11" font-family="${mono}" text-anchor="middle">index.db</text>`);
+    }
+  }
+
+  // ── CONNECTIONS ──
+  if (horiz) {
+    if (positions.before && positions.operation) {
+      const y = positions.before.cy;
+      parts.push(arrow(positions.before.r+2, y, positions.operation.l-2, y, t.deleted, true));
+      parts.push(edgeLabel((positions.before.r + positions.operation.l)/2, y-8, 'flat scores', t.deleted));
+    }
+    if (positions.operation && positions.after) {
+      const y = positions.operation.cy;
+      parts.push(arrow(positions.operation.r+2, y, positions.after.l-2, y, t.kept));
+      parts.push(edgeLabel((positions.operation.r + positions.after.l)/2, y-8, 'quality retained', t.kept));
+    }
+    if (positions.before && positions.after && !positions.operation) {
+      const y = positions.before.cy;
+      parts.push(arrow(positions.before.r+2, y, positions.after.l-2, y, t.arrow));
+      parts.push(edgeLabel((positions.before.r + positions.after.l)/2, y-8, 'surgical prune', t.label));
+    }
+    // animated "kept" flows
+    if (positions.before && positions.after && positions.operation) {
+      const bx2 = positions.before.r, ax1 = positions.after.l;
+      // arc over the operation box
+      const topY = positions.before.y - 10;
+      const midX = (bx2 + ax1) / 2;
+      parts.push(`<path d="M${bx2} ${positions.before.y+90} Q${midX} ${topY-30} ${ax1} ${positions.after.y+90}" fill="none" stroke="${t.kept}" stroke-width="1" stroke-dasharray="6 3" marker-end="url(#ah)" opacity="0.5"/>`);
+      parts.push(edgeLabel(midX, topY-10, 'kept', t.kept));
+    }
+  }
+
+  svg.innerHTML = parts.join('\n');
+}
+
+function generateD2() {
+  const L = [];
+  const op = state.deletedOp.toFixed(2);
+
+  // ── Config ──
+  L.push('vars: {');
+  L.push('\td2-config: {');
+  L.push('\t\tlayout-engine: elk');
+  L.push('\t\ttheme-id: 300');
+  L.push('\t}');
+  L.push('}');
+  L.push('');
+
+  // ── index.db — central actor ──
+  if (state.showBefore || state.showAfter) {
+    L.push('index.db: "index.db" {');
+    L.push('\tshape: cylinder');
+    L.push('}');
+    L.push('');
+  }
+
+  // ── Before ──
+  if (state.showBefore) {
+    L.push('before: "Before (282 memories)" {');
+    L.push('');
+    L.push('\tconsolidated: {');
+    L.push('');
+    L.push('\t\tearly: "Feb 26-28" {');
+    L.push('\t\t\tshape: stored_data');
+    L.push('\t\t\tstyle: {');
+    L.push('\t\t\t\tmultiple: true');
+    L.push('\t\t\t}');
+    L.push('\t\t}');
+    L.push('');
+    L.push('\t\tbulk: "Mar 1-27" {');
+    L.push('\t\t\tshape: stored_data');
+    L.push('\t\t\tstyle: {');
+    L.push('\t\t\t\tmultiple: true');
+    L.push(`\t\t\t\topacity: ${op}`);
+    L.push('\t\t\t}');
+    L.push('\t\t}');
+    L.push('');
+    L.push('\t\tearly -> bulk: pipeline iterations');
+    L.push('\t}');
+    L.push('');
+    L.push('\tcrystallized: "crystallized (57)" {');
+    L.push('\t\tshape: cylinder');
+    L.push('\t\tstyle: {');
+    L.push('\t\t\tmultiple: true');
+    L.push('\t\t}');
+    L.push('\t}');
+    L.push('');
+    L.push('\tinstinctive: "instinctive (3)" {');
+    L.push('\t\tshape: hexagon');
+    L.push('\t}');
+    L.push('}');
+    L.push('');
+
+    if (state.showQuality) {
+      L.push('before.consolidated.early: {');
+      L.push('\t18 memories');
+      L.push('\tavg importance 0.81');
+      L.push('\tvariance high');
+      L.push('}');
+      L.push('before.consolidated.bulk: {');
+      L.push('\t204 memories');
+      L.push('\tavg importance 0.65');
+      L.push('\tvariance near zero');
+      L.push('}');
+      L.push('');
+    }
+  }
+
+  // ── Prune operation ──
+  if (state.showOperation) {
+    L.push('prune: "Surgical Prune" {');
+    L.push('');
+    L.push('\tquery: {');
+    L.push('\t\tshape: code');
+    L.push('\t\t|sql');
+    L.push('\t\t\tDELETE FROM memories');
+    L.push("\t\t\tWHERE stage = 'consolidated'");
+    L.push("\t\t\tAND date(created_at) >= '2026-03-01'");
+    L.push('\t\t\t-- 204 rows');
+    L.push('\t\t|');
+    L.push('\t}');
+
+    if (state.showCleanup) {
+      L.push('');
+      L.push('\torphans: "Filesystem Cleanup" {');
+      L.push('');
+      L.push('\t\tmd-files: "204 .md files" {');
+      L.push('\t\t\tshape: document');
+      L.push('\t\t\tstyle: {');
+      L.push('\t\t\t\tmultiple: true');
+      L.push('\t\t\t}');
+      L.push('\t\t}');
+      L.push('');
+      L.push('\t\tpytest-dirs: "632 temp dirs" {');
+      L.push('\t\t\tshape: package');
+      L.push('\t\t\tstyle: {');
+      L.push('\t\t\t\tmultiple: true');
+      L.push('\t\t\t}');
+      L.push('\t\t}');
+      L.push('\t}');
+      L.push('');
+      L.push('\tfts: "FTS Index" {');
+      L.push('\t\tshape: cylinder');
+      L.push('\t\tstyle: {');
+      L.push('\t\t\tstroke-dash: 5');
+      L.push('\t\t}');
+      L.push('\t}');
+      L.push('');
+      L.push('\tquery -> orphans: cascade');
+      L.push('\tquery -> fts: rebuild failed {');
+      L.push('\t\tstyle: {');
+      L.push('\t\t\tstroke-dash: 5');
+      L.push('\t\t}');
+      L.push('\t}');
+    }
+
+    if (state.showQuality) {
+      L.push('');
+      L.push('\trationale: "Rationale" {');
+      L.push('\t\tshape: callout');
+      L.push('\t\t|md');
+      L.push('\t\t\t- flat importance = no retrieval signal');
+      L.push('\t\t\t- mixed pipeline versions');
+      L.push('\t\t\t- rebuild organically');
+      L.push('\t\t|');
+      L.push('\t}');
+    }
+
+    L.push('}');
+    L.push('');
+  }
+
+  // ── After ──
+  if (state.showAfter) {
+    L.push('after: "After (78 memories)" {');
+    L.push('');
+    L.push('\tconsolidated: "consolidated (18)" {');
+    L.push('\t\tshape: stored_data');
+    L.push('\t\tstyle: {');
+    L.push('\t\t\tmultiple: true');
+    L.push('\t\t}');
+    L.push('\t}');
+    L.push('');
+    L.push('\tcrystallized: "crystallized (57)" {');
+    L.push('\t\tshape: cylinder');
+    L.push('\t\tstyle: {');
+    L.push('\t\t\tmultiple: true');
+    L.push('\t\t}');
+    L.push('\t}');
+    L.push('');
+    L.push('\tinstinctive: "instinctive (3)" {');
+    L.push('\t\tshape: hexagon');
+    L.push('\t}');
+    L.push('');
+    L.push('\tdelta: "282 → 78 (-72%)" {');
+    L.push('\t\tshape: text');
+    L.push('\t\tstyle: {');
+    L.push('\t\t\tfont-size: 22');
+    L.push('\t\t\tbold: true');
+    L.push('\t\t}');
+    L.push('\t}');
+    L.push('}');
+    L.push('');
+  }
+
+  // ── Connections ──
+
+  // index.db -> before (one-to-many with crow's foot)
+  if (state.showBefore) {
+    L.push('index.db -> before.consolidated: read {');
+    L.push('\ttarget-arrowhead: {');
+    L.push('\t\tshape: cf-many');
+    L.push('\t}');
+    L.push('}');
+    L.push('index.db -> before.crystallized: read');
+    L.push('index.db -> before.instinctive: read');
+    L.push('');
+  }
+
+  // before.bulk -> prune (the deletion flow)
+  if (state.showBefore && state.showOperation) {
+    L.push('before.consolidated.bulk -> prune.query: flat scores {');
+    L.push('\tstyle: {');
+    L.push('\t\tstroke-dash: 5');
+    L.push('\t\tanimated: true');
+    L.push('\t}');
+    L.push('}');
+    L.push('');
+  }
+
+  // prune -> after
+  if (state.showOperation && state.showAfter) {
+    L.push('prune -> after: quality retained');
+    L.push('');
+  }
+
+  // kept flows (before -> after, animated)
+  if (state.showBefore && state.showAfter) {
+    if (state.showOperation) {
+      L.push('before.consolidated.early -> after.consolidated: kept {');
+      L.push('\tstyle: {');
+      L.push('\t\tanimated: true');
+      L.push('\t}');
+      L.push('}');
+      L.push('before.crystallized -> after.crystallized: unchanged {');
+      L.push('\tstyle: {');
+      L.push('\t\tanimated: true');
+      L.push('\t}');
+      L.push('}');
+      L.push('before.instinctive -> after.instinctive: unchanged {');
+      L.push('\tstyle: {');
+      L.push('\t\tanimated: true');
+      L.push('\t}');
+      L.push('}');
+    } else {
+      L.push('before -> after: surgical prune');
+    }
+    L.push('');
+  }
+
+  // after -> index.db (write back)
+  if (state.showAfter) {
+    L.push('after.consolidated -> index.db: write back {');
+    L.push('\tstyle: {');
+    L.push('\t\tstroke-dash: 5');
+    L.push('\t}');
+    L.push('\tsource-arrowhead: {');
+    L.push('\t\tshape: cf-many-required');
+    L.push('\t}');
+    L.push('}');
+  }
+
+  return L.join('\n');
+}
+
+function updatePrompt() {
+  document.getElementById('prompt-output').textContent = generateD2();
+}
+
+function copyPrompt() {
+  const btn = document.querySelector('.copy-btn');
+  navigator.clipboard.writeText(generateD2()).then(() => {
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy d2'; btn.classList.remove('copied'); }, 1500);
+  });
+}
+
+function updateAll() {
+  readState();
+  renderDiagram();
+  updatePrompt();
+}
+
+updateAll();
+</script>
+</body>
+</html>

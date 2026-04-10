@@ -132,7 +132,7 @@ def read_transcript(path: Path) -> list[dict]:
     """
     messages = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
@@ -172,7 +172,7 @@ def read_transcript(path: Path) -> list[dict]:
             if len(text) < 10:
                 continue
 
-            messages.append({"role": role, "text": text})
+            messages.append({"role": role, "text": text, "line": line_num})
     return messages
 
 
@@ -185,11 +185,9 @@ def summarize(messages: list[dict], max_chars: int = None) -> str:
     lines, chars = [], 0
     for msg in messages:
         role = "USER" if msg["role"] == "user" else "CLAUDE"
-        limit = 800 if role == "USER" else 300
-        text = msg["text"][:limit]
-        if len(msg["text"]) > limit:
-            text += "..."
-        entry = f"[{role}] {text}"
+        text = msg["text"]
+        line_ref = f":L{msg['line']}" if "line" in msg else ""
+        entry = f"[{role}{line_ref}] {text}"
         if chars + len(entry) > max_chars:
             lines.append("[... session truncated ...]")
             break
