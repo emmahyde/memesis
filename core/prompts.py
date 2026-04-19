@@ -27,7 +27,7 @@ OBSERVATION_TYPES = {
 }
 
 
-def format_observation(text: str, obs_type: str = None, context: str = None) -> str:
+def format_observation(text: str, obs_type: str | None = None, context: str | None = None) -> str:
     """
     Format an observation for the ephemeral buffer.
 
@@ -193,3 +193,52 @@ Respond ONLY with valid JSON:
   "resolution_type": "scoped|superseded|coexist",
   "confidence": 0.0-1.0
 }}"""
+
+
+# ---------------------------------------------------------------------------
+# Transcript delta extraction prompt
+# ---------------------------------------------------------------------------
+
+OBSERVATION_EXTRACT_PROMPT = """Extract 0-3 durable observations from this Claude Code session slice.
+
+Each observation must be:
+- Falsifiable (could be discovered wrong later)
+- Durable (still relevant in a future session)
+- Novel (not derivable from reading the codebase directly)
+
+Mode taxonomy:
+  decision       - a choice made, with rationale
+  finding        - something learned about the system or codebase
+  preference     - how the user wants to work
+  constraint     - a requirement or limit going forward
+  correction     - an earlier belief was wrong; state the correct version
+  open_question  - an unresolved issue worth surfacing next session
+
+PRIVACY: NEVER store emotional state observations (e.g. "user is frustrated",
+"user seems excited"). Only factual, technical, or preference content.
+
+Skip:
+- Tool call logs without a finding attached
+- File reads with no conclusion drawn
+- Status checks, test runs that passed without incident
+- Anything obvious from the codebase itself
+
+Importance anchors:
+  0.2  routine finding ("this module uses pytest")
+  0.5  useful context ("auth tokens stored in Redis with 24h TTL")
+  0.8  load-bearing decision ("chose cron over hooks to avoid blocking")
+  0.95 correction or hard constraint ("privacy filter MUST precede LLM calls")
+
+Return a JSON array (empty array if nothing qualifies):
+[
+  {{
+    "content": "1-2 sentence statement of the durable observation",
+    "mode": "decision|finding|preference|constraint|correction|open_question",
+    "importance": 0.0,
+    "tags": ["lowercase-hyphenated", "topical"]
+  }}
+]
+
+Session slice:
+{transcript}
+"""

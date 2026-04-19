@@ -1,0 +1,5 @@
+{"type": "user", "message": {"role": "user", "content": "What is the auth flow?"}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "The auth system uses JWT tokens stored in Redis with a 24-hour TTL. There is no refresh token mechanism currently."}]}}
+{"type": "user", "message": {"role": "user", "content": "Should we add refresh tokens?"}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "We decided against refresh tokens for now — the 24h TTL matches session expectations and adds complexity without clear user benefit."}]}}
+{"type": "user", "message": {"role": "user", "content": "Ok, let's move on."}}
