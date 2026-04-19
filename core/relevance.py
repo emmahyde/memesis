@@ -433,7 +433,9 @@ class RelevanceEngine:
         # Filter to only archived + not subsumed
         archived_ids = {m.id for m in archived_memories}
         matched = []
-        for memory_id, distance in results:
+        for result in results:
+            memory_id = result["memory_id"]
+            distance = result["distance"]
             if memory_id in archived_ids:
                 try:
                     mem = Memory.get_by_id(memory_id)

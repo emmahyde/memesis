@@ -674,20 +674,20 @@ class TestLastSurfacedAtTracking:
 
 
 class MockVecStore:
-    """Stub VecStore that returns predetermined (memory_id, distance) tuples."""
+    """Stub VecStore that returns predetermined result dicts."""
 
     def __init__(self, results: list[tuple], available: bool = True):
-        self._results = results
+        self._results = [{"memory_id": mid, "distance": dist} for mid, dist in results]
         self._available = available
 
     @property
     def available(self) -> bool:
         return self._available
 
-    def search_vector(self, query_embedding: bytes, k: int = 10, exclude_ids: set = None) -> list[tuple]:
+    def search_vector(self, query_embedding: bytes, k: int = 10, exclude_ids: set = None) -> list[dict]:
         results = self._results[:k]
         if exclude_ids:
-            results = [(mid, dist) for mid, dist in results if mid not in exclude_ids]
+            results = [r for r in results if r["memory_id"] not in exclude_ids]
         return results
 
 

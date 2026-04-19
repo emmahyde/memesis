@@ -53,7 +53,9 @@ def _make_conn(tmp_path: Path) -> sqlite3.Connection:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_sessions (
             session_id TEXT PRIMARY KEY,
-            processed_at TEXT DEFAULT CURRENT_TIMESTAMP
+            processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            manifest_hash TEXT,
+            obs_count_at_time INTEGER
         )
     """)
     conn.commit()
