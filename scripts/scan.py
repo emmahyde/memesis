@@ -18,6 +18,9 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from core.transcript import read_transcript, summarize  # type: ignore[import]
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 OUTPUT_DIR = Path(__file__).parent.parent / "backfill-output"
 
@@ -60,140 +63,7 @@ def parse_duration(s: str) -> timedelta:
     if unit == 'd': return timedelta(days=n)
     if unit == 'w': return timedelta(weeks=n)
     if unit == 'm': return timedelta(days=n * 30)
-
-
-def _clean_text(text: str) -> str:
-    """Strip noise from a text block, keeping only conversational signal."""
-    # XML tags: system reminders, command wrappers, skill loads
-    text = re.sub(r'<system-reminder>.*?</system-reminder>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<command-(?:name|message|args)>.*?</command-(?:name|message|args)>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<local-command-(?:stdout|caveat)>.*?</local-command-(?:stdout|caveat)>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<available-deferred-tools>.*?</available-deferred-tools>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<[a-zA-Z_-]+>.*?</[a-zA-Z_-]+>', '', text, flags=re.DOTALL)
-
-    # Code blocks: remove large ones, keep small ones (might contain key snippets)
-    text = re.sub(r'```[\s\S]{300,}?```', '[code block removed]', text)
-
-    # File paths and tool-mechanical lines
-    text = re.sub(r'^(?:Base directory|File:?|Path:?) (?:for this skill: )?/\S+.*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^\s*\d+→.*$', '', text, flags=re.MULTILINE)  # cat -n style file content
-
-    # Markdown headers that are just skill/doc content being loaded (not conversation)
-    # Keep ## headers (likely assistant structuring) but strip long doc-like content after them
-    text = re.sub(r'^#{1,3} (?:Core Capabilities|Usage|Installation|Configuration|API Reference|Parameters)\b.*?(?=^#{1,3} |\Z)', '', text, flags=re.MULTILINE | re.DOTALL)
-
-    # Loaded content detection: if a block has 3+ headers and is long, it's a
-    # skill/doc/spec being injected — not conversation. Collapse to one line.
-    headers = re.findall(r'^#{1,4} .+', text, re.MULTILINE)
-    if len(headers) >= 3 and len(text) > 500:
-        text = f"[loaded content: {headers[0].strip('# ').strip()[:60]}]"
-
-    # Repeated whitespace
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
-
-
-def _extract_tool_summary(content: list) -> str:
-    """Summarize tool usage from an assistant message's content blocks."""
-    tools_used = []
-    for block in content:
-        if block.get("type") == "tool_use":
-            name = block.get("name", "?")
-            # Extract key info without raw output
-            inp = block.get("input", {})
-            if name in ("Read", "read"):
-                tools_used.append(f"[read {inp.get('file_path', '?').split('/')[-1]}]")
-            elif name in ("Edit", "edit"):
-                tools_used.append(f"[edited {inp.get('file_path', '?').split('/')[-1]}]")
-            elif name in ("Write", "write"):
-                tools_used.append(f"[wrote {inp.get('file_path', '?').split('/')[-1]}]")
-            elif name in ("Bash", "bash"):
-                cmd = str(inp.get("command", "?"))[:60]
-                tools_used.append(f"[ran: {cmd}]")
-            elif name in ("Grep", "grep"):
-                tools_used.append(f"[searched for: {inp.get('pattern', '?')[:40]}]")
-            elif name == "Agent":
-                tools_used.append(f"[spawned agent: {inp.get('description', '?')[:40]}]")
-            # Skip other tools — not worth summarizing
-    if tools_used:
-        return " ".join(tools_used[:5])  # Cap at 5 tool mentions
-    return ""
-
-
-def read_transcript(path: Path) -> list[dict]:
-    """Extract conversational signal from a Claude Code transcript.
-
-    Filters aggressively:
-    - Only user and assistant messages (no progress, system, tool_result)
-    - Only text blocks (tool_use/tool_result content stripped)
-    - Tool usage summarized as compact one-liners instead of raw output
-    - XML tags, system injections, skill loads, file content all removed
-    - Large code blocks replaced with placeholder
-    """
-    messages = []
-    with open(path, encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if msg.get("type") not in ("user", "assistant"):
-                continue
-
-            content = msg.get("message", {}).get("content", "")
-            role = msg["type"]
-
-            if isinstance(content, list):
-                # Extract text and thinking blocks — skip tool_use, tool_result
-                parts = []
-                for b in content:
-                    if b.get("type") == "text":
-                        parts.append(b.get("text", "").strip())
-                    elif b.get("type") == "thinking":
-                        thinking = b.get("thinking", "").strip()
-                        if thinking:
-                            parts.append(f"[thinking] {thinking}")
-                text = "\n".join(t for t in parts if t)
-
-                # For assistant messages, add a compact tool summary
-                if role == "assistant":
-                    tool_summary = _extract_tool_summary(content)
-                    if tool_summary and not text:
-                        text = tool_summary  # Tool-only turn — keep the summary
-                    elif tool_summary:
-                        text = f"{text}\n{tool_summary}"
-            elif isinstance(content, str):
-                text = content.strip()
-            else:
-                continue
-
-            text = _clean_text(text)
-
-            if len(text) < 10:
-                continue
-
-            messages.append({"role": role, "text": text, "line": line_num})
-    return messages
-
-
-def summarize(messages: list[dict], max_chars: int = None) -> str:
-    if not messages:
-        return ""
-    # Scale budget by message count: 12K base + 100 chars per message beyond 40
-    if max_chars is None:
-        max_chars = 12000 + max(0, len(messages) - 40) * 100
-    lines, chars = [], 0
-    for msg in messages:
-        role = "USER" if msg["role"] == "user" else "CLAUDE"
-        text = msg["text"]
-        line_ref = f":L{msg['line']}" if "line" in msg else ""
-        entry = f"[{role}{line_ref}] {text}"
-        if chars + len(entry) > max_chars:
-            lines.append("[... session truncated ...]")
-            break
-        lines.append(entry)
-        chars += len(entry)
-    return "\n\n".join(lines)
+    raise ValueError(f"Unhandled unit: {unit!r}")
 
 
 def main():
