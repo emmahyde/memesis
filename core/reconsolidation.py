@@ -18,6 +18,7 @@ import logging
 import struct
 from datetime import datetime
 
+from .flags import get_flag
 from .llm import call_llm, strip_markdown_fences
 from .models import Memory, ConsolidationLog, MemoryEdge
 
@@ -67,8 +68,6 @@ def reconsolidate(
     Returns:
         {"confirmed": [id, ...], "contradicted": [id, ...], "refined": [id, ...]}
     """
-    from .flags import get_flag
-
     if not get_flag("reconsolidation"):
         return {"confirmed": [], "contradicted": [], "refined": []}
 
@@ -177,8 +176,6 @@ def _build_affect_meta(session_affect: dict | None) -> dict | None:
     Returns a dict with frustration, momentum, and dominant_valence keys,
     or None if affect_signatures flag is off or session_affect is missing.
     """
-    from .flags import get_flag
-
     if session_affect is None or not get_flag("affect_signatures"):
         return None
 
@@ -325,23 +322,23 @@ def _create_contradiction_edges(
         resolved = already_flagged
         resolution = "superseded" if already_flagged else None
 
+        meta_dict = {
+            "evidence": evidence,
+            "session_id": session_id,
+            "created_at": timestamp,
+            "resolved": resolved,
+            "resolution": resolution,
+            "detected_by": "reconsolidation",
+            "detected_at": timestamp,
+        }
+        affect_meta = _build_affect_meta(session_affect)
+        if affect_meta is not None:
+            meta_dict["affect"] = affect_meta
+        meta = json.dumps(meta_dict)
+
         for confirmed_id in confirmed_set:
             if confirmed_id == mid:
                 continue
-
-            meta_dict = {
-                "evidence": evidence,
-                "session_id": session_id,
-                "created_at": timestamp,
-                "resolved": resolved,
-                "resolution": resolution,
-                "detected_by": "reconsolidation",
-                "detected_at": timestamp,
-            }
-            affect_meta = _build_affect_meta(session_affect)
-            if affect_meta is not None:
-                meta_dict["affect"] = affect_meta
-            meta = json.dumps(meta_dict)
 
             # A → B
             a_to_b_exists = MemoryEdge.select().where(

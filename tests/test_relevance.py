@@ -464,7 +464,7 @@ class TestSemanticRehydration:
 
         vec_store = get_vec_store()
         with patch("core.embeddings.embed_text", return_value=fake_embedding), \
-             patch.object(vec_store, "search_vector", return_value=[(mid, 0.1)]):
+             patch.object(vec_store, "search_vector", return_value=[{"memory_id": mid, "distance": 0.1}]):
             matches = engine.find_rehydration_by_observation("software deployment pipeline")
 
         assert any(m.id == mid for m in matches), (
@@ -480,7 +480,7 @@ class TestSemanticRehydration:
 
         vec_store = get_vec_store()
         with patch("core.embeddings.embed_text", return_value=fake_embedding), \
-             patch.object(vec_store, "search_vector", return_value=[(mid, 0.1)]):
+             patch.object(vec_store, "search_vector", return_value=[{"memory_id": mid, "distance": 0.1}]):
             matches = engine.find_rehydration_by_observation(
                 "We need to fix the payment pipeline deadlock issue"
             )

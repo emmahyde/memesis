@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Optional
 
 from peewee import fn
 
+import json
+
 from .database import get_base_dir, get_vec_store
+from .flags import get_flag
 from .models import Memory, MemoryEdge, NarrativeThread, RetrievalLog, ThreadMember, db
 
 if TYPE_CHECKING:
@@ -115,8 +118,7 @@ class RetrievalEngine:
 
         # Tier 2 — Crystallized (context-relevant knowledge)
         if tier2:
-            from .flags import get_flag as _get_flag
-            if _get_flag("provenance_signals"):
+            if get_flag("provenance_signals"):
                 provenance_map = self._compute_provenance_batch([m.id for m in tier2])
             else:
                 provenance_map = {}
@@ -151,8 +153,7 @@ class RetrievalEngine:
                     sections.append(narrative)
 
         # Tier 2.6 — Active Tensions (unresolved contradictions)
-        from .flags import get_flag as _get_flag_tensions
-        if _get_flag_tensions("contradiction_tensors") and tier2:
+        if get_flag("contradiction_tensors") and tier2:
             tension_blocks = self._get_active_tensions(tier2)
             if tension_blocks:
                 sections.append("")
@@ -276,8 +277,8 @@ class RetrievalEngine:
         if use_vec:
             vec_results = vec_store.search_vector(query_embedding, k=k)
             vec_ranks = {
-                memory_id: rank
-                for rank, (memory_id, _distance) in enumerate(vec_results, start=1)
+                r["memory_id"]: rank
+                for rank, r in enumerate(vec_results, start=1)
             }
 
         # --- RRF fusion ----------------------------------------------------
@@ -338,9 +339,8 @@ class RetrievalEngine:
                 t.narrative = truncated
 
         # Affect-aware ordering: when frustration > 0.3 and flag is on
-        from .flags import get_flag as _get_flag_affect
         frustration = (session_affect or {}).get("frustration", 0.0)
-        if frustration > 0.3 and _get_flag_affect("affect_signatures"):
+        if frustration > 0.3 and get_flag("affect_signatures"):
             def _affect_sort_key(thread):
                 """Return (priority_bucket, narrative_length).
 
@@ -352,8 +352,7 @@ class RetrievalEngine:
                 if not arc_affect_raw:
                     return (1, len(thread.narrative or ""))
                 try:
-                    import json as _json
-                    arc_data = _json.loads(arc_affect_raw)
+                    arc_data = json.loads(arc_affect_raw)
                     trajectory = arc_data.get("trajectory", "")
                 except Exception:
                     trajectory = ""
@@ -399,8 +398,6 @@ class RetrievalEngine:
         Returns a list of formatted tension block strings, packed greedily
         within TENSION_BUDGET_CHARS.
         """
-        import json as _json
-
         if not tier2_memories:
             return []
 
@@ -427,7 +424,7 @@ class RetrievalEngine:
                 unresolved_edges.append(edge)
                 continue
             try:
-                meta = _json.loads(edge.metadata)
+                meta = json.loads(edge.metadata)
             except (ValueError, TypeError):
                 unresolved_edges.append(edge)
                 continue
@@ -480,7 +477,7 @@ class RetrievalEngine:
             context_note = ""
             if edge.metadata:
                 try:
-                    meta = _json.loads(edge.metadata)
+                    meta = json.loads(edge.metadata)
                     context = meta.get("context", "")
                     if context:
                         context_note = f"\nContext: {context}"
@@ -567,8 +564,6 @@ class RetrievalEngine:
             ),
         )
 
-        # Thompson sampling re-rank: stochastic explore/exploit on top of ranked list
-        from .flags import get_flag
         if get_flag("thompson_sampling"):
             records_sorted = self._thompson_rerank(records_sorted)
 
@@ -787,8 +782,6 @@ class RetrievalEngine:
 
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        # Thompson sampling re-rank: stochastic explore/exploit on top of ranked list
-        from .flags import get_flag
         if get_flag("thompson_sampling"):
             ranked_memories = [mem for _, mem in scored]
             ranked_memories = self._thompson_rerank(ranked_memories)

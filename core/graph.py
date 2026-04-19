@@ -19,6 +19,7 @@ import logging
 import struct
 from itertools import combinations
 
+from .flags import get_flag
 from .models import Memory, MemoryEdge, NarrativeThread, ThreadMember, db
 
 logger = logging.getLogger(__name__)
@@ -105,8 +106,6 @@ def expand_neighbors(
     same priority tier, neighbors are ordered by sqlite-vec cosine
     similarity to the seed set centroid (when available).
     """
-    from .flags import get_flag
-
     if not get_flag("graph_expansion") or not seed_ids:
         return []
 

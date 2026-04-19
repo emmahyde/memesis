@@ -68,8 +68,9 @@ class VecStore:
             return
         conn = self._connect()
         try:
+            conn.execute("DELETE FROM vec_memories WHERE memory_id = ?", (memory_id,))
             conn.execute(
-                "INSERT OR REPLACE INTO vec_memories(memory_id, embedding) VALUES (?, ?)",
+                "INSERT INTO vec_memories(memory_id, embedding) VALUES (?, ?)",
                 (memory_id, embedding),
             )
         finally:
@@ -107,7 +108,7 @@ class VecStore:
 
         if exclude_ids:
             rows = [(mid, dist) for mid, dist in rows if mid not in exclude_ids]
-        return rows
+        return [{"memory_id": mid, "distance": dist} for mid, dist in rows]
 
     def get_embedding(self, memory_id: str) -> bytes | None:
         """Get the stored embedding for a memory, or None."""

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from .database import get_vec_store
+from .flags import get_flag
 from .llm import call_llm
 from .models import Memory, MemoryEdge, NarrativeThread, ThreadMember, db
 
@@ -418,18 +419,22 @@ def _get_member_valences(member_ids: list[str]) -> list[str]:
     Returns:
         List of valence strings, one per member_id.
     """
+    mem_map = {
+        m.id: m
+        for m in Memory.select(Memory.id, Memory.tags).where(Memory.id.in_(member_ids))
+    }
     valences = []
     for mid in member_ids:
-        try:
-            mem = Memory.get_by_id(mid)
-            valence = "neutral"
-            for tag in mem.tag_list:
-                if tag.startswith("valence:"):
-                    valence = tag[len("valence:"):]
-                    break
-            valences.append(valence)
-        except Memory.DoesNotExist:
+        mem = mem_map.get(mid)
+        if mem is None:
             valences.append("neutral")
+            continue
+        valence = "neutral"
+        for tag in mem.tag_list:
+            if tag.startswith("valence:"):
+                valence = tag[len("valence:"):]
+                break
+        valences.append(valence)
     return valences
 
 
@@ -439,8 +444,6 @@ def build_threads() -> list[dict]:
 
     Returns list of created thread dicts.
     """
-    from .flags import get_flag
-
     detector = ThreadDetector()
     narrator = ThreadNarrator()
 
@@ -467,10 +470,18 @@ def build_threads() -> list[dict]:
         if not valid_ids:
             continue
 
+        arc_affect = None
+        arc_affect_json = None
+        if get_flag("affect_signatures"):
+            valences = _get_member_valences(valid_ids)
+            arc_affect = _compute_arc_affect(valences, result.get("arc_type", "knowledge_building"))
+            arc_affect_json = json.dumps(arc_affect)
+
         thread = NarrativeThread.create(
             title=result["title"],
             summary=result["summary"],
             narrative=result["narrative"],
+            arc_affect=arc_affect_json,
             created_at=now,
             updated_at=now,
         )
@@ -484,12 +495,7 @@ def build_threads() -> list[dict]:
 
         result["id"] = thread.id
 
-        # Compute and store arc_affect when affect_signatures flag is enabled
-        if get_flag("affect_signatures"):
-            valences = _get_member_valences(valid_ids)
-            arc_affect = _compute_arc_affect(valences, result.get("arc_type", "knowledge_building"))
-            thread.arc_affect = json.dumps(arc_affect)
-            thread.save()
+        if arc_affect is not None:
             result["arc_affect"] = arc_affect
             logger.info(
                 "Arc affect for thread %s: trajectory=%s friction_ratio=%.2f",

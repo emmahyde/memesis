@@ -8,6 +8,7 @@ All tables are defined here; the database connection is deferred
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 
@@ -25,6 +26,21 @@ logger = logging.getLogger(__name__)
 
 # Deferred database — bound by init_db()
 db = SqliteDatabase(None)
+
+_FTS_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "shall", "can",
+    "to", "of", "in", "for", "on", "with", "at", "by", "from",
+    "as", "into", "through", "during", "before", "after", "above",
+    "below", "between", "out", "off", "over", "under", "again",
+    "further", "then", "once", "here", "there", "when", "where",
+    "why", "how", "all", "both", "each", "few", "more", "most",
+    "other", "some", "such", "no", "nor", "not", "only", "own",
+    "same", "so", "than", "too", "very", "and", "but", "or",
+    "if", "while", "what", "which", "who", "whom", "this", "that",
+    "these", "those", "it", "its", "s",
+})
 
 
 class BaseModel(Model):
@@ -134,25 +150,8 @@ class Memory(BaseModel):
         operators, and joins with OR so any matching term produces results.
         Falls back to the raw query (quoted) if no tokens remain.
         """
-        _STOP_WORDS = {
-            "a", "an", "the", "is", "are", "was", "were", "be", "been",
-            "being", "have", "has", "had", "do", "does", "did", "will",
-            "would", "could", "should", "may", "might", "shall", "can",
-            "to", "of", "in", "for", "on", "with", "at", "by", "from",
-            "as", "into", "through", "during", "before", "after", "above",
-            "below", "between", "out", "off", "over", "under", "again",
-            "further", "then", "once", "here", "there", "when", "where",
-            "why", "how", "all", "both", "each", "few", "more", "most",
-            "other", "some", "such", "no", "nor", "not", "only", "own",
-            "same", "so", "than", "too", "very", "and", "but", "or",
-            "if", "while", "what", "which", "who", "whom", "this", "that",
-            "these", "those", "it", "its", "s",
-        }
-        import re
-        # Extract word tokens, lowercase
         tokens = re.findall(r"[a-zA-Z0-9_'-]+", query.lower())
-        # Filter stop words and very short tokens
-        keywords = [t for t in tokens if t not in _STOP_WORDS and len(t) > 1]
+        keywords = [t for t in tokens if t not in _FTS_STOP_WORDS and len(t) > 1]
         if not keywords:
             escaped = query.replace('"', '""')
             return f'"{escaped}"'
