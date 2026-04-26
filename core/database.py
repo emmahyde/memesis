@@ -12,11 +12,15 @@ from pathlib import Path
 from typing import Optional
 
 from .models import (
+    AffectLog,
     ConsolidationLog,
+    EvalRun,
     Memory,
     MemoryEdge,
     NarrativeThread,
+    Observation,
     RetrievalLog,
+    RetrievalCandidate,
     ThreadMember,
     db,
 )
@@ -28,7 +32,18 @@ _vec_store = None
 _db_path: Optional[Path] = None
 _base_dir: Optional[Path] = None
 
-ALL_TABLES = [Memory, NarrativeThread, ThreadMember, MemoryEdge, RetrievalLog, ConsolidationLog]
+ALL_TABLES = [
+    Memory,
+    NarrativeThread,
+    ThreadMember,
+    MemoryEdge,
+    RetrievalLog,
+    ConsolidationLog,
+    Observation,
+    RetrievalCandidate,
+    AffectLog,
+    EvalRun,
+]
 
 
 def _resolve_db_path(project_context: str = None, base_dir: str = None) -> tuple[Path, Path]:
@@ -181,11 +196,18 @@ def _run_migrations():
 
     # retrieval_log migration
     ret_cols = _columns("retrieval_log")
-    if "project_context" not in ret_cols:
-        try:
-            db.execute_sql("ALTER TABLE retrieval_log ADD COLUMN project_context TEXT")
-        except Exception:
-            pass
+    for col, typ in [
+        ("project_context", "TEXT"),
+        ("query_text", "TEXT"),
+        ("limit_count", "INTEGER"),
+        ("selected_count", "INTEGER"),
+        ("metadata", "TEXT"),
+    ]:
+        if col not in ret_cols:
+            try:
+                db.execute_sql(f"ALTER TABLE retrieval_log ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
 
     # narrative_threads migration
     nt_cols = _columns("narrative_threads")
@@ -242,3 +264,20 @@ def _run_migrations():
                 "VALUES (?,?,?,?,?,?,?)",
                 list(r),
             )
+
+    # consolidation_log observer instrumentation columns
+    con_cols = _columns("consolidation_log")
+    for col, typ in [
+        ("prompt", "TEXT"),
+        ("llm_response", "TEXT"),
+        ("model", "TEXT"),
+        ("input_tokens", "INTEGER"),
+        ("output_tokens", "INTEGER"),
+        ("latency_ms", "INTEGER"),
+        ("input_observation_refs", "TEXT"),
+    ]:
+        if col not in con_cols:
+            try:
+                db.execute_sql(f"ALTER TABLE consolidation_log ADD COLUMN {col} {typ}")
+            except Exception:
+                pass

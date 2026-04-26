@@ -378,6 +378,10 @@ class RetrievalLog(BaseModel):
     was_used = IntegerField(default=0)
     relevance_score = FloatField(null=True)
     project_context = TextField(null=True)
+    query_text = TextField(null=True)
+    limit_count = IntegerField(null=True)
+    selected_count = IntegerField(null=True)
+    metadata = TextField(null=True)
 
     class Meta:
         table_name = "retrieval_log"
@@ -399,6 +403,99 @@ class ConsolidationLog(BaseModel):
     from_stage = TextField(null=True)
     to_stage = TextField(null=True)
     rationale = TextField(null=True)
+    prompt = TextField(null=True)
+    llm_response = TextField(null=True)
+    model = TextField(null=True)
+    input_tokens = IntegerField(null=True)
+    output_tokens = IntegerField(null=True)
+    latency_ms = IntegerField(null=True)
+    input_observation_refs = TextField(null=True)
 
     class Meta:
         table_name = "consolidation_log"
+
+
+# ---------------------------------------------------------------------------
+# Observer instrumentation tables
+# ---------------------------------------------------------------------------
+
+
+class Observation(BaseModel):
+    """Raw and filtered observations captured before consolidation decisions."""
+
+    id = AutoField()
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+    session_id = TextField(null=True)
+    source_path = TextField(null=True)
+    ordinal = IntegerField(null=True)
+    content = TextField()
+    filtered_content = TextField(null=True)
+    content_hash = TextField(null=True)
+    status = TextField(null=True)
+    memory_id = TextField(null=True)
+    metadata = TextField(null=True)
+
+    class Meta:
+        table_name = "observations"
+
+
+class RetrievalCandidate(BaseModel):
+    """Per-candidate retrieval scoring details for Observer waterfall views."""
+
+    id = AutoField()
+    retrieval_log_id = IntegerField()
+    memory_id = TextField()
+    rank = IntegerField()
+    fts_rank = IntegerField(null=True)
+    vector_rank = IntegerField(null=True)
+    semantic_score = FloatField(default=0.0)
+    recency_score = FloatField(default=0.0)
+    importance_score = FloatField(default=0.0)
+    affect_score = FloatField(default=0.0)
+    reinforcement_score = FloatField(default=0.0)
+    boost_score = FloatField(default=0.0)
+    final_score = FloatField(default=0.0)
+    was_selected = IntegerField(default=0)
+    metadata = TextField(null=True)
+
+    class Meta:
+        table_name = "retrieval_candidates"
+
+
+class AffectLog(BaseModel):
+    """Point-in-time affect/coherence state snapshots for Observer timelines."""
+
+    id = AutoField()
+    timestamp = TextField(default=lambda: datetime.now().isoformat())
+    session_id = TextField(null=True)
+    project_context = TextField(null=True)
+    frustration = FloatField(default=0.0)
+    satisfaction = FloatField(default=0.0)
+    momentum = FloatField(default=0.0)
+    arousal = FloatField(default=0.0)
+    valence = FloatField(default=0.0)
+    degradation = FloatField(default=0.0)
+    coherence = FloatField(null=True)
+    metadata = TextField(null=True)
+
+    class Meta:
+        table_name = "affect_log"
+
+
+class EvalRun(BaseModel):
+    """Eval report metadata and JSON payloads consumed by Observer."""
+
+    id = AutoField()
+    run_id = TextField(unique=True)
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+    finished_at = TextField(null=True)
+    suite = TextField()
+    status = TextField(default="running")
+    command = TextField(null=True)
+    config_a = TextField(null=True)
+    config_b = TextField(null=True)
+    score = FloatField(null=True)
+    report_json = TextField(null=True)
+
+    class Meta:
+        table_name = "eval_runs"

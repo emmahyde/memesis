@@ -18,7 +18,15 @@ import json
 
 from .database import get_base_dir, get_vec_store
 from .flags import get_flag
-from .models import Memory, MemoryEdge, NarrativeThread, RetrievalLog, ThreadMember, db
+from .models import (
+    Memory,
+    MemoryEdge,
+    NarrativeThread,
+    RetrievalCandidate,
+    RetrievalLog,
+    ThreadMember,
+    db,
+)
 
 if TYPE_CHECKING:
     from .vec import VecStore
@@ -68,6 +76,7 @@ class RetrievalEngine:
         self.token_budget_pct = token_budget_pct
         # token_limit is in *characters* (chars/4 is the token estimate)
         self.token_limit = int(token_budget_pct * 200_000) * 4  # chars
+        self._last_hybrid_candidates = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,6 +104,16 @@ class RetrievalEngine:
             query=query,
             query_embedding=query_embedding,
         )
+
+        if query is not None:
+            self._record_retrieval_run(
+                query=query,
+                session_id=session_id,
+                retrieval_type="injected_query",
+                project_context=project_context,
+                selected_ids=[m.id for m in tier2],
+                limit=len(tier2),
+            )
 
         # Log injections for every memory surfaced
         for memory in tier1 + tier2:
@@ -227,7 +246,68 @@ class RetrievalEngine:
                 "project_context": memory.project_context,
             })
 
+        self._record_retrieval_run(
+            query=query,
+            session_id=session_id,
+            retrieval_type="active_search",
+            project_context=None,
+            selected_ids=[d["id"] for d in disclosed],
+            limit=limit,
+        )
+
         return disclosed
+
+    def _record_retrieval_run(
+        self,
+        query: str,
+        session_id: str,
+        retrieval_type: str,
+        project_context: str | None,
+        selected_ids: list[str],
+        limit: int,
+    ) -> None:
+        """Persist per-candidate retrieval scoring for Observer inspection."""
+        candidates = self._last_hybrid_candidates or []
+        if not candidates:
+            return
+
+        now = datetime.now().isoformat()
+        selected = set(selected_ids)
+        try:
+            log = RetrievalLog.create(
+                timestamp=now,
+                session_id=session_id,
+                memory_id=None,
+                retrieval_type=retrieval_type,
+                was_used=1 if selected_ids else 0,
+                relevance_score=candidates[0]["final_score"] if candidates else None,
+                project_context=project_context,
+                query_text=query,
+                limit_count=limit,
+                selected_count=len(selected_ids),
+                metadata=json.dumps({"candidate_count": len(candidates)}),
+            )
+
+            for candidate in candidates:
+                RetrievalCandidate.create(
+                    retrieval_log_id=log.id,
+                    memory_id=candidate["memory_id"],
+                    rank=candidate["rank"],
+                    fts_rank=candidate.get("fts_rank"),
+                    vector_rank=candidate.get("vector_rank"),
+                    semantic_score=candidate.get("semantic_score", 0.0),
+                    recency_score=candidate.get("recency_score", 0.0),
+                    importance_score=candidate.get("importance_score", 0.0),
+                    affect_score=candidate.get("affect_score", 0.0),
+                    reinforcement_score=candidate.get("reinforcement_score", 0.0),
+                    boost_score=candidate.get("boost_score", 0.0),
+                    final_score=candidate.get("final_score", 0.0),
+                    was_selected=1 if candidate["memory_id"] in selected else 0,
+                    metadata=json.dumps(candidate.get("metadata", {})),
+                )
+        except Exception:
+            # Retrieval must stay available even if observer instrumentation lags a migration.
+            return
 
     def hybrid_search(
         self,
@@ -287,15 +367,37 @@ class RetrievalEngine:
             return []
 
         scores: dict[str, float] = {}
+        component_rows: dict[str, dict] = {}
         for memory_id in all_ids:
             score = 0.0
+            lexical_score = 0.0
+            semantic_score = 0.0
             if memory_id in fts_ranks:
-                score += 1.0 / (rrf_k + fts_ranks[memory_id])
+                lexical_score = 1.0 / (rrf_k + fts_ranks[memory_id])
+                score += lexical_score
             if memory_id in vec_ranks:
-                score += 1.0 / (rrf_k + vec_ranks[memory_id])
+                semantic_score = 1.0 / (rrf_k + vec_ranks[memory_id])
+                score += semantic_score
             scores[memory_id] = score
+            component_rows[memory_id] = {
+                "memory_id": memory_id,
+                "fts_rank": fts_ranks.get(memory_id),
+                "vector_rank": vec_ranks.get(memory_id),
+                "semantic_score": semantic_score,
+                "recency_score": 0.0,
+                "importance_score": 0.0,
+                "affect_score": 0.0,
+                "reinforcement_score": 0.0,
+                "boost_score": lexical_score,
+                "final_score": score,
+                "metadata": {"query": query, "rrf_k": rrf_k},
+            }
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        self._last_hybrid_candidates = [
+            {**component_rows[memory_id], "rank": rank}
+            for rank, (memory_id, _score) in enumerate(ranked, start=1)
+        ]
         return ranked[:k]
 
     def _get_thread_narratives(
