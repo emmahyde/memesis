@@ -8,13 +8,14 @@ keep/prune/promote, and writes decisions back to the memory store.
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
 from .database import get_base_dir, get_vec_store
 from .lifecycle import LifecycleManager
 from .llm import call_llm as _call_llm_transport
-from .models import ConsolidationLog, Memory, db
+from .models import ConsolidationLog, Memory, Observation, db
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .relevance import RelevanceEngine
 
@@ -37,6 +38,7 @@ class Consolidator:
     ):
         self.lifecycle = lifecycle
         self.model = model
+        self._last_llm_call = {}
 
     # ------------------------------------------------------------------
     # Public interface
@@ -81,6 +83,12 @@ class Consolidator:
         # 2c. Replay priority — sort observations by salience before LLM sees them
         from .replay import sort_by_salience
         filtered_content = sort_by_salience(filtered_content)
+        observation_refs = self._record_observations(
+            raw_content=ephemeral_content,
+            filtered_content=filtered_content,
+            source_path=ephemeral_path,
+            session_id=session_id,
+        )
 
         # 3. Build manifest summary
         manifest_summary = self._build_manifest_summary()
@@ -103,6 +111,8 @@ class Consolidator:
             observation = decision.get("observation", "")
             rationale = decision.get("rationale", "")
             contradicts = decision.get("contradicts")
+            refs = self._refs_for_observation(observation, observation_refs)
+            decision["_observer_refs"] = refs
 
             # Track conflicts regardless of action
             if contradicts:
@@ -112,15 +122,18 @@ class Consolidator:
                 memory_id = self._execute_keep(decision, session_id)
                 if memory_id:
                     kept.append(memory_id)
+                    self._mark_observations(refs, "kept", memory_id)
 
             elif action == "prune":
-                self._execute_prune(observation, rationale, session_id)
+                self._execute_prune(observation, rationale, session_id, decision)
                 pruned.append({"observation": observation, "rationale": rationale})
+                self._mark_observations(refs, "pruned")
 
             elif action == "promote":
                 memory_id = self._execute_promote(decision, session_id)
                 if memory_id:
                     promoted.append(memory_id)
+                    self._mark_observations(refs, "promoted", memory_id)
             else:
                 logger.warning("Unknown action '%s' in LLM response; skipping", action)
 
@@ -143,6 +156,91 @@ class Consolidator:
             "conflicts": conflicts,
             "resolved": resolved,
             "rehydrated": rehydrated,
+        }
+
+    def _record_observations(
+        self,
+        raw_content: str,
+        filtered_content: str,
+        source_path: str,
+        session_id: str,
+    ) -> list[dict]:
+        """Persist raw observations before the consolidation LLM decision."""
+        raw_parts = _split_observation_blocks(raw_content)
+        filtered_parts = _split_observation_blocks(filtered_content)
+        parts = filtered_parts or raw_parts
+        refs = []
+
+        for index, content in enumerate(parts):
+            raw = raw_parts[index] if index < len(raw_parts) else content
+            content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()
+            try:
+                observation = Observation.create(
+                    session_id=session_id,
+                    source_path=source_path,
+                    ordinal=index,
+                    content=raw,
+                    filtered_content=content,
+                    content_hash=content_hash,
+                    status="pending",
+                    metadata=json.dumps({"source": "consolidator"}),
+                )
+                refs.append({
+                    "id": observation.id,
+                    "content": content,
+                    "hash": content_hash,
+                })
+            except Exception as exc:
+                logger.debug("Observation instrumentation skipped: %s", exc)
+
+        return refs
+
+    def _refs_for_observation(self, observation: str, refs: list[dict]) -> list[int]:
+        """Best-effort map from an LLM decision observation back to captured rows."""
+        if not observation or not refs:
+            return []
+
+        normalized = observation.strip()
+        exact = [r["id"] for r in refs if r["content"].strip() == normalized]
+        if exact:
+            return exact
+
+        partial = [
+            r["id"] for r in refs
+            if normalized in r["content"] or r["content"] in normalized
+        ]
+        return partial[:3]
+
+    def _mark_observations(
+        self,
+        observation_ids: list[int],
+        status: str,
+        memory_id: str | None = None,
+    ) -> None:
+        """Update observation audit rows after the decision has been applied."""
+        if not observation_ids:
+            return
+        try:
+            Observation.update(status=status, memory_id=memory_id).where(
+                Observation.id.in_(observation_ids)
+            ).execute()
+        except Exception as exc:
+            logger.debug("Observation status instrumentation skipped: %s", exc)
+
+    def _consolidation_metadata(self, decision: dict | None = None) -> dict:
+        """Return shared LLM instrumentation fields for consolidation log rows."""
+        call = self._last_llm_call or {}
+        refs = []
+        if decision is not None:
+            refs = decision.get("_observer_refs") or []
+        return {
+            "prompt": call.get("prompt"),
+            "llm_response": call.get("response"),
+            "model": call.get("model"),
+            "input_tokens": call.get("input_tokens"),
+            "output_tokens": call.get("output_tokens"),
+            "latency_ms": call.get("latency_ms"),
+            "input_observation_refs": json.dumps(refs),
         }
 
     def estimate_token_budget(self, memories: list) -> int:
@@ -198,7 +296,21 @@ class Consolidator:
         Returns:
             List of decision dicts from the LLM.
         """
-        raw = _call_llm_transport(prompt, max_tokens=2048, temperature=0)
+        started_at = time.perf_counter()
+        raw = _call_llm_transport(
+            prompt,
+            max_tokens=2048,
+            temperature=0,
+            model=self.model,
+        )
+        self._last_llm_call = {
+            "prompt": prompt,
+            "response": raw,
+            "model": self.model,
+            "input_tokens": max(1, len(prompt) // 4),
+            "output_tokens": max(1, len(raw) // 4),
+            "latency_ms": int((time.perf_counter() - started_at) * 1000),
+        }
 
         try:
             return self._parse_decisions(raw)
@@ -211,7 +323,21 @@ class Consolidator:
                 "Respond ONLY with a valid JSON object starting with { and ending with }. "
                 "No markdown fences, no explanation, no preamble."
             )
-            retry_raw = _call_llm_transport(retry_prompt, max_tokens=2048, temperature=0)
+            started_at = time.perf_counter()
+            retry_raw = _call_llm_transport(
+                retry_prompt,
+                max_tokens=2048,
+                temperature=0,
+                model=self.model,
+            )
+            self._last_llm_call = {
+                "prompt": retry_prompt,
+                "response": retry_raw,
+                "model": self.model,
+                "input_tokens": max(1, len(retry_prompt) // 4),
+                "output_tokens": max(1, len(retry_raw) // 4),
+                "latency_ms": int((time.perf_counter() - started_at) * 1000),
+            }
 
             try:
                 return self._parse_decisions(retry_raw)
@@ -330,13 +456,20 @@ class Consolidator:
                 from_stage="ephemeral",
                 to_stage="consolidated",
                 rationale=decision.get("rationale", ""),
+                **self._consolidation_metadata(decision),
             )
             return memory_id
         except ValueError as exc:
             logger.warning("KEEP failed for '%s': %s", title, exc)
             return None
 
-    def _execute_prune(self, observation: str, rationale: str, session_id: str) -> None:
+    def _execute_prune(
+        self,
+        observation: str,
+        rationale: str,
+        session_id: str,
+        decision: dict | None = None,
+    ) -> None:
         """
         Execute a PRUNE decision by logging it (no memory created).
 
@@ -356,6 +489,7 @@ class Consolidator:
             from_stage="ephemeral",
             to_stage="ephemeral",
             rationale=rationale,
+            **self._consolidation_metadata(decision),
         )
         logger.debug("PRUNE: %s — %s", observation[:80], rationale)
 
@@ -395,6 +529,7 @@ class Consolidator:
             from_stage=memory.stage,
             to_stage=memory.stage,
             rationale=decision.get("rationale", "Reinforced by new observation"),
+            **self._consolidation_metadata(decision),
         )
 
         # Check if memory now qualifies for lifecycle stage advancement
@@ -507,6 +642,7 @@ class Consolidator:
                 from_stage=memory.stage,
                 to_stage=memory.stage,
                 rationale=f"Contradiction resolved ({resolution_type}): {observation[:100]}",
+                **self._consolidation_metadata(),
             )
 
             resolved.append({
@@ -571,6 +707,7 @@ class Consolidator:
                         from_stage="archived",
                         to_stage=match_stage,
                         rationale=f"Rehydrated by new observation: {memory.title or 'untitled'}",
+                        **self._consolidation_metadata(),
                     )
                     rehydrated.append(match_id)
                     logger.info(
@@ -594,3 +731,27 @@ def _format_markdown(metadata: dict, content: str) -> str:
     lines.append('')
     lines.append(content)
     return '\n'.join(lines)
+
+
+def _split_observation_blocks(content: str) -> list[str]:
+    """Split a markdown-ish ephemeral file into durable observation blocks."""
+    blocks = []
+    current = []
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                blocks.append('\n'.join(current).strip())
+                current = []
+            continue
+        if stripped.startswith('---') and current:
+            blocks.append('\n'.join(current).strip())
+            current = []
+            continue
+        current.append(line.rstrip())
+
+    if current:
+        blocks.append('\n'.join(current).strip())
+
+    return [block for block in blocks if block]
