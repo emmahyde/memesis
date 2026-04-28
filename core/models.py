@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -105,6 +106,10 @@ class Memory(BaseModel):
     # NOTE: created_at already exists as TextField; w2_created_at captures timezone-aware value
     w2_created_at = DateTimeField(null=True, default=lambda: datetime.now(timezone.utc))
 
+    # Agentic-memory BLOCKER set (B4 + E3)
+    expires_at = IntegerField(null=True)          # Unix timestamp; NULL = never expires (T1)
+    source = TextField(default='human')           # 'human' | 'agent'; guards poisoning (E3)
+
     class Meta:
         table_name = "memories"
 
@@ -138,6 +143,75 @@ class Memory(BaseModel):
     def active(cls):
         """Return a query for non-archived memories."""
         return cls.select().where(cls.archived_at.is_null())
+
+    @classmethod
+    def live(cls):
+        """Return a query for non-archived, non-expired memories.
+
+        Includes memories where expires_at is NULL (never-expire, T1) or
+        expires_at is in the future.  Does NOT replace active() — both coexist.
+        """
+        now_ts = int(time.time())
+        return cls.select().where(
+            cls.archived_at.is_null()
+            & (cls.expires_at.is_null() | (cls.expires_at > now_ts))
+        )
+
+    def set_expiry(self) -> None:
+        """Compute and persist expires_at based on this memory's stage/tier.
+
+        T1 (instinctive) → expires_at = None (never expire).
+        All other tiers → expires_at = int(time.time()) + tier_ttl(stage_to_tier(stage)).
+        Calls self.save() to persist.
+        """
+        from .tiers import stage_to_tier, tier_ttl
+        ttl = tier_ttl(stage_to_tier(self.stage))
+        if ttl is None:
+            self.expires_at = None
+        else:
+            self.expires_at = int(time.time()) + ttl
+        self.save()
+        return None
+
+    @classmethod
+    def hard_delete(cls, memory_id: str) -> None:
+        """Hard-delete a memory with cascade to FTS5 and vec_memories.
+
+        All three DELETE statements run inside a single db.atomic() block.
+        This is the ONLY sanctioned path for raw deletion — no app code
+        should issue raw DELETE FROM memories outside this method.
+        """
+        from .database import get_vec_store
+        with db.atomic():
+            # FTS5 cascade: fetch current DB values first (same as _fts_delete_from_db)
+            cursor = db.execute_sql(
+                "SELECT rowid, title, summary, tags, content FROM memories WHERE id = ?",
+                (memory_id,),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                rowid, title, summary, tags, content = row
+                db.execute_sql(
+                    "INSERT INTO memories_fts(memories_fts, rowid, title, summary, tags, content) "
+                    "VALUES('delete', ?, ?, ?, ?, ?)",
+                    (rowid, title or "", summary or "", tags or "", content or ""),
+                )
+            # vec_memories cascade (no-op when VecStore unavailable)
+            vec_store = get_vec_store()
+            if vec_store is not None and vec_store.available:
+                try:
+                    conn = vec_store._connect()
+                    try:
+                        conn.execute(
+                            "DELETE FROM vec_memories WHERE memory_id = ?",
+                            (memory_id,),
+                        )
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+            # Primary row
+            db.execute_sql("DELETE FROM memories WHERE id = ?", (memory_id,))
 
     @classmethod
     def by_stage(cls, stage, include_archived=False):

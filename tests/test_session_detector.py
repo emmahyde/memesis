@@ -22,12 +22,14 @@ def test_cwd_sector_project_is_code():
     assert detect_session_type_from_cwd("/Users/emmahyde/projects/sector") == "code"
 
 
-def test_cwd_memesis_project_is_code():
-    assert detect_session_type_from_cwd("/Users/emmahyde/projects/memesis") == "code"
+def test_cwd_memesis_project_is_research():
+    # /projects/memesis matches RESEARCH_PATH_HINTS_PREPEND before code hints
+    assert detect_session_type_from_cwd("/Users/emmahyde/projects/memesis") == "research"
 
 
-def test_cwd_generic_projects_dir_is_code():
-    assert detect_session_type_from_cwd("/Users/emmahyde/projects/myapp") == "code"
+def test_cwd_generic_projects_dir_returns_none():
+    # Generic /projects/myapp has no matching hint — ambiguous, returns None
+    assert detect_session_type_from_cwd("/Users/emmahyde/projects/myapp") is None
 
 
 def test_cwd_manuscript_is_writing():
@@ -175,13 +177,42 @@ def test_combined_writing_cwd():
     assert result == "writing"
 
 
-def test_combined_ambiguous_falls_back_to_default():
+def test_combined_no_cwd_no_tools_returns_unknown():
+    # A3: cwd=None + tool_uses=None → 'unknown'
     result = detect_session_type(None, None)
+    assert result == "unknown"
+
+
+def test_combined_no_cwd_empty_tools_returns_unknown():
+    # A3: cwd=None + tool_uses=[] → 'unknown'
+    result = detect_session_type(None, [])
+    assert result == "unknown"
+
+
+def test_combined_ambiguous_tools_returns_unknown():
+    # A3: tool_uses yields no confident type → 'unknown'
+    tool_uses = [{"tool_name": "Read", "file_path": "/some/file.json"}]
+    result = detect_session_type(None, tool_uses)
+    assert result == "unknown"
+
+
+def test_combined_cwd_overrides_tool_mix():
+    # cwd hint takes precedence regardless of tool_uses
+    tool_uses = [
+        {"tool_name": "WebFetch", "file_path": ""},
+        {"tool_name": "Read", "file_path": "/notes/ref.md"},
+    ]
+    # cwd → code; tool mix → research; cwd wins
+    result = detect_session_type("/Users/emmahyde/projects/sector", tool_uses)
     assert result == "code"
 
 
-def test_combined_ambiguous_tools_falls_back_to_default():
-    tool_uses = [{"tool_name": "Read", "file_path": "/some/file.json"}]
+def test_combined_tool_uses_fires_only_as_tiebreak_when_cwd_none():
+    # tool_uses is tiebreak only when cwd is None
+    tool_uses = [
+        {"tool_name": "Edit", "file_path": "/app/main.py"},
+        {"tool_name": "Bash", "file_path": ""},
+    ]
     result = detect_session_type(None, tool_uses)
     assert result == "code"
 
