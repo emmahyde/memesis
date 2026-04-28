@@ -187,6 +187,7 @@ def _run_migrations():
         ("next_injection_due", "TEXT"),
         ("injection_ease_factor", "REAL DEFAULT 2.5"),
         ("injection_interval_days", "REAL DEFAULT 1.0"),
+        ("files_modified", "TEXT DEFAULT '[]'"),
     ]:
         if col not in mem_cols:
             try:

@@ -719,3 +719,35 @@ class TestFormatGuidance:
         guidance = format_guidance(state)
         assert "plan" in guidance.lower()
         assert "User corrections so far" not in guidance
+
+
+class TestNonTypedInputGating:
+    """update() must reject pasted skill bodies / system reminders without
+    poisoning the valence window or repair counter."""
+
+    def test_skill_body_does_not_increment_repair_count(self):
+        analyzer = InteractionAnalyzer()
+        body = (
+            "Base directory for this skill: /Users/foo/.claude/skills/x\n\n"
+            "# Foo skill\nDocumentation says this never fails, never errors, "
+            "and never blocks even when wrong inputs arrive."
+        )
+        analyzer.update(body)
+        assert analyzer._repair_count == 0
+        assert analyzer._valence_window == []
+
+    def test_system_reminder_does_not_log_correction(self):
+        analyzer = InteractionAnalyzer()
+        msg = "<system-reminder>I told you again to stop, please just do this</system-reminder>"
+        analyzer.update(msg)
+        assert analyzer._corrections == []
+
+    def test_long_paste_skipped(self):
+        analyzer = InteractionAnalyzer()
+        analyzer.update("x " * 500)
+        assert analyzer._exchange_count == 0
+
+    def test_real_typed_friction_still_counts(self):
+        analyzer = InteractionAnalyzer()
+        analyzer.update("ugh, this is broken again")
+        assert "friction" in analyzer._valence_window

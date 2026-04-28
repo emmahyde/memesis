@@ -179,7 +179,7 @@ the ecosystem has a better option.
 
 - Facts that live in the code or git history
 - Step-by-step task logs ("then I ran pytest")
-- Emotional state observations (the privacy filter will catch these anyway)
+- Emotional self-narration without behavioral framing ("I felt confused" — phrase as "kept asking the same question 3 times" instead)
 - Generic truths ("user prefers clean code")
 """
 

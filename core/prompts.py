@@ -1,5 +1,5 @@
 """
-Prompt templates, observation taxonomy, and privacy filter patterns.
+Prompt templates and observation taxonomy.
 
 This module defines the voice and judgment of the memory system —
 how observations are structured, how consolidation decisions are made,
@@ -24,6 +24,20 @@ OBSERVATION_TYPES = {
     "personality": "Who this person IS — values, opinions, energy, directness, aesthetic sense. 'Prefers clean code' is generic. 'Values angular/precise design, provides reference screenshots as specs, pushes back bluntly when quality is off' has texture.",
     "aesthetic": "Visual taste, quality standards, design sensibility. What they find beautiful, ugly, or acceptable.",
     "collaboration_dynamic": "How we work together — trust patterns, delegation style, feedback style, when they hand off control vs engage deeply.",
+    "system_change": "What the codebase or system now does differently — shipped capability, fix, refactor, or migration. Captures authored work, not user behavior. (Borrowed from claude-mem; complements user-trait observations.)",
+}
+
+
+# Concept tags — orthogonal to observation_type. Borrowed from claude-mem
+# (see claude-mem/plugin/modes/code.json:63-99). Validation is prompt-only.
+CONCEPT_TAGS = {
+    "how-it-works":     "Mechanism or implementation detail",
+    "why-it-exists":    "Purpose or rationale",
+    "what-changed":     "Modification or capability shift",
+    "problem-solution": "Issue and its fix",
+    "gotcha":           "Trap or edge case",
+    "pattern":          "Reusable approach",
+    "trade-off":        "Pros/cons of a decision",
 }
 
 
@@ -89,8 +103,12 @@ PRUNE AGGRESSIVELY:
 
 SELECTIVITY: Let the behavioral gate decide, not an arbitrary number. A short session might have 0 keeps. A long, dense collaboration might have 10. Trust the gate — if losing it would hurt, keep it. If not, prune it. The test is quality, not quota.
 
-PRIVACY:
-- NEVER store emotional state observations (frustration, excitement, mood)
+BEHAVIORAL FRAMING:
+- Phrase friction signals as workflow patterns, not feelings.
+- GOOD: "User pivots to a new approach after 2 failed tool retries rather than persisting"
+- GOOD: "User stops engaging when responses exceed ~5 paragraphs"
+- LESS USEFUL: "User is frustrated"
+- Both are allowed; behavioral framing transfers better across sessions.
 
 CONFLICT CHECK:
 - Does any observation CONTRADICT an existing memory? If so, note which one.
@@ -112,7 +130,9 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "summary": "~150 char summary (keep only)",
       "tags": ["tag1", "tag2"],
       "target_path": "category/filename.md (keep only)",
-      "observation_type": "correction|preference_signal|shared_insight|domain_knowledge|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic|null",
+      "observation_type": "correction|preference_signal|shared_insight|domain_knowledge|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic|system_change|null",
+      "concept_tags": ["how-it-works|why-it-exists|what-changed|problem-solution|gotcha|pattern|trade-off"],
+      "files_modified": ["relative/path.py"],
       "reinforces": "memory_id or null",
       "contradicts": "memory_id or null"
     }}
@@ -214,8 +234,9 @@ Mode taxonomy:
   correction     - an earlier belief was wrong; state the correct version
   open_question  - an unresolved issue worth surfacing next session
 
-PRIVACY: NEVER store emotional state observations (e.g. "user is frustrated",
-"user seems excited"). Only factual, technical, or preference content.
+BEHAVIORAL FRAMING: Phrase friction signals as workflow patterns rather than
+feelings. "User pivots after 2 failed retries" beats "user is frustrated";
+both are allowed but behavioral framing transfers better across sessions.
 
 Skip:
 - Tool call logs without a finding attached
@@ -227,7 +248,7 @@ Importance anchors:
   0.2  routine finding ("this module uses pytest")
   0.5  useful context ("auth tokens stored in Redis with 24h TTL")
   0.8  load-bearing decision ("chose cron over hooks to avoid blocking")
-  0.95 correction or hard constraint ("privacy filter MUST precede LLM calls")
+  0.95 correction or hard constraint ("must call _resolve_db_path before init_db")
 
 Return a JSON array (empty array if nothing qualifies):
 [
