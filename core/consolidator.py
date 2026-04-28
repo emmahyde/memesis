@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .database import get_base_dir, get_vec_store
 from .lifecycle import LifecycleManager
+from .linking import link_memory as _link_memory
 from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, Observation, db
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
@@ -123,6 +124,12 @@ class Consolidator:
                 if memory_id:
                     kept.append(memory_id)
                     self._mark_observations(refs, "kept", memory_id)
+                    # WS-F: cosine-based linking post-processing (C3/OD-D)
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        _link_memory(mem)
+                    except Exception as _link_exc:
+                        logger.debug("Linking skipped for %s: %s", memory_id, _link_exc)
 
             elif action == "prune":
                 self._execute_prune(observation, rationale, session_id, decision)
@@ -134,6 +141,12 @@ class Consolidator:
                 if memory_id:
                     promoted.append(memory_id)
                     self._mark_observations(refs, "promoted", memory_id)
+                    # WS-F: cosine-based linking post-processing (C3/OD-D)
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        _link_memory(mem)
+                    except Exception as _link_exc:
+                        logger.debug("Linking skipped for %s: %s", memory_id, _link_exc)
             else:
                 logger.warning("Unknown action '%s' in LLM response; skipping", action)
 
