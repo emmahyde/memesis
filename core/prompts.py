@@ -4,6 +4,19 @@ Prompt templates and observation taxonomy.
 This module defines the voice and judgment of the memory system —
 how observations are structured, how consolidation decisions are made,
 and what the system refuses to store.
+
+Token budget guidance (per panel LLME-F8):
+- Stage 1 lean schema: ~150 tokens per observation
+  (kind + knowledge_type + confidence + importance + facts + cwd)
+- Stage 2 full schema: ~280 tokens per decision
+  (all Stage 1 fields + subject + work_event + subtitle + raw_importance + action + rationale + links)
+
+Stage 1 runs on the 15-minute cron (high frequency — keep it lean).
+Stage 2 runs on the hourly cron / PreCompact hook (lower frequency — full enrichment is fine).
+
+CONCEPT_TAGS removed per panel C2 / TAXONOMY §3: replaced by knowledge_type (Bloom-Revised
+4-way vocabulary) + knowledge_type_confidence. The W2 borrow of claude-mem concept tags is
+reverted. See TAXONOMY-AND-DEFERRED-PATTERNS.md §3 for the collapse map.
 """
 
 from datetime import datetime
@@ -25,19 +38,6 @@ OBSERVATION_TYPES = {
     "aesthetic": "Visual taste, quality standards, design sensibility. What they find beautiful, ugly, or acceptable.",
     "collaboration_dynamic": "How we work together — trust patterns, delegation style, feedback style, when they hand off control vs engage deeply.",
     "system_change": "What the codebase or system now does differently — shipped capability, fix, refactor, or migration. Captures authored work, not user behavior. (Borrowed from claude-mem; complements user-trait observations.)",
-}
-
-
-# Concept tags — orthogonal to observation_type. Borrowed from claude-mem
-# (see claude-mem/plugin/modes/code.json:63-99). Validation is prompt-only.
-CONCEPT_TAGS = {
-    "how-it-works":     "Mechanism or implementation detail",
-    "why-it-exists":    "Purpose or rationale",
-    "what-changed":     "Modification or capability shift",
-    "problem-solution": "Issue and its fix",
-    "gotcha":           "Trap or edge case",
-    "pattern":          "Reusable approach",
-    "trade-off":        "Pros/cons of a decision",
 }
 
 
@@ -73,66 +73,114 @@ def format_observation(text: str, obs_type: str | None = None, context: str | No
 # Consolidation prompt
 # ---------------------------------------------------------------------------
 
-CONSOLIDATION_PROMPT = """You are reviewing your own session notes before sleep. These observations were captured during active work. MOST SHOULD DIE. You are looking for the observations that would genuinely change how you behave in a future session. Not "interesting" — behaviorally load-bearing.
+CONSOLIDATION_PROMPT = """You are reviewing a buffer of Stage 1 observations captured during recent work sessions.
+Your job: review each observation with full context, re-score its importance independently, add
+Stage 2 enrichment fields, and decide KEEP / PRUNE / PROMOTE.
 
-THE TEST: For each observation, ask: "If I didn't have this, would I do something wrong next time?" If the answer is no — if you'd figure it out from the code, the git history, or common sense — PRUNE IT.
+THE BEHAVIORAL GATE: For each observation, ask — "Would I do something wrong without this?"
+If the code, git log, or common sense would surface it anyway: PRUNE IT.
 
-SESSION OBSERVATIONS:
+SESSION OBSERVATIONS (Stage 1 buffer):
 {ephemeral_content}
 
 EXISTING MEMORY MANIFEST:
 {manifest_summary}
 
+---
+
 MANDATORY KEEP:
-- Observations prefixed with [PRIORITY] were explicitly stored by the user via /learn. ALWAYS keep these — the user decided they matter. Do not second-guess.
+- Observations prefixed with [PRIORITY] were explicitly stored by the user via /learn.
+  ALWAYS keep these. The user decided they matter. Do not second-guess.
 
-KEEP ONLY IF it passes one of these gates (in priority order):
-1. CORRECTIONS — You were wrong. What pattern caused it? Would you make the same mistake without this memory? Keep only if the pattern is non-obvious.
-2. PREFERENCE SIGNALS — The user pushed back. But ONLY keep if the preference is surprising or counter-intuitive. "Prefers clean code" fails. "Prefers angular connectors over curved because she reads data flow direction from angles" passes.
-3. SELF-OBSERVATIONS — You caught yourself doing something. ONLY keep if it's a specific, actionable pattern, not a generic tendency you'd write about any AI.
-4. WORKFLOW PATTERNS — How this specific person works in ways you wouldn't guess. "Works across multiple repos" is obvious from any engineer. "Prefers to remove scaffolding immediately after migration completes rather than in a follow-up PR" has teeth.
+KEEP gates (in priority order):
+1. CORRECTIONS — You were wrong. Does the pattern cause the mistake again without this? Keep only
+   if the pattern is non-obvious.
+2. PREFERENCE SIGNALS — User pushed back, but ONLY keep if the preference is surprising or
+   counter-intuitive. "Prefers clean code" fails. "Prefers angular connectors because she reads
+   data flow direction from angle" passes.
+3. SELF-OBSERVATIONS — Specific, actionable pattern — not a generic tendency you'd write about
+   any AI.
+4. WORKFLOW PATTERNS — How this specific person works in ways you wouldn't guess.
 
-PRUNE AGGRESSIVELY:
-- Anything re-derivable from code, git log, or reading the codebase
-- One-time task mechanics, tool output, file paths, commit hashes
-- Generic observations true of most engineers ("moves fast", "prefers tests")
-- Preferences without reasoning (the WHY is the only part worth keeping)
-- Domain knowledge that lives in documentation
-- Self-observations that are just "I should have done X" without identifying the underlying PATTERN
-- Anything you're keeping because it's "interesting" rather than because losing it would hurt
+PRUNE if:
+- Re-derivable from code, git log, docs, or codebase reading
+- One-time task mechanics, file paths, commit hashes, test output
+- Generic observations true of most engineers
+- Preferences without the WHY (the reasoning is the only keepable part)
+- "I should have done X" without identifying the underlying PATTERN
 
-SELECTIVITY: Let the behavioral gate decide, not an arbitrary number. A short session might have 0 keeps. A long, dense collaboration might have 10. Trust the gate — if losing it would hurt, keep it. If not, prune it. The test is quality, not quota.
+SELECTIVITY: Let the behavioral gate decide — not a number. A short session may have 0 keeps.
+A dense collaboration may have 10. Trust the gate: quality, not quota.
+
+---
+
+IMPORTANCE RE-SCORING (panel C7):
+You have more context than Stage 1 did. Re-score `importance` independently using the full
+buffer and manifest. Preserve the Stage 1 score as `raw_importance` for audit. Do not just copy
+the Stage 1 score — you should diverge when context justifies it.
+
+Importance anchors:
+  0.2  routine finding (re-derivable, low stakes)
+  0.5  useful context (saves time but not load-bearing)
+  0.8  load-bearing decision (getting this wrong causes real problems)
+  0.95 correction or hard constraint (must-know to avoid repeating a mistake)
+
+---
+
+STAGE 2 AXIS PROMPTS:
+
+subject — what or whom is this observation about?
+  self          — the AI's own tendencies or failure modes
+  user          — developer personality, aesthetics, collaboration style
+  system        — codebase, infrastructure, tool behavior
+  collaboration — how we work together (delegation, trust, feedback)
+  workflow      — how the user thinks and operates
+  aesthetic     — visual taste, quality standards, design sensibility
+  domain        — technical fact not re-derivable from codebase
+  Tie-breaker: if the observation is about codebase or tooling behavior, default to "system".
+  Only use "user" when the observation is explicitly about developer preferences or personality.
+
+work_event — only when the observation traces directly to a discrete code action this session:
+  bugfix | feature | refactor | discovery | change
+  Set to null for preference, constraint, correction, and open_question observations.
+  Most observations should have work_event=null. Do not hallucinate a code action.
+
+subtitle — ≤24 words. Acts as a retrieval card: enough context to judge relevance without
+  loading full content. Do not exceed 24 words.
+
+---
 
 BEHAVIORAL FRAMING:
 - Phrase friction signals as workflow patterns, not feelings.
-- GOOD: "User pivots to a new approach after 2 failed tool retries rather than persisting"
-- GOOD: "User stops engaging when responses exceed ~5 paragraphs"
+- GOOD: "Emma pivots to a new approach after 2 failed tool retries rather than persisting"
 - LESS USEFUL: "User is frustrated"
-- Both are allowed; behavioral framing transfers better across sessions.
 
 CONFLICT CHECK:
-- Does any observation CONTRADICT an existing memory? If so, note which one.
-- Does any observation REINFORCE an existing memory? If so, reference it by ID.
+- Does any observation CONTRADICT an existing memory? Note the memory_id.
+- Does any observation REINFORCE an existing memory? Reference it by ID.
 
-For each observation, decide:
-- KEEP: Passes the "would I do something wrong without this?" gate.
-- PRUNE: Fails the gate. Say why in one sentence.
-- PROMOTE: Reinforces an existing memory. Specify the memory_id from the manifest.
+---
+
+If the buffer has nothing worth processing, return {{"decisions": []}}.
+Do NOT skip — Stage 2 always returns a decision array.
 
 Respond ONLY with valid JSON (no markdown, no explanation):
 {{
   "decisions": [
     {{
-      "observation": "the raw observation text",
+      "raw_importance": 0.0,
+      "importance": 0.0,
+      "kind": "decision|finding|preference|constraint|correction|open_question",
+      "knowledge_type": "factual|conceptual|procedural|metacognitive",
+      "knowledge_type_confidence": "low|high",
+      "facts": ["Named subject did what, when/where — no pronouns"],
+      "cwd": "/abs/path/or/null",
+      "subject": "self|user|system|collaboration|workflow|aesthetic|domain",
+      "work_event": "bugfix|feature|refactor|discovery|change|null",
+      "subtitle": "retrieval card no longer than twenty-four words",
       "action": "keep|prune|promote",
-      "rationale": "why this decision — be honest with yourself",
-      "title": "short title (keep only)",
-      "summary": "~150 char summary (keep only)",
-      "tags": ["tag1", "tag2"],
+      "rationale": "why this decision",
       "target_path": "category/filename.md (keep only)",
-      "observation_type": "correction|preference_signal|shared_insight|domain_knowledge|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic|system_change|null",
-      "concept_tags": ["how-it-works|why-it-exists|what-changed|problem-solution|gotcha|pattern|trade-off"],
-      "files_modified": ["relative/path.py"],
       "reinforces": "memory_id or null",
       "contradicts": "memory_id or null"
     }}
@@ -219,24 +267,18 @@ Respond ONLY with valid JSON:
 # Transcript delta extraction prompt
 # ---------------------------------------------------------------------------
 
-OBSERVATION_EXTRACT_PROMPT = """Extract 0-3 durable observations from this Claude Code session slice.
+OBSERVATION_EXTRACT_PROMPT = """Extract every durable observation that passes the quality gate from this Claude Code session slice.
 
-Each observation must be:
-- Falsifiable (could be discovered wrong later)
-- Durable (still relevant in a future session)
-- Novel (not derivable from reading the codebase directly)
+A short slice may have zero qualifying observations. A dense one may have many.
+Quality, not quota.
 
-Mode taxonomy:
-  decision       - a choice made, with rationale
-  finding        - something learned about the system or codebase
-  preference     - how the user wants to work
-  constraint     - a requirement or limit going forward
-  correction     - an earlier belief was wrong; state the correct version
-  open_question  - an unresolved issue worth surfacing next session
+---
 
-BEHAVIORAL FRAMING: Phrase friction signals as workflow patterns rather than
-feelings. "User pivots after 2 failed retries" beats "user is frustrated";
-both are allowed but behavioral framing transfers better across sessions.
+QUALITY GATE — an observation qualifies only if ALL of the following are true:
+- Falsifiable: could be discovered wrong later
+- Durable: still relevant in a future session, not just today's task
+- Novel: not derivable from reading the codebase, docs, or git history directly
+- Load-bearing: without this, I would do something wrong next time
 
 Skip:
 - Tool call logs without a finding attached
@@ -244,21 +286,91 @@ Skip:
 - Status checks, test runs that passed without incident
 - Anything obvious from the codebase itself
 
-Importance anchors:
+---
+
+KIND AXIS — what type of claim is this? (pick the best fit; kind and knowledge_type are
+independent dimensions — do not collapse them)
+
+  decision      — a choice made, with rationale; the constraints that produced it
+  finding       — something learned about the system or codebase
+  preference    — how the user wants to work
+  constraint    — a requirement or limit going forward
+  correction    — an earlier belief was wrong; state the correct version
+  open_question — an unresolved issue worth surfacing next session
+
+---
+
+KNOWLEDGE_TYPE AXIS — what kind of knowledge is this? (orthogonal to kind)
+
+  factual       — discrete fact, terminology, specific value
+                  YES: "memesis consolidator runs hourly via consolidate_cron.py"
+                  NO (if it's a principle): use conceptual
+  conceptual    — mechanism, principle, model, classification
+                  YES: "EventBus uses copy-on-write snapshots to avoid lock contention"
+                  NO (if it's a how-to sequence): use procedural
+  procedural    — how-to, method, step sequence, required call order
+                  YES: "must call _resolve_db_path before init_db or path resolves wrong"
+                  NO (if it's a static fact): use factual
+  metacognitive — strategy, self-knowledge, vigilance, trade-off awareness
+                  YES: "Emma defaults to most-powerful tool when simplest would do"
+                  NO (if it's a concrete fact about code): use factual
+
+  Tie-breaker: if both factual AND conceptual apply, prefer factual.
+  If both procedural AND factual apply, prefer procedural.
+
+KNOWLEDGE_TYPE_CONFIDENCE:
+  high — your classification is unambiguous; a second reader would agree
+  low  — reasonable people could classify this differently
+
+kind and knowledge_type are independent dimensions. Do not collapse them —
+a "decision" can be factual, conceptual, procedural, or metacognitive.
+
+---
+
+FACTS ATTRIBUTION:
+Each fact must begin with a named subject. No pronouns (he/she/it/they/we/I/this/that/the).
+Each fact must stand alone — no implicit context from the surrounding observation.
+Use concrete past-tense action verbs: implemented, fixed, deployed, configured, migrated,
+optimized, added, refactored, discovered, confirmed, traced.
+
+  YES: "Emma rejected tailored CSS grid in favor of fixed-width panels citing scan-path predictability"
+  NO:  "She prefers fixed-width panels"
+
+---
+
+IMPORTANCE ANCHORS:
   0.2  routine finding ("this module uses pytest")
   0.5  useful context ("auth tokens stored in Redis with 24h TTL")
-  0.8  load-bearing decision ("chose cron over hooks to avoid blocking")
+  0.8  load-bearing decision ("chose cron over hooks to avoid blocking the hook path")
   0.95 correction or hard constraint ("must call _resolve_db_path before init_db")
 
-Return a JSON array (empty array if nothing qualifies):
+---
+
+SKIP PROTOCOL:
+If this slice has no qualifying observation, return:
+  {{"skipped": true, "reason": "<one sentence>"}}
+Do NOT return an empty array — that signals extraction failure, not intentional skip.
+
+---
+
+Return either an array of observations OR a skip signal. No markdown fences. No commentary.
+
+Array form:
 [
   {{
-    "content": "1-2 sentence statement of the durable observation",
-    "mode": "decision|finding|preference|constraint|correction|open_question",
+    "kind": "decision|finding|preference|constraint|correction|open_question",
+    "knowledge_type": "factual|conceptual|procedural|metacognitive",
+    "knowledge_type_confidence": "low|high",
     "importance": 0.0,
-    "tags": ["lowercase-hyphenated", "topical"]
+    "facts": [
+      "Named subject did what, when/where — no pronouns, self-contained"
+    ],
+    "cwd": "/absolute/path/or/null"
   }}
 ]
+
+Skip form:
+{{"skipped": true, "reason": "no durable signal in this slice"}}
 
 Session slice:
 {transcript}
