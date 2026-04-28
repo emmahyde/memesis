@@ -94,6 +94,11 @@ class Memory(BaseModel):
     raw_importance = FloatField(null=True)            # Stage 1 importance, preserved for audit (C7)
     linked_observation_ids = TextField(null=True)     # JSON-serialized list of UUIDs
 
+    # WS-H: open_question lifecycle fields (Sprint B DS-F9)
+    resolves_question_id = TextField(null=True)   # UUID of the open_question this memory resolves
+    resolved_at = DateTimeField(null=True)         # when this question was resolved (set on question row)
+    is_pinned = IntegerField(default=0, null=True) # 1 = exempt from auto-pruning (open_questions)
+
     # DS-F3 forward-compat: shadow-prune logger fields
     access_count = IntegerField(default=0, null=True)
     last_accessed_at = DateTimeField(null=True)
