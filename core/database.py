@@ -202,6 +202,10 @@ def _run_migrations():
         ("access_count", "INTEGER DEFAULT 0"),
         ("last_accessed_at", "TEXT"),
         ("w2_created_at", "TEXT"),
+        # WS-H: open_question lifecycle fields (Sprint B DS-F9)
+        ("resolves_question_id", "TEXT"),
+        ("resolved_at", "TEXT"),
+        ("is_pinned", "INTEGER DEFAULT 0"),
     ]:
         if col not in mem_cols:
             try:
