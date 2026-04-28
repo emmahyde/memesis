@@ -18,6 +18,12 @@ from .linking import link_memory as _link_memory
 from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, Observation, db
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
+from .question_lifecycle import (
+    detect_resolution,
+    get_unresolved_questions,
+    mark_resolved,
+    pin_open_question,
+)
 from .relevance import RelevanceEngine
 
 logger = logging.getLogger(__name__)
@@ -94,10 +100,14 @@ class Consolidator:
         # 3. Build manifest summary
         manifest_summary = self._build_manifest_summary()
 
+        # 3b. Build open_questions context block (WS-H)
+        open_questions_block = self._build_open_questions_block()
+
         # 4. Build and send prompt to Claude
         prompt = CONSOLIDATION_PROMPT.format(
             ephemeral_content=filtered_content,
             manifest_summary=manifest_summary,
+            open_questions_block=open_questions_block,
         )
         decisions = self._call_llm(prompt)
 
@@ -130,6 +140,23 @@ class Consolidator:
                         _link_memory(mem)
                     except Exception as _link_exc:
                         logger.debug("Linking skipped for %s: %s", memory_id, _link_exc)
+                    # WS-H: open_question lifecycle hook
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        if mem.kind == "open_question":
+                            pin_open_question(mem)
+                        elif mem.kind in ("correction", "finding"):
+                            question_id = detect_resolution(mem)
+                            if question_id:
+                                question = Memory.get_by_id(question_id)
+                                mark_resolved(question, mem)
+                                logger.info(
+                                    "WS-H: memory %s resolves open_question %s",
+                                    memory_id,
+                                    question_id,
+                                )
+                    except Exception as _q_exc:
+                        logger.debug("Question lifecycle hook skipped for %s: %s", memory_id, _q_exc)
 
             elif action == "prune":
                 self._execute_prune(observation, rationale, session_id, decision)
@@ -147,6 +174,21 @@ class Consolidator:
                         _link_memory(mem)
                     except Exception as _link_exc:
                         logger.debug("Linking skipped for %s: %s", memory_id, _link_exc)
+                    # WS-H: open_question lifecycle hook
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        if mem.kind in ("correction", "finding"):
+                            question_id = detect_resolution(mem)
+                            if question_id:
+                                question = Memory.get_by_id(question_id)
+                                mark_resolved(question, mem)
+                                logger.info(
+                                    "WS-H: promoted memory %s resolves open_question %s",
+                                    memory_id,
+                                    question_id,
+                                )
+                    except Exception as _q_exc:
+                        logger.debug("Question lifecycle hook skipped for %s: %s", memory_id, _q_exc)
             else:
                 logger.warning("Unknown action '%s' in LLM response; skipping", action)
 
@@ -274,6 +316,16 @@ class Consolidator:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _build_open_questions_block(self) -> str:
+        """Build a text block of unresolved open_questions for Stage 2 prompt injection (WS-H)."""
+        questions = get_unresolved_questions(limit=10)
+        if not questions:
+            return "(none)"
+        lines = []
+        for q in questions:
+            lines.append(f"- [{q.id}] {q.title or '(untitled)'}: {q.summary or ''}")
+        return "\n".join(lines)
 
     def _build_manifest_summary(self) -> str:
         """
