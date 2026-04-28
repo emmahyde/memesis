@@ -129,8 +129,11 @@ class TestStage1PromptStructure:
         assert '"subject"' not in OBSERVATION_EXTRACT_PROMPT
 
     def test_format_with_mock_transcript(self):
-        # Smoke test: no KeyError
-        formatted = OBSERVATION_EXTRACT_PROMPT.format(transcript="mock session content")
+        # Smoke test: no KeyError (session_type added in Sprint B WS-G)
+        formatted = OBSERVATION_EXTRACT_PROMPT.format(
+            transcript="mock session content",
+            session_type="code",
+        )
         assert "mock session content" in formatted
 
 
@@ -209,10 +212,11 @@ class TestStage2PromptStructure:
         assert '"observation_type"' not in CONSOLIDATION_PROMPT
 
     def test_format_with_mock_data(self):
-        # Smoke test: no KeyError
+        # Smoke test: no KeyError (open_questions_block added by WS-H)
         formatted = CONSOLIDATION_PROMPT.format(
             ephemeral_content="[observation 1]\n[observation 2]",
             manifest_summary="existing memories: none",
+            open_questions_block="none",
         )
         assert "observation 1" in formatted
         assert "existing memories" in formatted
