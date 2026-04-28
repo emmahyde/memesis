@@ -44,15 +44,75 @@ def project_memory_dir(jsonl_path: Path) -> Path:
     return jsonl_path.parent / "memory"
 
 
+def _write_ingest_trace(outcome: str, reason: str, raw_excerpt: str) -> None:
+    """Append a skip/rejection trace to the validator observability stream.
+
+    Local writer — does not depend on core/observability.py (WS-A).
+    Refactor once WS-A lands.
+    """
+    import datetime
+    trace_path = Path("backfill-output") / "observability" / "validator-trace.jsonl"
+    try:
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+            "stage": "ingest",
+            "outcome": outcome,
+            "field_errors": [reason],
+            "raw_excerpt": raw_excerpt[:80],
+        }
+        with trace_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
 def extract_observations(rendered: str) -> list[dict]:
-    """Call LLM to extract observations; filter low-importance entries."""
+    """Call LLM to extract observations; filter low-importance entries.
+
+    Handles two LLM response formats:
+      1. JSON array  []         — existing behavior; observation list (possibly empty).
+      2. JSON object {"skipped": true, "reason": "..."}
+                                — intentional skip signal (Stage-1 skip protocol, LLME-F5).
+         Any other dict is treated as malformed and rejected.
+    """
     raw = call_llm(OBSERVATION_EXTRACT_PROMPT.format(transcript=rendered))
     try:
-        obs_list = json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning("extract_observations: failed to parse LLM response as JSON")
         return []
-    return [o for o in obs_list if o.get("importance", 0) >= 0.3]
+
+    if isinstance(parsed, list):
+        # Existing behavior — array of observations (may be empty).
+        return [o for o in parsed if o.get("importance", 0) >= 0.3]
+
+    if isinstance(parsed, dict):
+        if parsed.get("skipped") is True:
+            # Intentional skip — log and return empty.
+            reason = parsed.get("reason", "(no reason given)")
+            logger.info(
+                "extract_observations: intentional skip — %s", reason
+            )
+            _write_ingest_trace("skipped", reason, raw[:80])
+            return []
+        # Dict without "skipped" key — malformed response.
+        logger.warning(
+            "extract_observations: LLM returned a dict without 'skipped' key — treating as malformed"
+        )
+        _write_ingest_trace(
+            "rejected",
+            "dict response without skipped=true",
+            raw[:80],
+        )
+        return []
+
+    # Unexpected type (shouldn't happen after json.loads, but guard anyway).
+    logger.warning(
+        "extract_observations: unexpected parsed type %s — discarding",
+        type(parsed).__name__,
+    )
+    return []
 
 
 def append_to_ephemeral(
