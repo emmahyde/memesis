@@ -6,7 +6,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.cursors import CursorStore
-from core.transcript_ingest import tick  # type: ignore[import]
+from core.transcript_ingest import tick, extract_observations  # type: ignore[import]
 
 
 def test_new_session_seeds_cursor_at_eof(tmp_path):
@@ -94,3 +94,62 @@ def test_empty_delta_skips_llm(tmp_path):
     mock_extract.assert_not_called()
     assert results["processed"] == 0
     assert results["observations_total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Skip-protocol tests — Sprint A WS-B (LLME-F5)
+# Tests target extract_observations() directly for format-detection logic.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_observations_empty_array_returns_empty_list():
+    """[] response → empty observation list, no crash."""
+    with patch("core.transcript_ingest.call_llm", return_value="[]"):
+        result = extract_observations("some transcript")
+    assert result == []
+
+
+def test_extract_observations_array_with_obs_returns_filtered_list():
+    """[{...}] response → parsed observations filtered by importance >= 0.3."""
+    import json
+    obs = [
+        {"content": "Auth uses JWT", "mode": "finding", "importance": 0.7, "tags": []},
+        {"content": "low signal", "mode": "finding", "importance": 0.1, "tags": []},
+    ]
+    with patch("core.transcript_ingest.call_llm", return_value=json.dumps(obs)):
+        result = extract_observations("some transcript")
+    assert len(result) == 1
+    assert result[0]["content"] == "Auth uses JWT"
+
+
+def test_extract_observations_skipped_dict_returns_empty_list(tmp_path, caplog):
+    """{"skipped": true, "reason": "..."} → empty list, skip trace logged."""
+    import logging
+    import json
+    skip_response = json.dumps({"skipped": True, "reason": "no signal in session"})
+    with patch("core.transcript_ingest.call_llm", return_value=skip_response), \
+         caplog.at_level(logging.INFO, logger="core.transcript_ingest"):
+        result = extract_observations("boring transcript")
+    assert result == []
+    assert any("no signal" in r.message for r in caplog.records)
+
+
+def test_extract_observations_malformed_dict_returns_empty_list(caplog):
+    """{"foo": "bar"} dict without skipped key → empty list, rejection logged."""
+    import logging
+    import json
+    with patch("core.transcript_ingest.call_llm", return_value=json.dumps({"foo": "bar"})), \
+         caplog.at_level(logging.WARNING, logger="core.transcript_ingest"):
+        result = extract_observations("transcript")
+    assert result == []
+    assert any("malformed" in r.message or "skipped" in r.message for r in caplog.records)
+
+
+def test_extract_observations_invalid_json_returns_empty_list(caplog):
+    """Non-JSON response → existing failure mode preserved (empty list, warning logged)."""
+    import logging
+    with patch("core.transcript_ingest.call_llm", return_value="not json at all"), \
+         caplog.at_level(logging.WARNING, logger="core.transcript_ingest"):
+        result = extract_observations("transcript")
+    assert result == []
+    assert any("parse" in r.message.lower() or "json" in r.message.lower() for r in caplog.records)
