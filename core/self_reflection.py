@@ -336,7 +336,7 @@ class SelfReflector:
             content=content,
             title=SELF_MODEL_TITLE,
             summary=SELF_MODEL_SUMMARY,
-            tags=["self-awareness", "meta-cognition", "type:self_observation"],
+            tags=["self-awareness", "meta-cognition", "kind:finding", "knowledge_type:metacognitive"],
             importance=0.90,
         )
 
@@ -347,7 +347,7 @@ class SelfReflector:
             content=OBSERVATION_HABIT_CONTENT,
             title=OBSERVATION_HABIT_TITLE,
             summary=OBSERVATION_HABIT_SUMMARY,
-            tags=["meta-cognition", "workflow", "type:workflow_pattern"],
+            tags=["meta-cognition", "workflow", "kind:preference", "knowledge_type:procedural"],
             importance=0.85,
         )
 
@@ -358,7 +358,7 @@ class SelfReflector:
             content=COMPACTION_GUIDANCE_CONTENT,
             title=COMPACTION_GUIDANCE_TITLE,
             summary=COMPACTION_GUIDANCE_SUMMARY,
-            tags=["meta-cognition", "compaction", "type:workflow_pattern"],
+            tags=["meta-cognition", "compaction", "kind:preference", "knowledge_type:procedural"],
             importance=0.80,
         )
 
