@@ -346,6 +346,17 @@ optimized, added, refactored, discovered, confirmed, traced.
 
   YES: "Emma rejected tailored CSS grid in favor of fixed-width panels citing scan-path predictability"
   NO:  "She prefers fixed-width panels"
+  NO:  "He fixed the bug" — use "Emma fixed the cursor-reset bug"
+  NO:  "It uses Y" — use "The validator uses dataclass-based schema"
+  NO:  "They migrated" — use "The memesis team migrated"
+
+---
+
+RETIRED VOCABULARY — DO NOT USE these legacy values, they will be rejected:
+  kind:           NOT 'insight', 'observation', 'preference_signal', 'system_change'
+  knowledge_type: NOT 'descriptive', 'episodic', 'semantic', 'procedural-knowledge'
+  knowledge_type_confidence: NOT 'medium', 'unsure', 'maybe' — only 'high' or 'low'
+  importance:     MUST be in [0.0, 1.0]; 1.5 / 2.0 / above-1 will be rejected
 
 ---
 
