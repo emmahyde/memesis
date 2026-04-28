@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.database import init_db, close_db
 from core.models import db
+from core.session_detector import detect_session_type
 
 # ---------------------------------------------------------------------------
 # Back-derivation maps
@@ -142,10 +143,24 @@ def run_migration(commit: bool, db_path: str | None) -> dict:
     else:
         init_db()
 
+    # WS-H: ensure open_question lifecycle columns exist (idempotent)
+    existing_cols = _table_columns("memories")
+    for col, typ in [
+        ("resolves_question_id", "TEXT"),
+        ("resolved_at", "TEXT"),
+        ("is_pinned", "INTEGER DEFAULT 0"),
+    ]:
+        if col not in existing_cols:
+            try:
+                db.execute_sql(f"ALTER TABLE memories ADD COLUMN {col} {typ}")
+                print(f"  [migration] Added column: memories.{col}")
+            except Exception as exc:
+                print(f"  [migration] Could not add {col}: {exc}")
+
     # Only select columns that actually exist (legacy DBs may not have mode/observation_type/concept_tags)
     existing = _table_columns("memories")
     select_cols = ["id", "kind", "knowledge_type", "subject", "work_event"]
-    for optional in ("mode", "observation_type", "concept_tags"):
+    for optional in ("mode", "observation_type", "concept_tags", "cwd", "session_type"):
         if optional in existing:
             select_cols.append(optional)
 
@@ -158,6 +173,7 @@ def run_migration(commit: bool, db_path: str | None) -> dict:
         "rows_back_derived": 0,
         "rows_flagged": 0,
         "rows_skipped": 0,
+        "rows_session_type_derived": 0,
         "dry_run": not commit,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
@@ -190,6 +206,13 @@ def run_migration(commit: bool, db_path: str | None) -> dict:
             flag = flag or ct_derived.pop("_flag_for_review", False)
             for k, v in ct_derived.items():
                 updates[k] = v
+
+        # 4. session_type back-derivation from cwd (Sprint B WS-G / LLME-F9)
+        #    Only populate if column exists and row has no value yet.
+        if "session_type" in existing and not row.get("session_type"):
+            derived_session_type = detect_session_type(row.get("cwd"), default="code")
+            updates["session_type"] = derived_session_type
+            stats["rows_session_type_derived"] += 1
 
         if not updates:
             stats["rows_skipped"] += 1
@@ -250,6 +273,7 @@ def main() -> None:
     print(f"  rows back-derived: {stats['rows_back_derived']}")
     print(f"  rows flagged:      {stats['rows_flagged']}")
     print(f"  rows skipped:      {stats['rows_skipped']}")
+    print(f"  session_type derived: {stats['rows_session_type_derived']}")
     print(f"  audit log:         {_AUDIT_PATH}")
 
 
