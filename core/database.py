@@ -188,6 +188,20 @@ def _run_migrations():
         ("injection_ease_factor", "REAL DEFAULT 2.5"),
         ("injection_interval_days", "REAL DEFAULT 1.0"),
         ("files_modified", "TEXT DEFAULT '[]'"),
+        # W2 schema additions
+        ("kind", "TEXT"),
+        ("knowledge_type", "TEXT"),
+        ("knowledge_type_confidence", "TEXT"),
+        ("subject", "TEXT"),
+        ("work_event", "TEXT"),
+        ("subtitle", "TEXT"),
+        ("cwd", "TEXT"),
+        ("session_type", "TEXT"),
+        ("raw_importance", "REAL"),
+        ("linked_observation_ids", "TEXT"),
+        ("access_count", "INTEGER DEFAULT 0"),
+        ("last_accessed_at", "TEXT"),
+        ("w2_created_at", "TEXT"),
     ]:
         if col not in mem_cols:
             try:

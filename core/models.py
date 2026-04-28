@@ -10,11 +10,12 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from peewee import (
     AutoField,
     CompositeKey,
+    DateTimeField,
     FloatField,
     IntegerField,
     Model,
@@ -81,10 +82,39 @@ class Memory(BaseModel):
     injection_interval_days = FloatField(default=1.0, null=True)
     files_modified = TextField(null=True, default="[]")  # JSON array of relative paths
 
+    # W2 schema additions
+    kind = TextField(null=True)                       # decision | finding | preference | constraint | correction | open_question
+    knowledge_type = TextField(null=True)             # factual | conceptual | procedural | metacognitive
+    knowledge_type_confidence = TextField(null=True)  # low | high
+    subject = TextField(null=True)                    # self | user | system | collaboration | workflow | aesthetic | domain
+    work_event = TextField(null=True)                 # bugfix | feature | refactor | discovery | change | null
+    subtitle = TextField(null=True)                   # ≤24 words retrieval card
+    cwd = TextField(null=True)                        # multi-project attribution
+    session_type = TextField(null=True)               # code | writing | research | null (Sprint B forward-compat)
+    raw_importance = FloatField(null=True)            # Stage 1 importance, preserved for audit (C7)
+    linked_observation_ids = TextField(null=True)     # JSON-serialized list of UUIDs
+
+    # DS-F3 forward-compat: shadow-prune logger fields
+    access_count = IntegerField(default=0, null=True)
+    last_accessed_at = DateTimeField(null=True)
+    # NOTE: created_at already exists as TextField; w2_created_at captures timezone-aware value
+    w2_created_at = DateTimeField(null=True, default=lambda: datetime.now(timezone.utc))
+
     class Meta:
         table_name = "memories"
 
     # -- Convenience accessors -----------------------------------------
+
+    @property
+    def linked_observations(self) -> list[str]:
+        """Parse linked_observation_ids JSON into a Python list. Empty list on null/error."""
+        if not self.linked_observation_ids:
+            return []
+        try:
+            value = json.loads(self.linked_observation_ids)
+            return value if isinstance(value, list) else []
+        except (ValueError, TypeError):
+            return []
 
     @property
     def files_list(self) -> list[str]:
