@@ -4,6 +4,7 @@ Tests for lifecycle state machine with promotion/demotion rules.
 
 import json
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.lifecycle import LifecycleManager
 from core.database import init_db, close_db, get_base_dir, get_db_path
 from core.models import Memory, ConsolidationLog, RetrievalLog, db
+from core.tiers import stage_to_tier, tier_ttl
 
 
 @pytest.fixture
@@ -520,3 +522,90 @@ class TestSpacingEffect:
         candidate_ids = [c['id'] for c in candidates]
         assert spaced_id in candidate_ids
         assert burst_id not in candidate_ids
+
+
+# -------------------------------------------------------------------
+# Expiry wiring tests (B2 + B3)
+# -------------------------------------------------------------------
+
+
+class TestExpiryWiring:
+    """Test that promote/demote set expires_at via set_expiry (B2)."""
+
+    SLACK = 10  # seconds of tolerance for timestamp comparisons
+
+    def test_promote_sets_expires_at(self, base, manager):
+        """After promote(), expires_at is non-null and approximately now + T3 TTL."""
+        memory_id = _create_memory(stage='ephemeral')
+
+        before = int(time.time())
+        manager.promote(memory_id, rationale='Test expiry on promote')
+        after = int(time.time())
+
+        memory = Memory.get_by_id(memory_id)
+        assert memory.stage == 'consolidated'
+
+        expected_ttl = tier_ttl(stage_to_tier('consolidated'))  # T3 = 90 days
+        assert expected_ttl is not None
+        assert memory.expires_at is not None
+        assert before + expected_ttl - self.SLACK <= memory.expires_at <= after + expected_ttl + self.SLACK
+
+    def test_demote_sets_expires_at_to_lower_tier(self, base, manager):
+        """After demote(), expires_at reflects the lower tier TTL."""
+        memory_id = _create_memory(stage='crystallized')
+
+        before = int(time.time())
+        manager.demote(memory_id, rationale='Test expiry on demote')
+        after = int(time.time())
+
+        memory = Memory.get_by_id(memory_id)
+        assert memory.stage == 'consolidated'
+
+        expected_ttl = tier_ttl(stage_to_tier('consolidated'))  # T3 = 90 days
+        assert expected_ttl is not None
+        assert memory.expires_at is not None
+        assert before + expected_ttl - self.SLACK <= memory.expires_at <= after + expected_ttl + self.SLACK
+
+    def test_promote_to_instinctive_sets_expires_at_none(self, base, manager):
+        """T1 (instinctive) promotion sets expires_at = None (never expire)."""
+        memory_id = _create_memory(
+            stage='crystallized',
+            importance=0.9,
+            usage_count=15,
+        )
+        for i in range(10):
+            session_id = f'session_{i}'
+            _record_injection(memory_id, session_id)
+            _record_usage(memory_id, session_id)
+
+        manager.promote(memory_id, rationale='Instinctive promotion')
+
+        memory = Memory.get_by_id(memory_id)
+        assert memory.stage == 'instinctive'
+        assert memory.expires_at is None
+
+    def test_demote_from_instinctive_sets_expires_at(self, base, manager):
+        """Demoting from instinctive (T1) to crystallized (T2) sets expires_at."""
+        memory_id = _create_memory(stage='instinctive')
+
+        before = int(time.time())
+        manager.demote(memory_id, rationale='Drop from instinctive')
+        after = int(time.time())
+
+        memory = Memory.get_by_id(memory_id)
+        assert memory.stage == 'crystallized'
+
+        expected_ttl = tier_ttl(stage_to_tier('crystallized'))  # T2 = 180 days
+        assert expected_ttl is not None
+        assert memory.expires_at is not None
+        assert before + expected_ttl - self.SLACK <= memory.expires_at <= after + expected_ttl + self.SLACK
+
+    def test_deprecate_does_not_call_set_expiry(self, base, manager):
+        """deprecate() (archive path) must NOT set expires_at — archived_at handles exclusion."""
+        memory_id = _create_memory(stage='ephemeral')
+
+        # deprecate() deletes the row entirely; just verify no exception and no row remains
+        manager.deprecate(memory_id, rationale='Test deprecate leaves expiry alone')
+
+        with pytest.raises(Memory.DoesNotExist):
+            Memory.get_by_id(memory_id)
