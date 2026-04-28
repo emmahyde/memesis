@@ -4,10 +4,14 @@ Three-tier retrieval engine with context matching and token budget.
 Tier 1 — Instinctive: always injected, zero decision overhead.
 Tier 2 — Crystallized: context-matched, token-budgeted.
 Tier 3 — Active search: agent-initiated FTS with progressive disclosure.
+
+NOTE: Future write-tools MUST set source='agent'; _compute_priors() should
+filter source != 'agent' OR access_count > K once agent-write path ships.
 """
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -27,6 +31,7 @@ from .models import (
     ThreadMember,
     db,
 )
+from .tiers import stage_to_tier, tier_ttl
 
 if TYPE_CHECKING:
     from .vec import VecStore
@@ -398,7 +403,71 @@ class RetrievalEngine:
             {**component_rows[memory_id], "rank": rank}
             for rank, (memory_id, _score) in enumerate(ranked, start=1)
         ]
-        return ranked[:k]
+
+        # Filter to live (non-expired, non-archived) memories only.
+        # FTS and vec legs do not know about expires_at, so we post-filter here.
+        top_k = ranked[:k]
+        if not top_k:
+            return top_k
+
+        top_k_ids = [mid for mid, _ in top_k]
+        live_ids = {
+            m.id
+            for m in Memory.live().where(Memory.id.in_(top_k_ids))
+        }
+        top_k = [(mid, score) for mid, score in top_k if mid in live_ids]
+
+        # Consume-bump: single batched UPDATE for all returned memories (B3/B4).
+        # T1 (instinctive, tier_ttl=None) rows keep expires_at=NULL — they are
+        # excluded from the expires_at part of the SET clause via per-row SQL
+        # with CASE.  Choice: single executemany with per-row values is cleaner
+        # than a CASE expression over unknown-length IN lists.
+        if top_k:
+            self._bump_accessed(top_k_ids=[mid for mid, _ in top_k])
+
+        return top_k
+
+    def _bump_accessed(self, top_k_ids: list[str]) -> None:
+        """Issue a single batched UPDATE to record consumption of returned memories.
+
+        Sets last_accessed_at to now (UTC ISO) for all ids.
+        Sets expires_at to now_unix + tier_ttl for non-T1 memories;
+        T1 memories (instinctive, tier_ttl=None) are skipped in the expires_at
+        update — their expires_at remains NULL (never expire).
+
+        Implemented as a single executemany so write contention is one round-trip
+        per query, not one per memory (CONTEXT write-contention concern).
+        """
+        if not top_k_ids:
+            return
+
+        # Load stage for each returned memory to compute per-row expiry.
+        stage_by_id: dict[str, str] = {
+            m.id: m.stage
+            for m in Memory.select(Memory.id, Memory.stage).where(
+                Memory.id.in_(top_k_ids)
+            )
+        }
+
+        now_unix = int(time.time())
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Build per-row (last_accessed_at, expires_at, id) tuples.
+        # For T1 memories tier_ttl returns None; pass None so the column stays NULL.
+        rows = []
+        for mid in top_k_ids:
+            stage = stage_by_id.get(mid, "ephemeral")
+            ttl = tier_ttl(stage_to_tier(stage))
+            new_expiry = (now_unix + ttl) if ttl is not None else None
+            rows.append((now_iso, new_expiry, mid))
+
+        # Single executemany — one round-trip to the DB.
+        # db.execute_sql() only accepts a single params tuple; use the underlying
+        # sqlite3 connection directly for executemany support.
+        db.connection().executemany(
+            "UPDATE memories SET last_accessed_at = ?, expires_at = ? WHERE id = ?",
+            rows,
+        )
 
     def _get_thread_narratives(
         self,
