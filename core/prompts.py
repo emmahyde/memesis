@@ -86,6 +86,13 @@ SESSION OBSERVATIONS (Stage 1 buffer):
 EXISTING MEMORY MANIFEST:
 {manifest_summary}
 
+UNRESOLVED OPEN QUESTIONS (from prior sessions, awaiting resolution):
+{open_questions_block}
+
+If any new observation resolves one of these questions (the observation's facts
+answer the question, or correct a misunderstanding the question raised), set
+`resolves_question_id` to the question's memory_id in your decision output.
+
 ---
 
 MANDATORY KEEP:
@@ -144,6 +151,7 @@ work_event — only when the observation traces directly to a discrete code acti
   bugfix | feature | refactor | discovery | change
   Set to null for preference, constraint, correction, and open_question observations.
   Most observations should have work_event=null. Do not hallucinate a code action.
+  Set work_event=null when session_type != 'code' (writing and research sessions have no code actions).
 
 subtitle — ≤24 words. Acts as a retrieval card: enough context to judge relevance without
   loading full content. Do not exceed 24 words.
@@ -182,7 +190,8 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "rationale": "why this decision",
       "target_path": "category/filename.md (keep only)",
       "reinforces": "memory_id or null",
-      "contradicts": "memory_id or null"
+      "contradicts": "memory_id or null",
+      "resolves_question_id": "memory_id of the open_question this resolves, or null"
     }}
   ]
 }}"""
@@ -268,6 +277,8 @@ Respond ONLY with valid JSON:
 # ---------------------------------------------------------------------------
 
 OBSERVATION_EXTRACT_PROMPT = """Extract every durable observation that passes the quality gate from this Claude Code session slice.
+
+Session type: {session_type}
 
 A short slice may have zero qualifying observations. A dense one may have many.
 Quality, not quota.
