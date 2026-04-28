@@ -5,12 +5,19 @@ Cron-driven transcript delta ingestion pipeline.
 Each tick:
   1. Discover JSONL transcripts modified within the last 25h
   2. For each session, read new content since last cursor byte offset
-  3. Extract 0-3 durable observations via LLM
+  3. Extract durable observations via LLM (no quota; quality gate per Sprint A)
   4. Append observations to the project's ephemeral session buffer
   5. Advance the cursor
 
 New sessions: cursor is created at EOF — nothing extracted on first contact.
 Path rotation: cursor reset to EOF of new path.
+
+This is Stage 1 of the two-stage memory pipeline. Stage 1 captures
+*episodic* observations — temporally-tagged, session-bound (Tulving 1972).
+Stage 2 (`core/consolidator.py`) elaborates these toward *semantic* memory
+— context-free knowledge. The biological analog is hippocampal-to-neocortical
+indexing, but functionally this implements elaborative curation
+(Craik & Lockhart 1972), not biological consolidation.
 """
 
 import fcntl

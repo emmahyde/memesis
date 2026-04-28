@@ -28,6 +28,15 @@ Design choices:
 Zhong et al. 2023: https://arxiv.org/abs/2305.10250
 Park et al. 2023: https://arxiv.org/abs/2304.03442
 
+## Naming convention (panel NS-F8)
+
+Future access-reinforcement function (called on retrieval to bump access_count
+and last_accessed_at) MUST be named `recency_reinforcement()`, NOT `on_access()`.
+Per Collins & Loftus 1975, "spreading activation" propagates through semantic
+networks to neighbor nodes — incrementing one node's count is recency
+reinforcement, not spreading activation. Reserve "spreading activation" for the
+graph-traversal propagation along `linked_observation_ids[]` edges.
+
 ## Shadow-prune (DS-F3)
 
 log_shadow_prune() computes what WOULD be pruned under the §9 activation/decay

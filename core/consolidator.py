@@ -3,6 +3,18 @@ Consolidation engine for LLM-based memory curation during PreCompact.
 
 Reads ephemeral session observations, calls Claude to decide what to
 keep/prune/promote, and writes decisions back to the memory store.
+
+Terminology note (panel NS-F6): the name "consolidation" is engineering-
+historical; functionally this module performs *elaborative curation*
+(Craik & Lockhart 1972, levels-of-processing) — gating, enrichment, and
+linking of extracted observations. Biological memory consolidation
+(McGaugh 2000) refers to sleep-dependent hippocampal-to-neocortical
+transfer of memory traces, which this module does NOT perform. The
+Stage 1 → Stage 2 pipeline maps more cleanly to Tulving's (1972, 1985)
+episodic-to-semantic transition: Stage 1 captures temporally-tagged
+session-bound observations (episodic); Stage 2 elaborates them toward
+context-free knowledge (semantic). See `.planning/TAXONOMY-AND-DEFERRED-
+PATTERNS.md` for the full architectural framing.
 """
 
 import hashlib
