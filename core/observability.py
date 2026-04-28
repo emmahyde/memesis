@@ -53,6 +53,20 @@ from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# C3 — 30-day dry-run flag (Decision C3)
+#
+# SHADOW_ONLY = True  → log_shadow_prune() only writes to shadow-prune.jsonl;
+#                        no database mutations (dry-run mode).
+# SHADOW_ONLY = False → after logging, soft-archives the memory by setting
+#                        archived_at = <now_iso> WHERE id=? AND archived_at IS NULL.
+#
+# Flip to False after 30 days of clean shadow-prune logs confirm the false-prune
+# rate is acceptable (see Decision C3 in .context/CONTEXT-agentic-memory-blockers.md).
+# ---------------------------------------------------------------------------
+
+SHADOW_ONLY: bool = True
+
+# ---------------------------------------------------------------------------
 # Log file locations — relative to repo root, resolved at import time
 # ---------------------------------------------------------------------------
 
@@ -316,8 +330,9 @@ def log_shadow_prune(
     tier:
         Salience tier string: "T1", "T2", "T3", or "T4".
     """
+    now_iso = _now_iso()
     record = {
-        "ts": _now_iso(),
+        "ts": now_iso,
         "memory_id": memory_id,
         "computed_activation": computed_activation,
         "threshold": threshold,
@@ -326,5 +341,21 @@ def log_shadow_prune(
         "age_hours": age_hours,
         "access_count": access_count,
         "tier": tier,
+        "shadow_only": SHADOW_ONLY,
     }
     _append_jsonl(_obs_dir() / "shadow-prune.jsonl", record)
+
+    # When SHADOW_ONLY is False and this memory would be pruned, perform the
+    # soft-archive: set archived_at = <now_iso> if not already archived.
+    # This does NOT hard-delete — hard deletion is deferred to prune_sweep.py
+    # which runs after the 2× TTL window (Decision B1).
+    if not SHADOW_ONLY and would_prune:
+        try:
+            from core.models import db
+            db.execute_sql(
+                "UPDATE memories SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
+                (now_iso, memory_id),
+            )
+        except Exception:
+            # Never let a DB write failure break the logging path.
+            pass

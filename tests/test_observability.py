@@ -1,11 +1,13 @@
 """
-Tests for core/observability.py — Sprint A WS-A.
+Tests for core/observability.py — Sprint A WS-A + agentic-memory BLOCKER set (C3).
 
 Covers:
 - compute_activation round-trips
 - log functions produce valid JSONL
 - log functions tolerate missing context fields
 - shadow_prune batch performance (< 1 second for 100 memories)
+- SHADOW_ONLY flag: shadow mode writes JSONL only, live mode also soft-archives
+- flipping SHADOW_ONLY mid-test produces the correct behaviour switch
 """
 
 import json
@@ -31,6 +33,19 @@ def isolate_obs_dir(tmp_path, monkeypatch):
     obs_mod._REPO_ROOT = tmp_path
     obs_mod._OBS_DIR = obs_out
     yield obs_out
+
+
+# ---------------------------------------------------------------------------
+# DB fixture used by SHADOW_ONLY tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def base(tmp_path):
+    """Isolated peewee + FTS database for tests that write Memory rows."""
+    from core.database import init_db, close_db
+    init_db(base_dir=str(tmp_path / "memory"))
+    yield tmp_path
+    close_db()
 
 
 # ---------------------------------------------------------------------------
@@ -222,3 +237,208 @@ def test_log_shadow_prune_batch_100_memories_under_one_second(isolate_obs_dir):
     assert elapsed < 1.0, f"Batch of 100 took {elapsed:.3f}s — exceeded 1s limit"
     lines = (isolate_obs_dir / "shadow-prune.jsonl").read_text().strip().splitlines()
     assert len(lines) == 100
+
+
+# ---------------------------------------------------------------------------
+# SHADOW_ONLY flag tests (Decision C3)
+# ---------------------------------------------------------------------------
+
+
+def _make_memory_for_prune(stage: str = "ephemeral") -> "Memory":
+    """Create a minimal Memory row and return it."""
+    from core.models import Memory
+    return Memory.create(
+        stage=stage,
+        title="prune candidate",
+        summary="test",
+        importance=0.1,
+    )
+
+
+class TestShadowOnlyFlag:
+    """Decision C3: SHADOW_ONLY=True logs only; SHADOW_ONLY=False also soft-archives."""
+
+    def test_shadow_only_true_does_not_update_archived_at(self, base, isolate_obs_dir):
+        """With SHADOW_ONLY=True, log_shadow_prune(would_prune=True) writes JSONL
+        but leaves archived_at NULL on the memory row."""
+        import core.observability as obs_mod
+        original = obs_mod.SHADOW_ONLY
+        try:
+            obs_mod.SHADOW_ONLY = True
+            mem = _make_memory_for_prune()
+            from core.observability import log_shadow_prune
+            log_shadow_prune(
+                memory_id=mem.id,
+                computed_activation=0.01,
+                threshold=0.05,
+                would_prune=True,
+                importance=0.1,
+                age_hours=200.0,
+                access_count=0,
+                tier="T4",
+            )
+            # JSONL must be written
+            path = isolate_obs_dir / "shadow-prune.jsonl"
+            assert path.exists()
+            record = json.loads(path.read_text().strip())
+            assert record["memory_id"] == mem.id
+            assert record["would_prune"] is True
+            assert record["shadow_only"] is True
+
+            # archived_at must remain NULL
+            from core.models import Memory
+            refreshed = Memory.get_by_id(mem.id)
+            assert refreshed.archived_at is None, (
+                f"Expected archived_at=None in shadow mode, got {refreshed.archived_at!r}"
+            )
+        finally:
+            obs_mod.SHADOW_ONLY = original
+
+    def test_shadow_only_false_sets_archived_at(self, base, isolate_obs_dir):
+        """With SHADOW_ONLY=False, log_shadow_prune(would_prune=True) writes JSONL
+        and also sets archived_at on the memory row."""
+        import core.observability as obs_mod
+        original = obs_mod.SHADOW_ONLY
+        try:
+            obs_mod.SHADOW_ONLY = False
+            mem = _make_memory_for_prune()
+            from core.observability import log_shadow_prune
+            log_shadow_prune(
+                memory_id=mem.id,
+                computed_activation=0.01,
+                threshold=0.05,
+                would_prune=True,
+                importance=0.1,
+                age_hours=200.0,
+                access_count=0,
+                tier="T4",
+            )
+            # JSONL written with shadow_only=False
+            path = isolate_obs_dir / "shadow-prune.jsonl"
+            record = json.loads(path.read_text().strip())
+            assert record["shadow_only"] is False
+
+            # archived_at must be set
+            from core.models import Memory
+            refreshed = Memory.get_by_id(mem.id)
+            assert refreshed.archived_at is not None, (
+                "Expected archived_at to be set when SHADOW_ONLY=False"
+            )
+        finally:
+            obs_mod.SHADOW_ONLY = original
+
+    def test_shadow_only_false_no_prune_does_not_archive(self, base, isolate_obs_dir):
+        """With SHADOW_ONLY=False, would_prune=False must NOT touch archived_at."""
+        import core.observability as obs_mod
+        original = obs_mod.SHADOW_ONLY
+        try:
+            obs_mod.SHADOW_ONLY = False
+            mem = _make_memory_for_prune()
+            from core.observability import log_shadow_prune
+            log_shadow_prune(
+                memory_id=mem.id,
+                computed_activation=0.9,
+                threshold=0.05,
+                would_prune=False,
+                importance=0.9,
+                age_hours=1.0,
+                access_count=5,
+                tier="T3",
+            )
+            from core.models import Memory
+            refreshed = Memory.get_by_id(mem.id)
+            assert refreshed.archived_at is None, (
+                "archived_at must remain NULL when would_prune=False"
+            )
+        finally:
+            obs_mod.SHADOW_ONLY = original
+
+    def test_shadow_only_false_idempotent_on_already_archived(self, base, isolate_obs_dir):
+        """With SHADOW_ONLY=False, calling log_shadow_prune twice on an already-archived
+        memory must not overwrite the existing archived_at value."""
+        import core.observability as obs_mod
+        original = obs_mod.SHADOW_ONLY
+        try:
+            obs_mod.SHADOW_ONLY = False
+            mem = _make_memory_for_prune()
+            from core.observability import log_shadow_prune
+
+            # First call — sets archived_at
+            log_shadow_prune(
+                memory_id=mem.id,
+                computed_activation=0.01,
+                threshold=0.05,
+                would_prune=True,
+                importance=0.1,
+                age_hours=200.0,
+                access_count=0,
+                tier="T4",
+            )
+            from core.models import Memory
+            first_archived_at = Memory.get_by_id(mem.id).archived_at
+            assert first_archived_at is not None
+
+            # Second call — WHERE archived_at IS NULL means no update
+            log_shadow_prune(
+                memory_id=mem.id,
+                computed_activation=0.01,
+                threshold=0.05,
+                would_prune=True,
+                importance=0.1,
+                age_hours=201.0,
+                access_count=0,
+                tier="T4",
+            )
+            second_archived_at = Memory.get_by_id(mem.id).archived_at
+            assert second_archived_at == first_archived_at, (
+                "archived_at must not be overwritten on a second call"
+            )
+        finally:
+            obs_mod.SHADOW_ONLY = original
+
+    def test_flipping_shadow_only_mid_test(self, base, isolate_obs_dir):
+        """Flipping SHADOW_ONLY from True → False mid-test produces the correct switch:
+        first call (shadow) leaves archived_at NULL; second call (live) sets it."""
+        import core.observability as obs_mod
+        original = obs_mod.SHADOW_ONLY
+        try:
+            mem = _make_memory_for_prune()
+            from core.observability import log_shadow_prune
+            from core.models import Memory
+
+            # Pass 1: shadow mode — no DB mutation
+            obs_mod.SHADOW_ONLY = True
+            log_shadow_prune(
+                memory_id=mem.id,
+                computed_activation=0.01,
+                threshold=0.05,
+                would_prune=True,
+                importance=0.1,
+                age_hours=100.0,
+                access_count=0,
+                tier="T4",
+            )
+            assert Memory.get_by_id(mem.id).archived_at is None
+
+            # Pass 2: live mode — soft-archive fires
+            obs_mod.SHADOW_ONLY = False
+            log_shadow_prune(
+                memory_id=mem.id,
+                computed_activation=0.01,
+                threshold=0.05,
+                would_prune=True,
+                importance=0.1,
+                age_hours=101.0,
+                access_count=0,
+                tier="T4",
+            )
+            assert Memory.get_by_id(mem.id).archived_at is not None
+
+            # JSONL should have two records (one per call)
+            lines = (isolate_obs_dir / "shadow-prune.jsonl").read_text().strip().splitlines()
+            assert len(lines) == 2
+            records = [json.loads(l) for l in lines]
+            assert records[0]["shadow_only"] is True
+            assert records[1]["shadow_only"] is False
+        finally:
+            obs_mod.SHADOW_ONLY = original

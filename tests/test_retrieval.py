@@ -933,42 +933,34 @@ class TestHybridSearch:
 
         assert len(results) <= 3
 
-    def test_hybrid_search_archived_fts_results_included(self, base, engine):
+    def test_hybrid_search_archived_excluded(self, base, engine):
         """
-        RRF operates on whatever FTS returns. Filtering is caller's responsibility.
-        Archived memories returned by FTS are included in hybrid results.
+        hybrid_search post-filters via Memory.live(), so archived memories are
+        excluded from results even if FTS matches them.
         """
         from datetime import datetime
 
+        id_live = _make_memory(
+            "archived hybrid search content live", "consolidated", "Live Hybrid"
+        )
         id_archived = _make_memory(
             "archived hybrid search content", "consolidated", "Archived Hybrid"
         )
-        # Mark as archived directly
+        # Mark one as archived directly
         Memory.update(archived_at=datetime.now().isoformat()).where(Memory.id == id_archived).execute()
-
-        # Re-index in FTS (since save() was bypassed via update)
-        mem = Memory.get_by_id(id_archived)
-        try:
-            mem._fts_insert()
-        except Exception:
-            pass  # May already be indexed from create
 
         vec_store = MockVecStore([])
         dummy_embedding = b"\x00" * 4
 
-        # FTS may or may not return archived items depending on how _make_memory indexed it
-        # The key assertion: whatever FTS returns, hybrid_search does NOT filter by archived_at
         results = engine.hybrid_search(
             query="archived hybrid search",
             query_embedding=dummy_embedding,
             k=10,
             vec_store=vec_store,
         )
-        # Results are a list of (id, score) tuples — archived_at is not a filter
-        assert isinstance(results, list)
-        for item in results:
-            assert len(item) == 2  # (memory_id, score)
-            assert isinstance(item[1], float)
+        result_ids = [r[0] for r in results]
+        # Archived memory must not appear; live one may appear
+        assert id_archived not in result_ids
 
 
 # ---------------------------------------------------------------------------
@@ -1987,3 +1979,165 @@ class TestAffectAwareThreadOrdering:
 
         assert len(received_affect) == 1
         assert received_affect[0] == affect
+
+
+# ---------------------------------------------------------------------------
+# Live filter + consume-bump (Task 3.1 ACs)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveFilter:
+    """Tests for Memory.live() filter and consume-bump in hybrid_search."""
+
+    def test_hybrid_search_excludes_expired_memory(self, base, engine):
+        """hybrid_search does not return a memory whose expires_at is in the past."""
+        import time as _time
+
+        id_live = _make_memory("live content term", "crystallized", "Live Memory")
+        id_expired = _make_memory("live content term expired", "crystallized", "Expired Memory")
+
+        # Set expires_at to one second in the past
+        past_ts = int(_time.time()) - 1
+        Memory.update(expires_at=past_ts).where(Memory.id == id_expired).execute()
+
+        results = engine.hybrid_search(
+            query="live content term",
+            query_embedding=None,
+            k=20,
+            vec_store=None,
+        )
+        result_ids = [r[0] for r in results]
+        assert id_expired not in result_ids, "Expired memory must be excluded from results"
+
+    def test_hybrid_search_excludes_archived_memory(self, base, engine):
+        """hybrid_search does not return a memory with archived_at set."""
+        import time as _time
+
+        id_live = _make_memory("archived filter content", "crystallized", "Live Archived Test")
+        id_archived = _make_memory("archived filter content", "crystallized", "Archived Test")
+
+        Memory.update(
+            archived_at=datetime.now().isoformat()
+        ).where(Memory.id == id_archived).execute()
+
+        results = engine.hybrid_search(
+            query="archived filter content",
+            query_embedding=None,
+            k=20,
+            vec_store=None,
+        )
+        result_ids = [r[0] for r in results]
+        assert id_archived not in result_ids, "Archived memory must be excluded from results"
+
+    def test_hybrid_search_includes_null_expires_at(self, base, engine):
+        """hybrid_search includes memories where expires_at IS NULL (T1 never-expire)."""
+        id_null = _make_memory("never expire content", "instinctive", "Never Expire")
+
+        results = engine.hybrid_search(
+            query="never expire content",
+            query_embedding=None,
+            k=20,
+            vec_store=None,
+        )
+        result_ids = [r[0] for r in results]
+        assert id_null in result_ids, "Memory with NULL expires_at must appear in results"
+
+    def test_hybrid_search_bumps_last_accessed_at(self, base, engine):
+        """After hybrid_search, returned memories have last_accessed_at updated."""
+        id_a = _make_memory("bump access test content", "crystallized", "Bump Access A")
+
+        # Confirm not yet set
+        before = Memory.get_by_id(id_a)
+        assert before.last_accessed_at is None
+
+        results = engine.hybrid_search(
+            query="bump access test content",
+            query_embedding=None,
+            k=10,
+            vec_store=None,
+        )
+
+        result_ids = [r[0] for r in results]
+        assert id_a in result_ids
+
+        after = Memory.get_by_id(id_a)
+        assert after.last_accessed_at is not None, "last_accessed_at must be set after search"
+
+    def test_hybrid_search_bumps_expires_at_for_non_t1(self, base, engine):
+        """After hybrid_search, returned non-T1 memories have expires_at bumped forward."""
+        import time as _time
+        from core.tiers import stage_to_tier, tier_ttl
+
+        id_a = _make_memory("expires bump content", "crystallized", "Expires Bump A")
+
+        before_ts = int(_time.time())
+        results = engine.hybrid_search(
+            query="expires bump content",
+            query_embedding=None,
+            k=10,
+            vec_store=None,
+        )
+
+        result_ids = [r[0] for r in results]
+        assert id_a in result_ids
+
+        after = Memory.get_by_id(id_a)
+        assert after.expires_at is not None, "expires_at must be set after search for non-T1"
+
+        expected_ttl = tier_ttl(stage_to_tier("crystallized"))
+        # expires_at should be approximately now + TTL (allow 5s drift)
+        assert after.expires_at >= before_ts + expected_ttl - 5
+        assert after.expires_at <= before_ts + expected_ttl + 5
+
+    def test_hybrid_search_t1_expires_at_stays_null(self, base, engine):
+        """After hybrid_search, T1 (instinctive) memories keep expires_at=NULL."""
+        id_t1 = _make_memory("instinctive never expires", "instinctive", "T1 Null Expiry")
+
+        results = engine.hybrid_search(
+            query="instinctive never expires",
+            query_embedding=None,
+            k=10,
+            vec_store=None,
+        )
+
+        result_ids = [r[0] for r in results]
+        assert id_t1 in result_ids
+
+        after = Memory.get_by_id(id_t1)
+        assert after.expires_at is None, "T1 instinctive memory must keep expires_at=NULL"
+
+    def test_hybrid_search_bump_is_batched(self, base, engine):
+        """All returned memories have last_accessed_at updated in a single batch (simultaneous)."""
+        import time as _time
+
+        ids = [
+            _make_memory(f"batch bump content item {i}", "crystallized", f"Batch Bump {i}")
+            for i in range(5)
+        ]
+
+        # Record time just before search
+        before_ts = _time.time()
+
+        results = engine.hybrid_search(
+            query="batch bump content item",
+            query_embedding=None,
+            k=10,
+            vec_store=None,
+        )
+
+        result_ids = [r[0] for r in results]
+        returned_ids = [mid for mid in ids if mid in result_ids]
+        assert len(returned_ids) >= 2, "At least 2 memories should be returned for batch test"
+
+        # All returned memories must have last_accessed_at set (proves batch ran)
+        timestamps = []
+        for mid in returned_ids:
+            mem = Memory.get_by_id(mid)
+            assert mem.last_accessed_at is not None, f"Memory {mid} missing last_accessed_at"
+            timestamps.append(mem.last_accessed_at)
+
+        # All timestamps must be identical (single executemany sets same value for all rows)
+        assert len(set(timestamps)) == 1, (
+            f"Batch UPDATE should produce identical timestamps for all returned memories, "
+            f"got: {set(timestamps)}"
+        )
