@@ -398,6 +398,159 @@ class TestContentHash:
         assert new_hash != original_hash
 
 
+# ---------------------------------------------------------------------------
+# W2 schema additions
+# ---------------------------------------------------------------------------
+
+
+class TestW2SchemaFields:
+    """Round-trip tests for Wave 2 Memory schema additions."""
+
+    def test_all_new_fields_persist(self, store):
+        """All W2 fields can be written and read back."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="W2 test",
+            content="content",
+            created_at=now,
+            updated_at=now,
+            kind="decision",
+            knowledge_type="conceptual",
+            knowledge_type_confidence="high",
+            subject="system",
+            work_event="feature",
+            subtitle="Short retrieval subtitle here",
+            cwd="/Users/test/myproject",
+            session_type="code",
+            raw_importance=0.7,
+            linked_observation_ids=json.dumps(["abc-123", "def-456"]),
+            access_count=3,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.kind == "decision"
+        assert result.knowledge_type == "conceptual"
+        assert result.knowledge_type_confidence == "high"
+        assert result.subject == "system"
+        assert result.work_event == "feature"
+        assert result.subtitle == "Short retrieval subtitle here"
+        assert result.cwd == "/Users/test/myproject"
+        assert result.session_type == "code"
+        assert result.raw_importance == pytest.approx(0.7)
+        assert result.access_count == 3
+
+    def test_linked_observations_accessor_parses_json(self, store):
+        """linked_observations property returns list from JSON text."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="linked test",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            linked_observation_ids=json.dumps(["id-1", "id-2", "id-3"]),
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.linked_observations == ["id-1", "id-2", "id-3"]
+
+    def test_linked_observations_accessor_returns_empty_for_null(self, store):
+        """linked_observations returns [] when field is null."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="null linked",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            linked_observation_ids=None,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.linked_observations == []
+
+    def test_linked_observations_accessor_returns_empty_for_missing(self, store):
+        """linked_observations returns [] when field is empty string."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="empty linked",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            linked_observation_ids="",
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.linked_observations == []
+
+    def test_session_type_accepts_valid_values(self, store):
+        """session_type stores code|writing|research values."""
+        now = datetime.now().isoformat()
+        for val in ("code", "writing", "research"):
+            mem = Memory.create(
+                stage="ephemeral",
+                title=f"session_type {val}",
+                content="c",
+                created_at=now,
+                updated_at=now,
+                session_type=val,
+            )
+            result = Memory.get_by_id(mem.id)
+            assert result.session_type == val
+
+    def test_session_type_accepts_null(self, store):
+        """session_type can be null."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="no session type",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            session_type=None,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.session_type is None
+
+    def test_w2_created_at_default_is_set(self, store):
+        """w2_created_at gets a default value on creation."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="created_at test",
+            content="c",
+            created_at=now,
+            updated_at=now,
+        )
+        result = Memory.get_by_id(mem.id)
+        # w2_created_at should be set (not null)
+        assert result.w2_created_at is not None
+
+    def test_access_count_defaults_to_zero(self, store):
+        """access_count defaults to 0."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="access_count default",
+            content="c",
+            created_at=now,
+            updated_at=now,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.access_count == 0
+
+    def test_raw_importance_null_by_default(self, store):
+        """raw_importance is null when not set."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="raw_importance null",
+            content="c",
+            created_at=now,
+            updated_at=now,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.raw_importance is None
+
+
 class TestProjectContext:
     """Test project-specific storage."""
 
