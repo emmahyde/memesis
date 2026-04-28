@@ -79,9 +79,23 @@ class Memory(BaseModel):
     next_injection_due = TextField(null=True)
     injection_ease_factor = FloatField(default=2.5, null=True)
     injection_interval_days = FloatField(default=1.0, null=True)
+    files_modified = TextField(null=True, default="[]")  # JSON array of relative paths
 
     class Meta:
         table_name = "memories"
+
+    # -- Convenience accessors -----------------------------------------
+
+    @property
+    def files_list(self) -> list[str]:
+        """Parse files_modified JSON into a Python list. Empty list on error."""
+        import json as _json
+        raw = self.files_modified or "[]"
+        try:
+            value = _json.loads(raw)
+            return value if isinstance(value, list) else []
+        except (ValueError, TypeError):
+            return []
 
     # -- Scopes --------------------------------------------------------
 

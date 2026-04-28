@@ -36,7 +36,7 @@ python3 -m pytest tests/
 python3 -m pytest tests/test_storage.py
 
 # Single test by name
-python3 -m pytest tests/test_consolidator.py -k test_filter_privacy
+python3 -m pytest tests/test_consolidator.py -k test_consolidate_session
 
 # With verbose output
 python3 -m pytest tests/ -v

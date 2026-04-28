@@ -248,7 +248,12 @@ def main():
         if base_dir:
             try:
                 analyzer = load_analyzer(base_dir, session_id)
-                state = analyzer.update(prompt)
+                # Strip system-reminder / command wrapper blocks before
+                # affect detection. Reuses the same logic as transcript
+                # cleaning so embedded reminders inside a real message do
+                # not poison valence detection.
+                from core.transcript import _clean_text
+                state = analyzer.update(_clean_text(prompt))
                 save_analyzer(analyzer, base_dir, session_id)
 
                 # If degradation looks likely and we haven't probed recently,

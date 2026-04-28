@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .somatic import classify_valence, SomaticResult
+from .somatic import classify_valence, SomaticResult, _is_typed_user_text
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +180,12 @@ class InteractionAnalyzer:
 
         if not get_flag("affect_awareness"):
             return AffectState()
+
+        # Reject non-typed input (skill bodies, system reminders, pastes) before
+        # any pattern matching runs. These contain keywords like "wrong"/"fail"
+        # inside slash-command docs that produce false-positive friction.
+        if not _is_typed_user_text(message):
+            return self.current_state()
 
         self._exchange_count = exchange_count if exchange_count is not None else self._exchange_count + 1
 

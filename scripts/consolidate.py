@@ -71,8 +71,10 @@ Respond ONLY with valid JSON:
       "source_ids": [1],
       "title": "Clean title",
       "observation": "Final observation text — dense, behavioral, pattern-level",
-      "observation_type": "correction|preference_signal|workflow_pattern|self_observation|decision_context",
+      "observation_type": "correction|preference_signal|workflow_pattern|self_observation|decision_context|system_change",
       "tags": ["tag1"],
+      "concept_tags": ["how-it-works|why-it-exists|what-changed|problem-solution|gotcha|pattern|trade-off"],
+      "files_modified": ["relative/path.py"],
       "frequency": 3,
       "rationale": "Why this passes the gate"
     }},

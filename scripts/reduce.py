@@ -333,8 +333,10 @@ Respond ONLY with valid JSON:
     {{
       "title": "Short pattern-level title",
       "content": "The observation — dense, textured, capturing the person not just the pattern. 1-3 sentences.",
-      "observation_type": "correction|preference_signal|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic",
+      "observation_type": "correction|preference_signal|workflow_pattern|self_observation|decision_context|personality|aesthetic|collaboration_dynamic|system_change",
       "tags": ["tag1", "tag2"],
+      "concept_tags": ["how-it-works|why-it-exists|what-changed|problem-solution|gotcha|pattern|trade-off"],
+      "files_modified": ["relative/path.py"],
       "source_lines": [7, 42],
       "rationale": "Why this matters — what would go wrong without it",
       "confidence": "high|medium|low"

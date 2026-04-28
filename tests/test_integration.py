@@ -391,8 +391,3 @@ class TestFeedbackImportanceUpdates:
             close_db()
 
 
-# ---------------------------------------------------------------------------
-# Test: privacy filter blocks emotional state
-# ---------------------------------------------------------------------------
-
-

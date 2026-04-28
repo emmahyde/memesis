@@ -2,7 +2,7 @@
 
 import pytest
 
-from core.somatic import classify_valence, VALENCE_BOOSTS
+from core.somatic import classify_valence, VALENCE_BOOSTS, _is_typed_user_text
 
 
 class TestValenceClassification:
@@ -129,3 +129,37 @@ class TestMatchedPatterns:
         result = classify_valence("The test failed and there's an error.")
         assert result.valence == "friction"
         assert len(result.matched_patterns) >= 1
+
+
+
+class TestIsTypedUserText:
+    """Filter rejects pasted skill bodies, system reminders, context dumps."""
+
+    def test_typed_short_message_accepted(self):
+        assert _is_typed_user_text("yes pls") is True
+        assert _is_typed_user_text("Try again") is True
+        assert _is_typed_user_text("why is it 1515 lines?! holy shit") is True
+
+    def test_skill_body_rejected(self):
+        body = "Base directory for this skill: /Users/foo/.claude/skills/x\n\n# Foo skill\nDoes things, never fails, blocks errors."
+        assert _is_typed_user_text(body) is False
+
+    def test_system_reminder_rejected(self):
+        assert _is_typed_user_text("<system-reminder>blah</system-reminder>") is False
+        assert _is_typed_user_text("<command-message>foo</command-message>") is False
+
+    def test_long_paste_rejected(self):
+        long = "x " * 500
+        assert _is_typed_user_text(long) is False
+
+    def test_continuation_summary_rejected(self):
+        msg = "This session is being continued from a previous conversation that ran out of context."
+        assert _is_typed_user_text(msg) is False
+
+    def test_long_markdown_doc_rejected(self):
+        doc = "# Some Big Doc\n\n" + ("Lorem ipsum " * 30)
+        assert _is_typed_user_text(doc) is False
+
+    def test_short_markdown_header_accepted(self):
+        # Real users do type things like "# todo" briefly
+        assert _is_typed_user_text("# todo: fix this") is True
