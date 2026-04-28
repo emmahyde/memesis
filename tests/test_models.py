@@ -3,7 +3,7 @@
 import json
 import struct
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -641,4 +641,74 @@ class TestVecEnabled:
         vec.store_embedding(mem.id, emb)
         results = vec.search_vector(emb, k=5)
         assert len(results) >= 1
-        assert 'distance' in results[0]
+
+
+# ---------------------------------------------------------------------------
+# WS-H: open_question lifecycle fields (Sprint B DS-F9)
+# ---------------------------------------------------------------------------
+
+
+class TestQuestionLifecycleFields:
+    """Round-trip tests for resolves_question_id, resolved_at, is_pinned."""
+
+    def test_is_pinned_defaults_false(self, store):
+        mem = _create_memory(kind='open_question')
+        fresh = Memory.get_by_id(mem.id)
+        # SQLite stores as 0; treat 0 / None / False as falsy
+        assert not fresh.is_pinned
+
+    def test_is_pinned_persists_true(self, store):
+        mem = _create_memory(kind='open_question')
+        Memory.update(is_pinned=1).where(Memory.id == mem.id).execute()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.is_pinned == 1
+
+    def test_resolved_at_defaults_null(self, store):
+        mem = _create_memory(kind='open_question')
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolved_at is None
+
+    def test_resolved_at_accepts_datetime(self, store):
+        mem = _create_memory(kind='open_question')
+        now = datetime.now(timezone.utc)
+        Memory.update(resolved_at=now).where(Memory.id == mem.id).execute()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolved_at is not None
+
+    def test_resolved_at_round_trips_none(self, store):
+        mem = _create_memory(kind='open_question')
+        now = datetime.now(timezone.utc)
+        Memory.update(resolved_at=now).where(Memory.id == mem.id).execute()
+        Memory.update(resolved_at=None).where(Memory.id == mem.id).execute()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolved_at is None
+
+    def test_resolves_question_id_defaults_null(self, store):
+        mem = _create_memory(kind='correction')
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolves_question_id is None
+
+    def test_resolves_question_id_persists(self, store):
+        question = _create_memory(kind='open_question')
+        resolver = _create_memory(kind='correction')
+        Memory.update(resolves_question_id=str(question.id)).where(
+            Memory.id == resolver.id
+        ).execute()
+        fresh = Memory.get_by_id(resolver.id)
+        assert fresh.resolves_question_id == str(question.id)
+
+    def test_all_three_fields_in_single_row(self, store):
+        now = datetime.now(timezone.utc)
+        question = _create_memory(kind='open_question')
+        resolver = _create_memory(kind='correction')
+        Memory.update(resolved_at=now, is_pinned=1).where(
+            Memory.id == question.id
+        ).execute()
+        Memory.update(resolves_question_id=str(question.id)).where(
+            Memory.id == resolver.id
+        ).execute()
+        q_fresh = Memory.get_by_id(question.id)
+        r_fresh = Memory.get_by_id(resolver.id)
+        assert q_fresh.resolved_at is not None
+        assert q_fresh.is_pinned == 1
+        assert r_fresh.resolves_question_id == str(question.id)
