@@ -126,6 +126,43 @@ Configuration is set in `.claude-plugin` under the `config` key:
 To override at runtime, pass environment variables to the hook commands or
 edit `.claude-plugin` directly.
 
+## MCP Server
+
+Memesis exposes a stdio MCP server that lets Claude Code query the memory store
+directly via tool calls, enabling progressive disclosure: `search_memory` for
+ranked summaries, `get_memory` for full hydration, and `recent_observations` for
+recency-ordered session context. The server runs locally, talks to the same
+SQLite store as the hooks, and requires no authentication.
+
+Register it in `~/.claude.json` under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "memesis": {
+      "command": "/abs/path/to/memesis/.venv/bin/memesis-mcp"
+    }
+  }
+}
+```
+
+Replace `/abs/path/to/memesis` with the absolute path to this repository.
+If using `uv` instead of a virtualenv:
+
+```json
+{
+  "mcpServers": {
+    "memesis": {
+      "command": "/abs/path/to/uv",
+      "args": ["--directory", "/abs/path/to/memesis", "run", "python", "core/mcp_server.py"]
+    }
+  }
+}
+```
+
+Use `which uv` and `which python` to confirm binary paths — Claude Code does
+not inherit your shell PATH.
+
 ## Phase 2 Note
 
 Vector search (semantic similarity retrieval) is available as an opt-in when

@@ -77,6 +77,7 @@ class LifecycleManager:
         # Perform transition
         memory.stage = next_stage
         memory.save()
+        memory.set_expiry()
 
         ConsolidationLog.create(
             timestamp=datetime.now().isoformat(),
@@ -116,6 +117,7 @@ class LifecycleManager:
         # Perform transition
         memory.stage = target_stage
         memory.save()
+        memory.set_expiry()
 
         ConsolidationLog.create(
             timestamp=datetime.now().isoformat(),
