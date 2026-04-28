@@ -24,6 +24,7 @@ from core.transcript import read_transcript_from, summarize
 from core.cursors import CursorStore
 from core.llm import call_llm
 from core.prompts import OBSERVATION_EXTRACT_PROMPT, OBSERVATION_TYPES, format_observation
+from core.session_detector import detect_session_type
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ def _write_ingest_trace(outcome: str, reason: str, raw_excerpt: str) -> None:
         pass
 
 
-def extract_observations(rendered: str) -> list[dict]:
+def extract_observations(rendered: str, session_type: str = "code") -> list[dict]:
     """Call LLM to extract observations; filter low-importance entries.
 
     Handles two LLM response formats:
@@ -75,8 +76,13 @@ def extract_observations(rendered: str) -> list[dict]:
       2. JSON object {"skipped": true, "reason": "..."}
                                 — intentional skip signal (Stage-1 skip protocol, LLME-F5).
          Any other dict is treated as malformed and rejected.
+
+    Args:
+        rendered: Summarised transcript slice text.
+        session_type: 'code', 'writing', or 'research' — injected into Stage 1
+                      prompt context block so the LLM knows the session genre.
     """
-    raw = call_llm(OBSERVATION_EXTRACT_PROMPT.format(transcript=rendered))
+    raw = call_llm(OBSERVATION_EXTRACT_PROMPT.format(transcript=rendered, session_type=session_type))
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -188,7 +194,28 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
                 continue
 
             rendered = summarize(entries)
-            obs_list = extract_observations(rendered)
+
+            # Detect session type from cwd embedded in transcript entries + tool mix
+            session_cwd: str | None = None
+            tool_uses: list[dict] = []
+            for entry in entries:
+                msg = entry.get("message") or {}
+                # cwd lives at top-level or inside message
+                if not session_cwd:
+                    session_cwd = entry.get("cwd") or msg.get("cwd")
+                # Collect tool use entries for tool-mix heuristic
+                if entry.get("type") == "tool_use" or msg.get("type") == "tool_use":
+                    tool_name = entry.get("tool_name") or msg.get("name") or ""
+                    file_path = entry.get("input", {}).get("file_path") or ""
+                    if tool_name:
+                        tool_uses.append({"tool_name": tool_name, "file_path": file_path})
+
+            session_type = detect_session_type(session_cwd, tool_uses or None)
+            obs_list = extract_observations(rendered, session_type=session_type)
+
+            # Attach session_type to each observation for downstream validators
+            for obs in obs_list:
+                obs.setdefault("session_type", session_type)
             mem_dir = project_memory_dir(path)
             n = append_to_ephemeral(mem_dir, obs_list, dry_run=dry_run)
 

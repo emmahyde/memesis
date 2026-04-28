@@ -153,3 +153,121 @@ def test_extract_observations_invalid_json_returns_empty_list(caplog):
         result = extract_observations("transcript")
     assert result == []
     assert any("parse" in r.message.lower() or "json" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# session_type detection wiring — Sprint B WS-G / LLME-F9
+# ---------------------------------------------------------------------------
+
+
+def test_extract_observations_passes_session_type_to_prompt():
+    """session_type kwarg is forwarded into the prompt format call."""
+    import json
+    obs = [{"content": "finding", "mode": "finding", "importance": 0.6, "tags": []}]
+    captured_prompts: list[str] = []
+
+    def fake_llm(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return json.dumps(obs)
+
+    with patch("core.transcript_ingest.call_llm", side_effect=fake_llm):
+        extract_observations("transcript text", session_type="writing")
+
+    assert len(captured_prompts) == 1
+    assert "writing" in captured_prompts[0]
+
+
+def test_tick_attaches_session_type_to_observations(tmp_path):
+    """tick() attaches session_type to each observation from extract_observations."""
+    transcript = tmp_path / "projects" / "proj-hash" / "session-st1.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type": "user", "message": {"role": "user", "content": "hi"}}\n')
+
+    cursors_db = tmp_path / "cursors.db"
+    with CursorStore(cursors_db) as store:
+        store.upsert("session-st1", str(transcript), 0)
+
+    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/projects/sector",
+                     "message": {"role": "user", "content": "hello"}}]
+    # Observation without session_type — tick should add it
+    fake_obs = [{"content": "some finding", "mode": "finding", "importance": 0.7, "tags": []}]
+    captured_obs: list[list[dict]] = []
+
+    def fake_append(mem_dir, observations, dry_run=False):
+        captured_obs.append(list(observations))
+        return len(observations)
+
+    with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
+         patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size)), \
+         patch("core.transcript_ingest.summarize", return_value="summarized text"), \
+         patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
+         patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
+        tick(dry_run=False)
+
+    assert len(captured_obs) == 1
+    obs = captured_obs[0][0]
+    assert "session_type" in obs
+    assert obs["session_type"] in {"code", "writing", "research"}
+
+
+def test_tick_code_cwd_produces_code_session_type(tmp_path):
+    """Entries with a code-like cwd produce session_type='code' on observations."""
+    transcript = tmp_path / "projects" / "proj-hash" / "session-st2.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type": "user", "message": {"role": "user", "content": "hi"}}\n')
+
+    cursors_db = tmp_path / "cursors.db"
+    with CursorStore(cursors_db) as store:
+        store.upsert("session-st2", str(transcript), 0)
+
+    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/projects/sector",
+                     "message": {"role": "user", "content": "hello"}}]
+    fake_obs = [{"content": "code finding", "mode": "finding", "importance": 0.7, "tags": []}]
+    captured_obs: list[list[dict]] = []
+
+    def fake_append(mem_dir, observations, dry_run=False):
+        captured_obs.append(list(observations))
+        return len(observations)
+
+    with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
+         patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size)), \
+         patch("core.transcript_ingest.summarize", return_value="summarized text"), \
+         patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
+         patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
+        tick(dry_run=False)
+
+    assert len(captured_obs) == 1
+    assert captured_obs[0][0]["session_type"] == "code"
+
+
+def test_tick_writing_cwd_produces_writing_session_type(tmp_path):
+    """Entries with a writing-like cwd produce session_type='writing' on observations."""
+    transcript = tmp_path / "projects" / "proj-hash" / "session-st3.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type": "user", "message": {"role": "user", "content": "hi"}}\n')
+
+    cursors_db = tmp_path / "cursors.db"
+    with CursorStore(cursors_db) as store:
+        store.upsert("session-st3", str(transcript), 0)
+
+    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/manuscript/chapter-01",
+                     "message": {"role": "user", "content": "hello"}}]
+    fake_obs = [{"content": "writing finding", "mode": "finding", "importance": 0.7, "tags": []}]
+    captured_obs: list[list[dict]] = []
+
+    def fake_append(mem_dir, observations, dry_run=False):
+        captured_obs.append(list(observations))
+        return len(observations)
+
+    with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
+         patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size)), \
+         patch("core.transcript_ingest.summarize", return_value="summarized text"), \
+         patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
+         patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
+        tick(dry_run=False)
+
+    assert len(captured_obs) == 1
+    assert captured_obs[0][0]["session_type"] == "writing"
