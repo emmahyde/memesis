@@ -284,6 +284,17 @@ def _run_migrations():
                 list(r),
             )
 
+    # TTL + poisoning-guard columns (agentic-memory BLOCKER set)
+    for col, typ in [
+        ("expires_at", "INTEGER DEFAULT NULL"),
+        ("source", "TEXT DEFAULT 'human'"),
+    ]:
+        if col not in mem_cols:
+            try:
+                db.execute_sql(f"ALTER TABLE memories ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
+
     # consolidation_log observer instrumentation columns
     con_cols = _columns("consolidation_log")
     for col, typ in [

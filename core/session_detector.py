@@ -13,7 +13,7 @@ always returns a concrete string.
 
 from __future__ import annotations
 
-SESSION_TYPE_VALUES: frozenset[str | None] = frozenset({"code", "writing", "research", None})
+SESSION_TYPE_VALUES: frozenset[str | None] = frozenset({"code", "writing", "research", "unknown", None})
 
 # Path substring hints — checked case-insensitively.
 # Specific over broad: a generic "/projects/" hint mis-classifies anything
@@ -182,14 +182,14 @@ def detect_session_type_from_tools(tool_uses: list[dict]) -> str | None:
 def detect_session_type(
     cwd: str | None,
     tool_uses: list[dict] | None = None,
-    default: str = "code",
+    default: str = "unknown",
 ) -> str:
     """Combine cwd hint + tool-mix + default to always return a session_type.
 
     Priority order:
     1. cwd path hint (most reliable — explicit project paths)
-    2. Tool-mix heuristic (good secondary signal)
-    3. default (fallback; 'code' because memesis is software-first)
+    2. Tool-mix heuristic (soft tiebreak only, used when cwd is None)
+    3. default (fallback; 'unknown' when no signal is available)
 
     Args:
         cwd: Current working directory path, or None.

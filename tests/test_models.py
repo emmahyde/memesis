@@ -712,3 +712,200 @@ class TestQuestionLifecycleFields:
         assert q_fresh.resolved_at is not None
         assert q_fresh.is_pinned == 1
         assert r_fresh.resolves_question_id == str(question.id)
+
+
+# ---------------------------------------------------------------------------
+# Agentic-memory BLOCKER set — Task 1.2 additions
+# ---------------------------------------------------------------------------
+
+
+class TestMigrationIdempotency:
+    """Running _run_migrations() twice must not raise on new columns."""
+
+    def test_expires_at_migration_idempotent(self, store):
+        """Re-running migrations does not error when expires_at already exists."""
+        from core.database import _run_migrations
+        _run_migrations()  # second run — column already present
+        cursor = db.execute_sql("PRAGMA table_info(memories)")
+        cols = [row[1] for row in cursor.fetchall()]
+        assert "expires_at" in cols
+
+    def test_source_migration_idempotent(self, store):
+        """Re-running migrations does not error when source already exists."""
+        from core.database import _run_migrations
+        _run_migrations()  # second run
+        cursor = db.execute_sql("PRAGMA table_info(memories)")
+        cols = [row[1] for row in cursor.fetchall()]
+        assert "source" in cols
+
+
+class TestNewModelFields:
+    """expires_at and source fields round-trip through the ORM."""
+
+    def test_expires_at_defaults_null(self, store):
+        mem = _create_memory()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.expires_at is None
+
+    def test_source_defaults_human(self, store):
+        mem = _create_memory()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.source == 'human'
+
+    def test_source_persists_agent(self, store):
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage='ephemeral',
+            title='agent write',
+            content='c',
+            created_at=now,
+            updated_at=now,
+            source='agent',
+        )
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.source == 'agent'
+
+
+class TestSetExpiry:
+    """Memory.set_expiry() computes correct expires_at per tier."""
+
+    def test_set_expiry_instinctive_returns_none(self, store):
+        """T1 (instinctive) → expires_at = None."""
+        mem = _create_memory(stage='instinctive')
+        result = mem.set_expiry()
+        assert result is None
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.expires_at is None
+
+    def test_set_expiry_crystallized_positive_int(self, store):
+        """T2 (crystallized) → expires_at is a positive integer (Unix ts)."""
+        import time as _time
+        mem = _create_memory(stage='crystallized')
+        before = int(_time.time())
+        mem.set_expiry()
+        after = int(_time.time())
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.expires_at is not None
+        assert isinstance(fresh.expires_at, int)
+        expected_ttl = 180 * 86400
+        assert fresh.expires_at >= before + expected_ttl
+        assert fresh.expires_at <= after + expected_ttl
+
+    def test_set_expiry_consolidated_positive_int(self, store):
+        """T3 (consolidated) → expires_at set to ~90 days from now."""
+        import time as _time
+        mem = _create_memory(stage='consolidated')
+        before = int(_time.time())
+        mem.set_expiry()
+        after = int(_time.time())
+        fresh = Memory.get_by_id(mem.id)
+        expected_ttl = 90 * 86400
+        assert fresh.expires_at >= before + expected_ttl
+        assert fresh.expires_at <= after + expected_ttl
+
+    def test_set_expiry_ephemeral_positive_int(self, store):
+        """T4 (ephemeral) → expires_at set to ~30 days from now."""
+        import time as _time
+        mem = _create_memory(stage='ephemeral')
+        before = int(_time.time())
+        mem.set_expiry()
+        after = int(_time.time())
+        fresh = Memory.get_by_id(mem.id)
+        expected_ttl = 30 * 86400
+        assert fresh.expires_at >= before + expected_ttl
+        assert fresh.expires_at <= after + expected_ttl
+
+    def test_set_expiry_returns_none(self, store):
+        """set_expiry() always returns None regardless of tier."""
+        for stage in ('instinctive', 'crystallized', 'consolidated', 'ephemeral'):
+            mem = _create_memory(stage=stage)
+            assert mem.set_expiry() is None
+
+
+class TestLiveScope:
+    """Memory.live() filters archived and expired memories."""
+
+    def test_live_excludes_archived(self, store):
+        """A memory with archived_at set is excluded from live()."""
+        mem = _create_memory()
+        Memory.update(archived_at=datetime.now().isoformat()).where(
+            Memory.id == mem.id
+        ).execute()
+        ids = [m.id for m in Memory.live()]
+        assert mem.id not in ids
+
+    def test_live_excludes_past_expires_at(self, store):
+        """A memory with expires_at in the past is excluded from live()."""
+        mem = _create_memory()
+        past_ts = int(time_module_unix()) - 3600  # 1 hour ago
+        Memory.update(expires_at=past_ts).where(Memory.id == mem.id).execute()
+        ids = [m.id for m in Memory.live()]
+        assert mem.id not in ids
+
+    def test_live_includes_future_expires_at(self, store):
+        """A memory with expires_at in the future is included in live()."""
+        mem = _create_memory()
+        future_ts = int(time_module_unix()) + 86400  # 1 day from now
+        Memory.update(expires_at=future_ts).where(Memory.id == mem.id).execute()
+        ids = [m.id for m in Memory.live()]
+        assert mem.id in ids
+
+    def test_live_includes_null_expires_at(self, store):
+        """A memory with expires_at = NULL (T1) is included in live()."""
+        mem = _create_memory(stage='instinctive')
+        # expires_at left as NULL (default)
+        ids = [m.id for m in Memory.live()]
+        assert mem.id in ids
+
+    def test_live_coexists_with_active(self, store):
+        """Memory.live() and Memory.active() both return queries independently."""
+        mem = _create_memory()
+        active_ids = {m.id for m in Memory.active()}
+        live_ids = {m.id for m in Memory.live()}
+        assert mem.id in active_ids
+        assert mem.id in live_ids
+
+
+def time_module_unix() -> int:
+    """Return current Unix timestamp as int (thin wrapper for test readability)."""
+    import time as _t
+    return int(_t.time())
+
+
+class TestHardDelete:
+    """Memory.hard_delete() removes from memories, memories_fts, and vec_memories."""
+
+    def test_hard_delete_removes_from_memories(self, store):
+        mem = _create_memory(content='hard delete test unique_xyzzy')
+        mem_id = mem.id
+        Memory.hard_delete(mem_id)
+        with pytest.raises(Memory.DoesNotExist):
+            Memory.get_by_id(mem_id)
+
+    def test_hard_delete_removes_from_fts(self, store):
+        mem = _create_memory(content='fts cascade check ftsxyzzy123')
+        mem_id = mem.id
+        # Verify it's in FTS before deletion
+        results_before = Memory.search_fts('ftsxyzzy123')
+        assert len(results_before) == 1
+        Memory.hard_delete(mem_id)
+        results_after = Memory.search_fts('ftsxyzzy123')
+        assert len(results_after) == 0
+
+    def test_hard_delete_nonexistent_is_silent(self, store):
+        """hard_delete of a missing ID should not raise."""
+        Memory.hard_delete('00000000-0000-0000-0000-000000000000')
+
+    def test_hard_delete_removes_from_vec_if_available(self, store):
+        """When VecStore is available, vec entry is also deleted."""
+        import struct
+        from core.database import get_vec_store
+        vec = get_vec_store()
+        if vec is None or not vec.available:
+            pytest.skip("VecStore not available")
+        mem = _create_memory(content='vec cascade check')
+        emb = struct.pack("512f", *([0.1] * 512))
+        vec.store_embedding(mem.id, emb)
+        assert vec.get_embedding(mem.id) is not None
+        Memory.hard_delete(mem.id)
+        assert vec.get_embedding(mem.id) is None
