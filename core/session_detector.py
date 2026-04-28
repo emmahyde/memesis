@@ -15,15 +15,28 @@ from __future__ import annotations
 
 SESSION_TYPE_VALUES: frozenset[str | None] = frozenset({"code", "writing", "research", None})
 
-# Path substring hints — checked case-insensitively
+# Path substring hints — checked case-insensitively.
+# Specific over broad: a generic "/projects/" hint mis-classifies anything
+# under ~/projects/ as code (e.g. memesis observer sessions, research notes
+# living in a projects subdir). Pin to known code-project subpaths instead.
 CODE_PATH_HINTS: tuple[str, ...] = (
-    "/projects/",
+    "/projects/sector",
+    "/projects/ccmanager",
+    "/projects/godot",
+    "/projects/claude-mem",
     "/repos/",
-    "/sector",
-    "/memesis",
-    "/code",
-    "/src",
-    "/dev",
+    "/sector/",
+    "/code/",
+    "/src/",
+    "/dev/",
+)
+
+# Memesis observer/agent sessions live under ~/.claude-mem/ or
+# /projects/memesis/ and are research-flavored, not code-flavored.
+RESEARCH_PATH_HINTS_PREPEND: tuple[str, ...] = (
+    "/.claude-mem",
+    "/projects/memesis",
+    "/observer-ses",
 )
 
 WRITING_PATH_HINTS: tuple[str, ...] = (
@@ -37,7 +50,7 @@ WRITING_PATH_HINTS: tuple[str, ...] = (
     "/story",
 )
 
-RESEARCH_PATH_HINTS: tuple[str, ...] = (
+RESEARCH_PATH_HINTS: tuple[str, ...] = RESEARCH_PATH_HINTS_PREPEND + (
     "/research",
     "/papers",
     "/external_references",
