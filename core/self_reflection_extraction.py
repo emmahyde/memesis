@@ -42,6 +42,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.rule_registry import RULE_OVERRIDES
+
 logger = logging.getLogger(__name__)
 
 
@@ -134,6 +136,7 @@ class ExtractionRunStats:
     dropped_duplicates: int = 0  # Jaccard near-dup losses
     low_importance_dropped: int = 0  # obs filtered at importance < 0.3
     notes: list[str] = field(default_factory=list)
+    repeated_fact_hashes: list[str] = field(default_factory=list)  # MD5 hashes of raw obs facts
 
     @property
     def productive_rate(self) -> float:
@@ -146,6 +149,12 @@ class ExtractionRunStats:
         if self.final_observations == 0:
             return float("inf") if self.cost_calls > 0 else 0.0
         return self.cost_calls / self.final_observations
+
+    @property
+    def obs_per_cost_call(self) -> float:
+        if self.cost_calls == 0:
+            return 0.0
+        return self.raw_observations / self.cost_calls
 
     def to_dict(self) -> dict:
         return {
@@ -167,6 +176,8 @@ class ExtractionRunStats:
             "cost_calls": self.cost_calls,
             "productive_rate": self.productive_rate,
             "cost_per_obs": self.cost_per_obs,
+            "obs_per_cost_call": self.obs_per_cost_call,
+            "repeated_fact_hashes": self.repeated_fact_hashes,
             "notes": self.notes,
         }
 
@@ -394,6 +405,122 @@ def _rule_dedup_inert(stats: ExtractionRunStats) -> SelfObservation | None:
         ),
         evidence=stats.to_dict(),
         rule_id="dedup_inert",
+    )
+
+
+@_rule("low_obs_yield_per_call")
+def _rule_low_obs_yield_per_call(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Raw observation yield per LLM call is too low — extraction is inefficient.
+
+    Fires when obs_per_cost_call < 2.0 AND cost_calls >= 8 (enough sample size
+    to be meaningful; fewer calls may reflect a legitimately sparse session).
+    """
+    if stats.cost_calls < 8:
+        return None
+    if stats.obs_per_cost_call >= 2.0:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} made {stats.cost_calls} LLM calls "
+            f"and produced {stats.raw_observations} raw observations "
+            f"({stats.obs_per_cost_call:.2f} obs/call); "
+            f"yield below the 2.0 threshold signals extraction spend without signal return."
+        ],
+        kind="finding",
+        importance=0.65,
+        proposed_action=(
+            "Reduce max_windows or enable affect_pre_filter to improve raw "
+            "observation yield per LLM call."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="low_obs_yield_per_call",
+    )
+
+
+@_rule("repeated_facts_high")
+def _rule_repeated_facts_high(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Cross-session re-extraction detected via content_hash collision.
+
+    Caller populates stats.repeated_fact_hashes with MD5 hashes of raw
+    observation facts. This rule checks how many of those hashes already
+    exist in the memories DB — collisions indicate facts being re-extracted
+    across sessions without deduplication.
+    """
+    if not stats.repeated_fact_hashes:
+        return None
+    collision_count: int | None = None
+    try:
+        from core.models import Memory, db
+        if not db.is_connection_usable():
+            return None
+        existing = (
+            Memory.select()
+            .where(Memory.content_hash.in_(stats.repeated_fact_hashes))
+            .count()
+        )
+        collision_count = existing
+    except Exception:
+        return None
+    if collision_count is None or collision_count < 3:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} produced {collision_count} raw "
+            f"observations whose content_hash already exists in the memory DB; "
+            f"facts are being re-extracted across sessions without deduplication."
+        ],
+        kind="finding",
+        importance=0.7,
+        proposed_action=(
+            "Cross-session re-extraction detected; consider deduplication at "
+            "consolidation time or raising importance_gate."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="repeated_facts_high",
+    )
+
+
+@_rule("confirmed_rule_no_action")
+def _rule_confirmed_rule_no_action(stats: ExtractionRunStats) -> SelfObservation | None:
+    """A self-reflection rule has fired many times but has no override wired.
+
+    Checks aggregate_audit() for rules that have fired >= 5 times, have a
+    proposed_action, but are NOT in RULE_OVERRIDES. These are confirmed
+    observations with no automated response — dead letter rules.
+    """
+    try:
+        audit = aggregate_audit(root=None)
+    except Exception:
+        return None
+    qualifying: list[str] = []
+    for rule_id, slot in audit.items():
+        if slot.get("fire_count", 0) < 5:
+            continue
+        proposed = (slot.get("latest") or {}).get("proposed_action") or ""
+        if not proposed:
+            continue
+        if rule_id in RULE_OVERRIDES:
+            continue
+        qualifying.append(rule_id)
+    if not qualifying:
+        return None
+    facts = [
+        f"Rule '{rid}' has fired >= 5 times with a proposed_action but has no "
+        f"entry in RULE_OVERRIDES — its recommendation is never automatically applied."
+        for rid in qualifying
+    ]
+    # Use the first qualifying rule_id in the proposed_action message
+    first_rid = qualifying[0]
+    return SelfObservation(
+        facts=facts,
+        kind="open_question",
+        importance=0.75,
+        proposed_action=(
+            f"Wire a parameter override for {first_rid} in "
+            f"core/rule_registry.py RULE_OVERRIDES."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="confirmed_rule_no_action",
     )
 
 

@@ -35,24 +35,74 @@ from core.transcript import (
     iter_user_anchored_windows,
 )
 from core.cursors import CursorStore
-from core.llm import call_llm, call_llm_batch
+from core.llm import call_llm, call_llm_batch, _repair_json  # noqa: F401
 from core.prompts import OBSERVATION_EXTRACT_PROMPT, OBSERVATION_TYPES, format_observation
-from core.session_detector import detect_session_type
-from core.extraction_affect import aggregate_window_affect, apply_affect_prior, WindowAffect
+from core.session_detector import detect_session_type, RESEARCH_PATH_HINTS_PREPEND
+from core.extraction_affect import aggregate_window_affect, apply_affect_prior, format_affect_hint, WindowAffect
 from core.issue_cards import synthesize_issue_cards
-from core.self_reflection_extraction import (
-    ExtractionRunStats,
-    reflect_on_extraction,
-    select_chunking,
-)
+from core.card_validators import _card_evidence_load_bearing
 from core.rule_registry import ParameterOverrides
+
+PREFILTER_RESEARCH_NEUTRAL: bool = True
+PREFILTER_DENSITY_THRESHOLD_CHARS: int = 200
+PREFILTER_TTR_THRESHOLD: float = 0.25
+PREFILTER_OBSERVER_DENSITY_THRESHOLD_CHARS: int = 400
 
 logger = logging.getLogger(__name__)
 
+
+def _avg_chars_per_entry(entries: list[dict]) -> float:
+    if not entries:
+        return 0.0
+    total = 0
+    for e in entries:
+        content = e.get("content") or e.get("text") or ""
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += len(part.get("text") or "")
+    return total / len(entries)
+
+
+def _is_research_observer(cwd: str | None) -> bool:
+    if not cwd:
+        return False
+    return any(hint in cwd for hint in RESEARCH_PATH_HINTS_PREPEND)
+
+
+def _compute_ttr(text: str) -> float:
+    if not text:
+        return 0.0
+    tokens = text.split()
+    if not tokens:
+        return 0.0
+    return len(set(tokens)) / len(tokens)
+
 REFINE_PROMPT = """You are reviewing observations extracted from overlapping windows of a single session.
 Your job: identify cross-window patterns, merge near-duplicates that the
-content-hash deduper missed (same finding, different phrasing), and adjust
-importance scores when full-session context warrants it.
+content-hash deduper missed (same finding, different phrasing), and assign the
+final session-level importance score.
+
+INCOMING IMPORTANCE FIELD IS WINDOW-LOCAL SALIENCE.
+Stage 1 produced each observation's `importance` based on what it could see in
+ONE window. You have the full session synopsis, the session-level affect summary,
+and every observation across every window. You own the final importance score.
+
+PROMOTE importance when:
+  - The same finding appears across multiple windows (recurrence = durability)
+  - The session affect summary shows pushback / repetition / friction near it
+  - Later windows reinforce or build on the observation
+  - It interacts with another observation (e.g., a constraint that shapes a fix)
+
+DEMOTE importance when:
+  - The window-local score was inflated for a passing aside
+  - The finding was contradicted or revised in a later window
+  - It is subsumed by a stronger observation you are merging into
+
+Final importance MUST be in [0.0, 1.0] using the same anchors Stage 1 used:
+  0.2 routine, 0.5 useful, 0.8 load-bearing, 0.95 correction/hard constraint.
 
 DO NOT invent new observations. Only refine, merge, or re-score existing ones.
 DO NOT drop observations unless they are confirmed duplicates of others in
@@ -65,12 +115,12 @@ SESSION SYNOPSIS:
 SESSION AFFECT (for importance calibration):
 {affect_summary}
 
-OBSERVATIONS FROM HIERARCHICAL EXTRACTION (JSON list):
+OBSERVATIONS FROM HIERARCHICAL EXTRACTION (JSON list, `importance` = window-local salience):
 {observations_json}
 
 Output ONLY a JSON object:
 {{
-  "refined": [/* observations in same schema as input */],
+  "refined": [/* observations in same schema as input; `importance` is now session-level */],
   "merges": [/* {{"merged_into_index": int, "from_indices": [int,...], "reason": str}} */],
   "rescores": [/* {{"index": int, "old": float, "new": float, "reason": str}} */]
 }}
@@ -127,7 +177,7 @@ def extract_observations(
 
     Handles two LLM response formats:
       1. JSON array  []         — existing behavior; observation list (possibly empty).
-      2. JSON object {"skipped": true, "reason": "..."}
+      2. JSON object {"skipped": true, "failed_gate": "...", "reason": "..."}
                                 — intentional skip signal (Stage-1 skip protocol, LLME-F5).
          Any other dict is treated as malformed and rejected.
 
@@ -141,7 +191,9 @@ def extract_observations(
                     Phase E audit (2026-04-28) added this so the silent
                     importance drop is observable downstream.
     """
-    raw = call_llm(OBSERVATION_EXTRACT_PROMPT.format(transcript=rendered, session_type=session_type))
+    raw = call_llm(OBSERVATION_EXTRACT_PROMPT.format(
+        transcript=rendered, session_type=session_type, affect_hint=""
+    ))
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -162,10 +214,12 @@ def extract_observations(
         if parsed.get("skipped") is True:
             # Intentional skip — log and return empty.
             reason = parsed.get("reason", "(no reason given)")
+            failed_gate = parsed.get("failed_gate", "unspecified")
             logger.info(
-                "extract_observations: intentional skip — %s", reason
+                "extract_observations: intentional skip [gate=%s] — %s",
+                failed_gate, reason,
             )
-            _write_ingest_trace("skipped", reason, raw[:80])
+            _write_ingest_trace("skipped", f"[{failed_gate}] {reason}", raw[:80])
             return []
         # Dict without "skipped" key — malformed response.
         logger.warning(
@@ -199,42 +253,42 @@ def _parse_extract_response(
     set when the response is an intentional skip, otherwise None. The
     observation list is possibly empty after filter / on skip.
 
-    On JSONDecodeError for an array-shaped response, attempts truncate-at-last-}
-    plus append-] repair before falling back to []. Successful repair is logged at
-    WARNING with parse_error_repaired=True and increments
+    On JSONDecodeError for an array-shaped response, delegates to _repair_json
+    (trailing-comma + truncated-array repair) before falling back to [].
+    Successful repair is logged at WARNING and increments
     drop_stats["parse_errors_repaired"].
+
+    Skip records returned by the caller now include:
+      - raw_response_excerpt: first 500 chars of the raw LLM response
+      - llm_reason: parsed reason string if the LLM emitted {"reason": "..."}
 
     drop_stats: optional mutable dict; receives:
       - "low_importance_dropped": count of obs filtered at importance < 0.3
       - "parse_errors_repaired": count of successfully repaired truncated arrays
+      - "parse_errors": count of unrecoverable parse failures
       (Phase E audit instrumentation, 2026-04-28).
     """
+    raw_excerpt = raw[:500]
     parsed = None
-    repaired = False
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        # Attempt repair: truncate to last complete object, close array
-        last_brace = raw.rfind("}")
-        if last_brace != -1:
-            repaired_text = raw[: last_brace + 1] + "]"
+        repaired_text = _repair_json(raw, drop_stats=drop_stats)
+        if repaired_text is not None:
             try:
                 candidate = json.loads(repaired_text)
                 if isinstance(candidate, list):
                     logger.warning(
-                        "_parse_extract_response: JSON repaired (truncated array) — "
-                        "%d obs recovered", len(candidate),
+                        "_parse_extract_response: JSON repaired — %d obs recovered",
+                        len(candidate),
                     )
-                    if drop_stats is not None:
-                        drop_stats["parse_errors_repaired"] = (
-                            drop_stats.get("parse_errors_repaired", 0) + 1
-                        )
                     parsed = candidate
-                    repaired = True
             except json.JSONDecodeError:
-                pass
-        if not repaired:
+                repaired_text = None
+        if parsed is None:
             logger.warning("_parse_extract_response: JSON decode failed: %s", exc)
+            if drop_stats is not None:
+                drop_stats["parse_errors"] = drop_stats.get("parse_errors", 0) + 1
             return [], None
 
     if isinstance(parsed, list):
@@ -249,13 +303,25 @@ def _parse_extract_response(
     if isinstance(parsed, dict):
         if parsed.get("skipped") is True:
             reason = parsed.get("reason", "(no reason given)")
-            logger.info("_parse_extract_response: intentional skip — %s", reason)
-            _write_ingest_trace("skipped", reason, raw[:80])
-            return [], reason
+            failed_gate = parsed.get("failed_gate", "unspecified")
+            tagged = f"[{failed_gate}] {reason}"
+            considered = parsed.get("considered")
+            # Task #12: if skip lacks `considered` field or affect shows signal,
+            # downgrade to warning — don't fully trust the skip.
+            affect_boost = getattr(affect, "max_boost", 0.0) if affect is not None else 0.0
+            if not considered or affect_boost > 0:
+                logger.warning(
+                    "_parse_extract_response: skip downgraded — considered=%r affect_boost=%.2f — %s",
+                    considered, affect_boost, tagged,
+                )
+            else:
+                logger.info("_parse_extract_response: intentional skip — %s", tagged)
+            _write_ingest_trace("skipped", tagged, raw_excerpt[:80])
+            return [], tagged
         logger.warning(
             "_parse_extract_response: LLM returned a dict without 'skipped' key — treating as malformed"
         )
-        _write_ingest_trace("rejected", "dict response without skipped=true", raw[:80])
+        _write_ingest_trace("rejected", "dict response without skipped=true", raw_excerpt[:80])
         return [], None
 
     logger.warning(
@@ -367,6 +433,7 @@ def extract_observations_hierarchical(
     context_before: int = 2,
     context_after: int = 8,
     overrides: ParameterOverrides | None = None,
+    cwd: str | None = None,
 ) -> dict:
     """Map-reduce extraction over overlapping windows.
 
@@ -437,11 +504,59 @@ def extract_observations_hierarchical(
     cost_calls = 0
     drop_stats: dict = {"low_importance_dropped": 0}
 
+    # Three-stage cheapest-first prefilter. Each gate records distinct outcome.
+    #   affect_gate    — neutral + no pushback/repetition + low session density
+    #   observer_gate  — research + observer/agent cwd + tighter density
+    #   entropy_gate   — per-window TTR below threshold (self-summarizing)
+    avg_chars = _avg_chars_per_entry(entries)
+    is_observer = _is_research_observer(cwd)
+    density_low = avg_chars < PREFILTER_DENSITY_THRESHOLD_CHARS
+    observer_density_low = avg_chars < PREFILTER_OBSERVER_DENSITY_THRESHOLD_CHARS
+    prefiltered: list[int] = []
+    if PREFILTER_RESEARCH_NEUTRAL and session_type == "research":
+        for i, a in enumerate(affect_signals):
+            outcome: str | None = None
+            reason: str | None = None
+            affect_neutral = (
+                a.max_boost == 0.0
+                and not a.has_pushback
+                and not a.has_repetition
+            )
+            if is_observer and observer_density_low and affect_neutral:
+                outcome = "pre_filtered_observer"
+                reason = "[observer_gate] research observer cwd + neutral affect + low density"
+            elif density_low and affect_neutral:
+                outcome = "pre_filtered_low_affect"
+                reason = "[affect_gate] neutral research window + low session density"
+            else:
+                ttr = _compute_ttr(windows[i])
+                if affect_neutral and ttr < PREFILTER_TTR_THRESHOLD:
+                    outcome = "pre_filtered_low_entropy"
+                    reason = f"[entropy_gate] low diversity ttr={ttr:.2f}"
+            if outcome:
+                prefiltered.append(i)
+                skips.append({
+                    "window_index": i,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "affect_intensity": a.max_boost,
+                    "affect_valence": a.valence,
+                    "avg_chars_per_entry": avg_chars,
+                })
+        if prefiltered:
+            _keep = set(range(len(windows))) - set(prefiltered)
+            windows = [w for i, w in enumerate(windows) if i in _keep]
+            affect_signals = [a for i, a in enumerate(affect_signals) if i in _keep]
+
     # Concurrent LLM batch — agent-SDK serializes OAuth refresh internally
     # so this no longer races against itself the way raw subprocess did.
     prompts = [
-        OBSERVATION_EXTRACT_PROMPT.format(transcript=w, session_type=session_type)
-        for w in windows
+        OBSERVATION_EXTRACT_PROMPT.format(
+            transcript=w,
+            session_type=session_type,
+            affect_hint=format_affect_hint(a),
+        )
+        for w, a in zip(windows, affect_signals)
     ]
     # affect_pre_filter: when `low_productive_rate` is confirmed, skip the
     # LLM call entirely on windows with no somatic affect signal. Recorded
@@ -471,7 +586,13 @@ def extract_observations_hierarchical(
             prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
         )
 
-    for i, (w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):
+    for i, (_w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):
+        # Pre-call warning: log if rendered window is unusually large
+        if len(_w) > 12000:
+            logger.warning(
+                "hierarchical: window %d/%d is large (%d chars) — may exceed effective attention range",
+                i + 1, len(windows), len(_w),
+            )
         if raw.startswith("[ERROR]"):
             logger.warning("hierarchical: window %d/%d failed: %s",
                            i + 1, len(windows), raw[:200])
@@ -479,6 +600,7 @@ def extract_observations_hierarchical(
                 "window_index": i,
                 "outcome": "exception",
                 "reason": raw[:300],
+                "raw_response_excerpt": raw[:500],
                 "affect_intensity": affect.max_boost,
                 "affect_valence": affect.valence,
             })
@@ -490,21 +612,37 @@ def extract_observations_hierarchical(
         except Exception as exc:  # noqa: BLE001
             logger.warning("hierarchical: window %d/%d parse failed: %s",
                            i + 1, len(windows), exc)
-            skips.append({"window_index": i, "outcome": "parse_error", "reason": str(exc)})
+            skips.append({
+                "window_index": i,
+                "outcome": "parse_error",
+                "reason": str(exc),
+                "raw_response_excerpt": raw[:500],
+            })
             parse_errors += 1
             continue
         if obs:
             productive_windows += 1
             apply_affect_prior(obs, affect)
         else:
+            # Attempt to extract llm_reason from the raw response (if LLM emitted {"reason": ...})
+            llm_reason: str | None = None
+            try:
+                _parsed_raw = json.loads(raw)
+                if isinstance(_parsed_raw, dict) and "reason" in _parsed_raw:
+                    llm_reason = _parsed_raw["reason"]
+            except (json.JSONDecodeError, TypeError):
+                pass
             skip_record: dict = {
                 "window_index": i,
                 "outcome": "empty_or_skipped",
+                "raw_response_excerpt": raw[:500],
                 "affect_intensity": affect.max_boost,
                 "affect_valence": affect.valence,
             }
             if skip_reason is not None:
                 skip_record["reason"] = skip_reason
+            if llm_reason is not None:
+                skip_record["llm_reason"] = llm_reason
             skips.append(skip_record)
         all_obs.extend(obs)
         logger.info(
@@ -533,14 +671,35 @@ def extract_observations_hierarchical(
         cards, orphans, synthesis_stats = synthesize_issue_cards(
             deduped, synopsis, session_affect_summary=affect_summary
         )
+        # Circular-evidence demotion: single-quote cards whose lone quote merely
+        # restates the card body add no retrieval value — demote them to orphans.
+        cards_demoted_circular = 0
+        surviving_cards: list[dict] = []
+        for card in cards:
+            if len(card.get("evidence_quotes") or []) == 1 and not _card_evidence_load_bearing(card):
+                orphans.append({
+                    "kind": card.get("kind") or "fact",
+                    "facts": [card["evidence_quotes"][0]],
+                    "importance": card.get("importance", 0.4),
+                    "knowledge_type": card.get("knowledge_type", "unknown"),
+                    "scope": card.get("scope", "session"),
+                    "demoted_from_card": True,
+                })
+                cards_demoted_circular += 1
+            else:
+                surviving_cards.append(card)
+        cards = surviving_cards
+        synthesis_stats["cards_demoted_circular"] = cards_demoted_circular
         # Merge LLM-derived card affect into session affect (Bug 2 fix)
         affect_summary = _merge_card_affect(cards, affect_summary)
         if synthesis_stats.get("outcome") == "ok":
             cost_calls += 1
+            demoted_suffix = f" + {cards_demoted_circular} demoted" if cards_demoted_circular else ""
             logger.info(
-                "issue_synthesis: %d→%d cards + %d orphans",
+                "issue_synthesis: %d→%d cards + %d orphans%s",
                 len(deduped), synthesis_stats.get("card_count", 0),
                 synthesis_stats.get("orphan_count", 0),
+                demoted_suffix,
             )
         else:
             logger.info("issue_synthesis: %s — keeping flat obs as orphans",
@@ -563,6 +722,7 @@ def extract_observations_hierarchical(
         "productive_windows": productive_windows,
         "parse_errors": parse_errors,
         "cost_calls": cost_calls,
+        "prefilter_skipped_count": len(prefiltered),
     }
 
 

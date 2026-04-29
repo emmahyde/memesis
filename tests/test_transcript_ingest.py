@@ -414,12 +414,22 @@ class TestJsonRepair:
         assert drop_stats.get("parse_errors_repaired", 0) == 0
 
     def test_skip_reason_returned_on_intentional_skip(self):
-        """Intentional skip dict returns the reason string as second element."""
+        """Intentional skip dict returns the reason string as second element,
+        prefixed with the failed gate (or [unspecified] if absent)."""
         import json
-        raw = json.dumps({"skipped": True, "reason": "no meaningful signal"})
+        raw = json.dumps({
+            "skipped": True,
+            "failed_gate": "novel",
+            "reason": "no meaningful signal",
+        })
         obs, reason = _parse_extract_response(raw)
         assert obs == []
-        assert reason == "no meaningful signal"
+        assert reason == "[novel] no meaningful signal"
+
+        # Backwards-compat: missing failed_gate marked unspecified
+        raw2 = json.dumps({"skipped": True, "reason": "no meaningful signal"})
+        _, reason2 = _parse_extract_response(raw2)
+        assert reason2 == "[unspecified] no meaningful signal"
 
     def test_skip_reason_included_in_skips_list(self):
         """extract_observations_hierarchical includes reason in skip records when present."""
@@ -450,7 +460,7 @@ class TestJsonRepair:
 
         skips = result["skips"]
         assert len(skips) == 1
-        assert skips[0].get("reason") == "window too short"
+        assert skips[0].get("reason") == "[unspecified] window too short"
 
 
 # ---------------------------------------------------------------------------
@@ -614,3 +624,210 @@ class TestRefineObservations:
 
         assert "refine" in result
         assert result["refine"]["outcome"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Pre-filter low-affect research windows — Task 2.1
+# ---------------------------------------------------------------------------
+
+
+class TestPrefilterResearchNeutral:
+    """Gate: PREFILTER_RESEARCH_NEUTRAL skips LLM calls on research windows
+    with max_boost == 0.0, logs them as pre_filtered_low_affect."""
+
+    def _make_fake_affect(self, max_boost: float = 0.0, valence: str = "neutral"):
+        from unittest.mock import MagicMock
+        from core.extraction_affect import WindowAffect
+        a = MagicMock(spec=WindowAffect)
+        a.max_boost = max_boost
+        a.valence = valence
+        a.has_repetition = False
+        a.has_pushback = False
+        a.evidence_quotes = []
+        a.importance_prior = 0.0
+        a.to_dict.return_value = {"valence": valence, "max_boost": max_boost}
+        return a
+
+    def test_research_zero_affect_skipped(self):
+        """Research session + max_boost==0.0 → windows skipped, call_llm_batch not called for them."""
+        import json
+        from unittest.mock import patch, call as mock_call
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        fake_affect = self._make_fake_affect(max_boost=0.0)
+
+        with patch.object(ti, "PREFILTER_RESEARCH_NEUTRAL", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1", "win2"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch") as mock_batch, \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="research",
+                refine=False,
+            )
+
+        # Both windows have max_boost=0.0 → both filtered, call_llm_batch called with empty list
+        mock_batch.assert_called_once()
+        batch_prompts = mock_batch.call_args[0][0]
+        assert batch_prompts == [], f"Expected empty prompts list, got {batch_prompts!r}"
+
+        skips = result["skips"]
+        prefilter_skips = [s for s in skips if s["outcome"] == "pre_filtered_low_affect"]
+        assert len(prefilter_skips) == 2
+        assert all(s["affect_intensity"] == 0.0 for s in prefilter_skips)
+
+    def test_research_nonzero_affect_not_skipped(self):
+        """Research session + one window max_boost>0 → that window passes to LLM."""
+        import json
+        from unittest.mock import patch, MagicMock
+        from core.extraction_affect import WindowAffect
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        affect_zero = self._make_fake_affect(max_boost=0.0)
+        affect_signal = self._make_fake_affect(max_boost=0.3, valence="friction")
+
+        call_count = []
+
+        def fake_aggregate(window_text: str):
+            # Return affect_zero for "win1", affect_signal for "win2"
+            if window_text == "win1":
+                return affect_zero
+            return affect_signal
+
+        obs_response = json.dumps([{"content": "finding", "importance": 0.6, "facts": []}])
+
+        with patch.object(ti, "PREFILTER_RESEARCH_NEUTRAL", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1", "win2"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", side_effect=fake_aggregate), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]) as mock_batch, \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="research",
+                refine=False,
+            )
+
+        # Only "win2" (max_boost=0.3) passes → batch called with 1 prompt
+        mock_batch.assert_called_once()
+        batch_prompts = mock_batch.call_args[0][0]
+        assert len(batch_prompts) == 1
+
+        skips = result["skips"]
+        prefilter_skips = [s for s in skips if s["outcome"] == "pre_filtered_low_affect"]
+        assert len(prefilter_skips) == 1  # only win1 was prefiltered
+        assert result["prefilter_skipped_count"] == 1
+
+    def test_code_session_not_filtered(self):
+        """Code session + max_boost==0.0 → prefilter gate does NOT fire."""
+        import json
+        from unittest.mock import patch
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        fake_affect = self._make_fake_affect(max_boost=0.0)
+        obs_response = json.dumps([])
+
+        with patch.object(ti, "PREFILTER_RESEARCH_NEUTRAL", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]) as mock_batch, \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="code",
+                refine=False,
+            )
+
+        # Gate doesn't fire for code sessions — batch called with 1 prompt
+        mock_batch.assert_called_once()
+        batch_prompts = mock_batch.call_args[0][0]
+        assert len(batch_prompts) == 1
+
+        prefilter_skips = [s for s in result["skips"] if s["outcome"] == "pre_filtered_low_affect"]
+        assert prefilter_skips == []
+        assert result["prefilter_skipped_count"] == 0
+
+    def test_constant_false_disables_gate(self, monkeypatch):
+        """Setting PREFILTER_RESEARCH_NEUTRAL=False disables the gate entirely."""
+        import json
+        from unittest.mock import patch
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        monkeypatch.setattr(ti, "PREFILTER_RESEARCH_NEUTRAL", False)
+
+        fake_affect = self._make_fake_affect(max_boost=0.0)
+        obs_response = json.dumps([])
+
+        with patch("core.transcript_ingest.iter_windows", return_value=["win1", "win2"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response, obs_response]) as mock_batch, \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="research",
+                refine=False,
+            )
+
+        # With gate disabled, both windows go to LLM
+        batch_prompts = mock_batch.call_args[0][0]
+        assert len(batch_prompts) == 2
+
+        prefilter_skips = [s for s in result["skips"] if s["outcome"] == "pre_filtered_low_affect"]
+        assert prefilter_skips == []
+        assert result["prefilter_skipped_count"] == 0
+
+    def test_prefilter_skipped_count_in_return(self):
+        """Return dict always contains 'prefilter_skipped_count' key."""
+        import json
+        from unittest.mock import patch
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        fake_affect = self._make_fake_affect(max_boost=0.0)
+        obs_response = json.dumps([])
+
+        # Non-research session — key should still be present (value=0)
+        with patch.object(ti, "PREFILTER_RESEARCH_NEUTRAL", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="code",
+                refine=False,
+            )
+
+        assert "prefilter_skipped_count" in result
+        assert result["prefilter_skipped_count"] == 0
+
+        # Research session with zero affect — key present and correct count
+        with patch.object(ti, "PREFILTER_RESEARCH_NEUTRAL", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1", "win2"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[]) as mock_batch, \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result2 = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="research",
+                refine=False,
+            )
+
+        assert "prefilter_skipped_count" in result2
+        assert result2["prefilter_skipped_count"] == 2
