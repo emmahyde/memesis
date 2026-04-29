@@ -162,24 +162,51 @@ def _parse_extract_response(
     *,
     affect=None,
     drop_stats: dict | None = None,
-) -> list[dict]:
+    skip_reason: str | None = None,
+) -> tuple[list[dict], str | None]:
     """Parse a Stage 1 LLM response with the same semantics as extract_observations.
 
-    Returns the observation list (possibly empty after filter / on skip).
-    Raises only json.JSONDecodeError-equivalent on malformed input — the
-    caller decides how to count parse_errors. Otherwise mirrors the skip /
-    rejected / unexpected-type handling of extract_observations() so the
-    batched and one-at-a-time paths produce identical outputs.
+    Returns (observation_list, skip_reason_text) where skip_reason_text is
+    set when the response is an intentional skip, otherwise None. The
+    observation list is possibly empty after filter / on skip.
 
-    drop_stats: optional mutable dict; receives "low_importance_dropped"
-                accumulating count of obs filtered at importance < 0.3
-                (Phase E audit instrumentation, 2026-04-28).
+    On JSONDecodeError for an array-shaped response, attempts truncate-at-last-}
+    plus append-] repair before falling back to []. Successful repair is logged at
+    WARNING with parse_error_repaired=True and increments
+    drop_stats["parse_errors_repaired"].
+
+    drop_stats: optional mutable dict; receives:
+      - "low_importance_dropped": count of obs filtered at importance < 0.3
+      - "parse_errors_repaired": count of successfully repaired truncated arrays
+      (Phase E audit instrumentation, 2026-04-28).
     """
+    parsed = None
+    repaired = False
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.warning("_parse_extract_response: JSON decode failed: %s", exc)
-        return []
+        # Attempt repair: truncate to last complete object, close array
+        last_brace = raw.rfind("}")
+        if last_brace != -1:
+            repaired_text = raw[: last_brace + 1] + "]"
+            try:
+                candidate = json.loads(repaired_text)
+                if isinstance(candidate, list):
+                    logger.warning(
+                        "_parse_extract_response: JSON repaired (truncated array) — "
+                        "%d obs recovered", len(candidate),
+                    )
+                    if drop_stats is not None:
+                        drop_stats["parse_errors_repaired"] = (
+                            drop_stats.get("parse_errors_repaired", 0) + 1
+                        )
+                    parsed = candidate
+                    repaired = True
+            except json.JSONDecodeError:
+                pass
+        if not repaired:
+            logger.warning("_parse_extract_response: JSON decode failed: %s", exc)
+            return [], None
 
     if isinstance(parsed, list):
         kept = [o for o in parsed if o.get("importance", 0) >= 0.3]
@@ -188,25 +215,25 @@ def _parse_extract_response(
                 drop_stats.get("low_importance_dropped", 0)
                 + (len(parsed) - len(kept))
             )
-        return kept
+        return kept, None
 
     if isinstance(parsed, dict):
         if parsed.get("skipped") is True:
             reason = parsed.get("reason", "(no reason given)")
             logger.info("_parse_extract_response: intentional skip — %s", reason)
             _write_ingest_trace("skipped", reason, raw[:80])
-            return []
+            return [], reason
         logger.warning(
             "_parse_extract_response: LLM returned a dict without 'skipped' key — treating as malformed"
         )
         _write_ingest_trace("rejected", "dict response without skipped=true", raw[:80])
-        return []
+        return [], None
 
     logger.warning(
         "_parse_extract_response: unexpected parsed type %s — discarding",
         type(parsed).__name__,
     )
-    return []
+    return [], None
 
 
 def _normalize_for_dedupe(text: str) -> frozenset[str]:
@@ -336,7 +363,7 @@ def extract_observations_hierarchical(
             continue
         cost_calls += 1
         try:
-            obs = _parse_extract_response(raw, affect=affect, drop_stats=drop_stats)
+            obs, skip_reason = _parse_extract_response(raw, affect=affect, drop_stats=drop_stats)
         except Exception as exc:  # noqa: BLE001
             logger.warning("hierarchical: window %d/%d parse failed: %s",
                            i + 1, len(windows), exc)
@@ -347,12 +374,15 @@ def extract_observations_hierarchical(
             productive_windows += 1
             apply_affect_prior(obs, affect)
         else:
-            skips.append({
+            skip_record: dict = {
                 "window_index": i,
                 "outcome": "empty_or_skipped",
                 "affect_intensity": affect.max_boost,
                 "affect_valence": affect.valence,
-            })
+            }
+            if skip_reason is not None:
+                skip_record["reason"] = skip_reason
+            skips.append(skip_record)
         all_obs.extend(obs)
         logger.info(
             "hierarchical: window %d/%d → %d obs (affect=%s/%.2f)",
@@ -365,12 +395,14 @@ def extract_observations_hierarchical(
     cards: list[dict] = []
     orphans: list[dict] = deduped
     synthesis_stats: dict = {"outcome": "skipped"}
+    affect_summary = _aggregate_session_affect(affect_signals)
     if refine and deduped:
         synopsis = summarize(entries, max_chars=6000)
-        affect_summary = _aggregate_session_affect(affect_signals)
         cards, orphans, synthesis_stats = synthesize_issue_cards(
             deduped, synopsis, session_affect_summary=affect_summary
         )
+        # Merge LLM-derived card affect into session affect (Bug 2 fix)
+        affect_summary = _merge_card_affect(cards, affect_summary)
         if synthesis_stats.get("outcome") == "ok":
             cost_calls += 1
             logger.info(
@@ -389,14 +421,78 @@ def extract_observations_hierarchical(
         "raw_count": len(all_obs),
         "dropped_duplicates": dropped,
         "low_importance_dropped": drop_stats.get("low_importance_dropped", 0),
+        "parse_errors_repaired": drop_stats.get("parse_errors_repaired", 0),
         "post_dedupe_count": len(deduped),
         "synthesis": synthesis_stats,
         "skips": skips,
         "affect_signals": [a.to_dict() for a in affect_signals],
+        "session_affect": affect_summary,
         "productive_windows": productive_windows,
         "parse_errors": parse_errors,
         "cost_calls": cost_calls,
     }
+
+
+def _merge_card_affect(cards: list[dict], base: dict) -> dict:
+    """Reconcile LLM-derived affect fields from issue cards into the session affect summary.
+
+    Solves the somatic affect blind spot: somatic detectors cannot see compiler errors,
+    behavioral corrections, or non-lexical pushback — but LLM issue cards already carry
+    that signal in user_reaction and user_affect_valence. No new LLM call required.
+
+    Args:
+        cards: Issue cards returned by synthesize_issue_cards (list of dicts).
+        base: Session affect dict from _aggregate_session_affect.
+
+    Returns:
+        A new dict (copy of base) with card-derived affect merged in.
+    """
+    if not cards:
+        return base
+
+    result = dict(base)
+
+    # Collect card valences and reactions
+    card_valences = [
+        c["user_affect_valence"]
+        for c in cards
+        if c.get("user_affect_valence") is not None
+    ]
+    card_reactions_raw = [
+        c["user_reaction"]
+        for c in cards
+        if c.get("user_reaction") is not None
+    ]
+
+    # Merge valence: if base is neutral and cards carry non-neutral signal, override
+    base_valence = result.get("dominant_valence", "neutral")
+    non_neutral = [v for v in card_valences if v != "neutral"]
+    if non_neutral:
+        # Count occurrences to find mode
+        counts: dict[str, int] = {}
+        for v in non_neutral:
+            counts[v] = counts.get(v, 0) + 1
+        dominant_card_valence = max(counts.items(), key=lambda x: x[1])[0]
+
+        if base_valence == "neutral":
+            result["dominant_valence"] = dominant_card_valence
+        elif base_valence != dominant_card_valence and base_valence != "mixed":
+            # Both base and cards carry distinct non-neutral valences
+            result["dominant_valence"] = "mixed"
+        # If base_valence == dominant_card_valence, no change needed
+
+    # Accumulate card reactions (deduped, preserve order, cap at 8)
+    seen_reactions: set[str] = set()
+    deduped_reactions: list[str] = []
+    for r in card_reactions_raw:
+        if r not in seen_reactions:
+            seen_reactions.add(r)
+            deduped_reactions.append(r)
+            if len(deduped_reactions) >= 8:
+                break
+    result["card_reactions"] = deduped_reactions
+
+    return result
 
 
 def _aggregate_session_affect(signals: list[WindowAffect]) -> dict:
@@ -515,7 +611,7 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
                 results["skipped"] += 1
                 continue
 
-            entries, new_offset = read_transcript_from(path, cursor.last_byte_offset)
+            entries, new_offset, _ = read_transcript_from(path, cursor.last_byte_offset)
 
             if not entries:
                 if not dry_run:

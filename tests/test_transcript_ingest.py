@@ -6,7 +6,13 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.cursors import CursorStore
-from core.transcript_ingest import tick, extract_observations, _dedupe_observations  # type: ignore[import]
+from core.transcript_ingest import (  # type: ignore[import]
+    tick,
+    extract_observations,
+    _dedupe_observations,
+    _merge_card_affect,
+    _parse_extract_response,
+)
 
 
 def test_new_session_seeds_cursor_at_eof(tmp_path):
@@ -199,7 +205,7 @@ def test_tick_attaches_session_type_to_observations(tmp_path):
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -232,7 +238,7 @@ def test_tick_code_cwd_produces_code_session_type(tmp_path):
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -263,7 +269,7 @@ def test_tick_writing_cwd_produces_writing_session_type(tmp_path):
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -310,3 +316,137 @@ class TestContentHashDedup:
         assert n_dropped == 1
         assert len(deduped) == 1
         assert deduped[0]["importance"] == 0.7
+
+
+# ---------------------------------------------------------------------------
+# Merge card affect into session affect — Task 2.1
+# ---------------------------------------------------------------------------
+
+
+class TestMergeCardAffect:
+    def test_friction_card_overrides_neutral_base_valence(self):
+        """A card with user_affect_valence='friction' should override a neutral base."""
+        base = {"dominant_valence": "neutral", "max_intensity": 0.0}
+        cards = [{"user_affect_valence": "friction", "user_reaction": "gave up"}]
+        result = _merge_card_affect(cards, base)
+        assert result["dominant_valence"] == "friction"
+
+    def test_mixed_when_positive_base_and_friction_cards(self):
+        """Positive base valence + friction card → 'mixed'."""
+        base = {"dominant_valence": "delight", "max_intensity": 0.5}
+        cards = [{"user_affect_valence": "friction", "user_reaction": "retried three times"}]
+        result = _merge_card_affect(cards, base)
+        assert result["dominant_valence"] == "mixed"
+
+    def test_reactions_accumulate_deduped_order_preserved_cap_at_8(self):
+        """user_reaction strings accumulate in card_reactions; deduped, order preserved, max 8."""
+        base = {"dominant_valence": "neutral", "max_intensity": 0.0}
+        reactions = [f"reaction_{i}" for i in range(12)]
+        cards = [{"user_affect_valence": "friction", "user_reaction": r} for r in reactions]
+        # Add a duplicate to verify dedup
+        cards.append({"user_affect_valence": "neutral", "user_reaction": "reaction_0"})
+        result = _merge_card_affect(cards, base)
+        assert len(result["card_reactions"]) == 8
+        assert result["card_reactions"][0] == "reaction_0"
+        assert result["card_reactions"][1] == "reaction_1"
+        # No duplicates
+        assert len(set(result["card_reactions"])) == len(result["card_reactions"])
+
+    def test_empty_cards_returns_base_unchanged(self):
+        """Empty card list returns base dict unchanged."""
+        base = {"dominant_valence": "friction", "max_intensity": 0.8}
+        result = _merge_card_affect([], base)
+        assert result == base
+
+    def test_cards_without_affect_fields_return_base_unchanged(self):
+        """Cards missing user_reaction and user_affect_valence do not alter base."""
+        base = {"dominant_valence": "neutral", "max_intensity": 0.0}
+        cards = [{"title": "Some issue", "summary": "no affect fields"}]
+        result = _merge_card_affect(cards, base)
+        assert result["dominant_valence"] == "neutral"
+        assert result.get("card_reactions", []) == []
+
+    def test_does_not_mutate_base(self):
+        """_merge_card_affect returns a copy; base dict is not mutated."""
+        base = {"dominant_valence": "neutral", "max_intensity": 0.0}
+        cards = [{"user_affect_valence": "friction", "user_reaction": "x"}]
+        result = _merge_card_affect(cards, base)
+        assert base["dominant_valence"] == "neutral"
+        assert result["dominant_valence"] == "friction"
+
+
+# ---------------------------------------------------------------------------
+# JSON repair + skip-reason persistence — Task 2.2
+# ---------------------------------------------------------------------------
+
+
+class TestJsonRepair:
+    def test_truncated_array_repaired_incomplete_obs_dropped(self):
+        """Truncated array missing closing ] → repairs to valid obs; incomplete second obs dropped."""
+        drop_stats: dict = {}
+        raw = '[{"content": "first obs", "importance": 0.5}, {"content": "trunc'
+        obs, reason = _parse_extract_response(raw, drop_stats=drop_stats)
+        # The complete first obs should be recovered
+        assert len(obs) == 1
+        assert obs[0]["content"] == "first obs"
+        assert reason is None
+        assert drop_stats.get("parse_errors_repaired", 0) == 1
+
+    def test_well_formed_array_unchanged_no_repair_counter(self):
+        """Well-formed array parses normally; no repair counter incremented."""
+        import json
+        drop_stats: dict = {}
+        raw = json.dumps([{"content": "clean obs", "importance": 0.6}])
+        obs, reason = _parse_extract_response(raw, drop_stats=drop_stats)
+        assert len(obs) == 1
+        assert obs[0]["content"] == "clean obs"
+        assert drop_stats.get("parse_errors_repaired", 0) == 0
+
+    def test_unrecoverable_garbage_returns_empty_no_counter(self):
+        """Completely unparseable input → [], no exception, no repair counter increment."""
+        drop_stats: dict = {}
+        raw = "totally not json at all }{]["
+        obs, reason = _parse_extract_response(raw, drop_stats=drop_stats)
+        assert obs == []
+        assert reason is None
+        # Repair counter should NOT increment for garbage that can't be repaired
+        assert drop_stats.get("parse_errors_repaired", 0) == 0
+
+    def test_skip_reason_returned_on_intentional_skip(self):
+        """Intentional skip dict returns the reason string as second element."""
+        import json
+        raw = json.dumps({"skipped": True, "reason": "no meaningful signal"})
+        obs, reason = _parse_extract_response(raw)
+        assert obs == []
+        assert reason == "no meaningful signal"
+
+    def test_skip_reason_included_in_skips_list(self):
+        """extract_observations_hierarchical includes reason in skip records when present."""
+        import json
+        from unittest.mock import patch, MagicMock
+        from core.transcript_ingest import extract_observations_hierarchical
+        from core.extraction_affect import WindowAffect
+
+        skip_response = json.dumps({"skipped": True, "reason": "window too short"})
+        fake_affect = MagicMock(spec=WindowAffect)
+        fake_affect.max_boost = 0.0
+        fake_affect.valence = "neutral"
+        fake_affect.has_repetition = False
+        fake_affect.has_pushback = False
+        fake_affect.evidence_quotes = []
+        fake_affect.to_dict.return_value = {"valence": "neutral", "max_boost": 0.0}
+
+        with patch("core.transcript_ingest.iter_windows", return_value=["window text"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[skip_response]), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                refine=False,
+            )
+
+        skips = result["skips"]
+        assert len(skips) == 1
+        assert skips[0].get("reason") == "window too short"

@@ -141,7 +141,7 @@ class TestCallLlm:
             mock_cls.return_value.messages.create.return_value = self._mock_response("ok")
             call_llm("test")
             call_args = mock_cls.return_value.messages.create.call_args
-            assert call_args.kwargs["max_tokens"] == 1024
+            assert call_args.kwargs["max_tokens"] == 8192
 
     def test_default_temperature(self):
         with patch("core.llm.anthropic.Anthropic") as mock_cls:
