@@ -8,6 +8,17 @@ from unittest.mock import patch
 from core.issue_cards import synthesize_issue_cards, ISSUE_SYNTHESIS_PROMPT, extract_card_memory_fields
 
 
+def _make_obs(facts: list[str], importance: float = 0.5) -> dict:
+    return {
+        "kind": "finding",
+        "knowledge_type": "factual",
+        "knowledge_type_confidence": "medium",
+        "importance": importance,
+        "facts": facts,
+        "cwd": "/tmp",
+    }
+
+
 class TestRule0EntityGate:
     """Verify that the ENTITY GATE (Rule 6) text is present and that the
     synthesize_issue_cards() function correctly handles solo observations,
@@ -186,6 +197,149 @@ class TestExtractCardMemoryFields:
         assert result["actor"] is None
 
     def test_all_fields_returned(self):
-        """Return dict always has all four keys."""
+        """Return dict always has all six keys."""
         result = extract_card_memory_fields({})
-        assert set(result.keys()) == {"temporal_scope", "confidence", "affect_valence", "actor"}
+        assert set(result.keys()) == {
+            "temporal_scope", "confidence", "affect_valence", "actor",
+            "criterion_weights", "rejected_options",
+        }
+
+
+# ---------------------------------------------------------------------------
+# TestEvidenceIndicesValidation — Item 15 acceptance criteria
+# ---------------------------------------------------------------------------
+
+class TestEvidenceIndicesValidation:
+    """evidence_obs_indices values outside [0, n_obs) are dropped; card survives."""
+
+    def _card_with_indices(self, indices: list, title: str = "Test card") -> dict:
+        return {
+            "title": title,
+            "problem": "A problem.",
+            "options_considered": [],
+            "decision_or_outcome": "An outcome.",
+            "user_reaction": "neutral",
+            "user_affect_valence": "neutral",
+            "evidence_quotes": ["Emma approved the plan."],
+            "evidence_obs_indices": indices,
+            "kind": "finding",
+            "knowledge_type": "factual",
+            "importance": 0.6,
+            "scope": "session-local",
+        }
+
+    def test_out_of_range_index_dropped_card_survives(self):
+        """Card with evidence_obs_indices: [999] and 5 obs → index dropped, card survives."""
+        obs = [_make_obs([f"Obs {i}."]) for i in range(5)]
+        card = self._card_with_indices([999])
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "one card",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            cards, orphans, stats = synthesize_issue_cards(
+                obs,
+                synopsis="synopsis",
+                session_affect_summary=None,
+            )
+        assert stats["outcome"] == "ok"
+        assert len(cards) == 1
+        assert cards[0]["evidence_obs_indices"] == []
+        assert stats["dropped_invalid_indices"] == 1
+
+    def test_valid_indices_preserved(self):
+        """Valid in-range indices are kept unchanged."""
+        obs = [_make_obs([f"Obs {i}."]) for i in range(5)]
+        card = self._card_with_indices([0, 2, 4])
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "all valid",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            cards, orphans, stats = synthesize_issue_cards(
+                obs,
+                synopsis="synopsis",
+                session_affect_summary=None,
+            )
+        assert cards[0]["evidence_obs_indices"] == [0, 2, 4]
+        assert stats["dropped_invalid_indices"] == 0
+
+    def test_invalid_type_filtered(self):
+        """Non-integer index values (e.g. strings, floats as non-int) are filtered."""
+        obs = [_make_obs([f"Obs {i}."]) for i in range(5)]
+        # String indices and a float (not int) should be dropped
+        card = self._card_with_indices(["0", 1, 3.5, 2])  # "0", 3.5 are non-int
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "mixed types",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            cards, orphans, stats = synthesize_issue_cards(
+                obs,
+                synopsis="synopsis",
+                session_affect_summary=None,
+            )
+        # Only the int 1 and int 2 survive; "0" (str) and 3.5 (float) are dropped
+        assert cards[0]["evidence_obs_indices"] == [1, 2]
+        assert stats["dropped_invalid_indices"] == 1
+
+
+# ---------------------------------------------------------------------------
+# TestDropGateStat — Item 16 acceptance criteria
+# ---------------------------------------------------------------------------
+
+class TestDropGateStat:
+    """Rule 10 DROP GATE in prompt; dropped_weak_observations present in stats."""
+
+    def test_prompt_contains_drop_gate_text(self):
+        """ISSUE_SYNTHESIS_PROMPT contains Rule 10 DROP GATE text verbatim."""
+        assert "DROP GATE" in ISSUE_SYNTHESIS_PROMPT
+        assert "importance < 0.3" in ISSUE_SYNTHESIS_PROMPT
+
+    def test_dropped_weak_observations_in_stats(self):
+        """stats dict returned by synthesize_issue_cards contains dropped_weak_observations key."""
+        obs = [_make_obs(["Emma chose the approach."]), _make_obs(["Deployment finished."])]
+        card = {
+            "title": "Approach decision",
+            "problem": "Deciding on approach.",
+            "options_considered": [],
+            "decision_or_outcome": "Emma chose the approach.",
+            "user_reaction": "accept",
+            "user_affect_valence": "neutral",
+            "evidence_quotes": ["Emma chose the approach."],
+            "evidence_obs_indices": [0],
+            "kind": "decision",
+            "knowledge_type": "procedural",
+            "importance": 0.7,
+            "scope": "session-local",
+        }
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "one card",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            _, _, stats = synthesize_issue_cards(
+                obs,
+                synopsis="synopsis",
+                session_affect_summary=None,
+            )
+        assert "dropped_weak_observations" in stats
+        assert isinstance(stats["dropped_weak_observations"], int)
+        assert stats["dropped_weak_observations"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# TestMixedValenceInstruction — Item 17 acceptance criteria
+# ---------------------------------------------------------------------------
+
+class TestMixedValenceInstruction:
+    """Mixed-valence sentence is present verbatim in ISSUE_SYNTHESIS_PROMPT."""
+
+    def test_mixed_valence_trajectory_guidance_present(self):
+        """Prompt contains the mixed-valence trajectory instruction."""
+        assert "Use 'mixed' when the user's reaction evolved across the card's span" in ISSUE_SYNTHESIS_PROMPT
+        assert "Track the trajectory in 'user_reaction' text." in ISSUE_SYNTHESIS_PROMPT

@@ -400,3 +400,278 @@ class TestListRulesIncludes:
 
     def test_confirmed_rule_no_action_registered(self):
         assert "confirmed_rule_no_action" in list_rules()
+
+    def test_monotone_knowledge_lens_registered(self):
+        assert "monotone_knowledge_lens" in list_rules()
+
+    def test_affect_signal_no_extraction_registered(self):
+        assert "affect_signal_no_extraction" in list_rules()
+
+    def test_forced_clustering_low_importance_registered(self):
+        assert "forced_clustering_low_importance" in list_rules()
+
+    def test_issue_card_collapse_efficient_still_present(self):
+        # Wave 3 owns removal of this rule; it must remain present through Wave 1.
+        assert "issue_card_collapse_efficient" in list_rules()
+
+
+# ---------------------------------------------------------------------------
+# TestStatsFieldAdditions (Tier 2 Wave 1 new fields)
+# ---------------------------------------------------------------------------
+
+
+class TestStatsFieldAdditions:
+    def test_unique_knowledge_types_emitted_default(self):
+        stats = _make_stats()
+        assert stats.unique_knowledge_types_emitted == 0
+
+    def test_repeated_facts_count_default(self):
+        stats = _make_stats()
+        assert stats.repeated_facts_count == 0
+
+    def test_windows_with_affect_signal_but_no_card_default(self):
+        stats = _make_stats()
+        assert stats.windows_with_affect_signal_but_no_card == 0
+
+    def test_min_card_importance_default(self):
+        stats = _make_stats()
+        assert stats.min_card_importance == pytest.approx(1.0)
+
+    def test_fields_settable(self):
+        stats = _make_stats(
+            unique_knowledge_types_emitted=3,
+            repeated_facts_count=7,
+            windows_with_affect_signal_but_no_card=4,
+            min_card_importance=0.25,
+        )
+        assert stats.unique_knowledge_types_emitted == 3
+        assert stats.repeated_facts_count == 7
+        assert stats.windows_with_affect_signal_but_no_card == 4
+        assert stats.min_card_importance == pytest.approx(0.25)
+
+    def test_to_dict_includes_unique_knowledge_types_emitted(self):
+        stats = _make_stats(unique_knowledge_types_emitted=2)
+        d = stats.to_dict()
+        assert "unique_knowledge_types_emitted" in d
+        assert d["unique_knowledge_types_emitted"] == 2
+
+    def test_to_dict_includes_repeated_facts_count(self):
+        stats = _make_stats(repeated_facts_count=5)
+        d = stats.to_dict()
+        assert "repeated_facts_count" in d
+        assert d["repeated_facts_count"] == 5
+
+    def test_to_dict_includes_windows_with_affect_signal_but_no_card(self):
+        stats = _make_stats(windows_with_affect_signal_but_no_card=3)
+        d = stats.to_dict()
+        assert "windows_with_affect_signal_but_no_card" in d
+        assert d["windows_with_affect_signal_but_no_card"] == 3
+
+    def test_to_dict_includes_min_card_importance(self):
+        stats = _make_stats(min_card_importance=0.35)
+        d = stats.to_dict()
+        assert "min_card_importance" in d
+        assert d["min_card_importance"] == pytest.approx(0.35)
+
+
+# ---------------------------------------------------------------------------
+# TestMonotoneKnowledgeLensRule
+# ---------------------------------------------------------------------------
+
+
+class TestMonotoneKnowledgeLensRule:
+    def _run_rule(self, stats: ExtractionRunStats) -> SelfObservation | None:
+        from core.self_reflection_extraction import _RULES
+        for rule in _RULES:
+            if getattr(rule, "__rule_id__", None) == "monotone_knowledge_lens":
+                try:
+                    return rule(stats)
+                except Exception:
+                    return None
+        return None
+
+    def test_fires_when_monotone_and_enough_obs(self):
+        # unique_knowledge_types_emitted=1, final_observations=5 → fires
+        stats = _make_stats(unique_knowledge_types_emitted=1, final_observations=5)
+        result = self._run_rule(stats)
+        assert result is not None
+        assert result.rule_id == "monotone_knowledge_lens"
+        assert result.importance == pytest.approx(0.6)
+        assert result.kind == "finding"
+
+    def test_fires_with_larger_obs_count(self):
+        stats = _make_stats(unique_knowledge_types_emitted=1, final_observations=20)
+        result = self._run_rule(stats)
+        assert result is not None
+        assert result.rule_id == "monotone_knowledge_lens"
+
+    def test_no_fire_when_diverse_types(self):
+        # unique_knowledge_types_emitted=3 → does not fire
+        stats = _make_stats(unique_knowledge_types_emitted=3, final_observations=10)
+        result = self._run_rule(stats)
+        assert result is None
+
+    def test_no_fire_when_zero_types(self):
+        # unique_knowledge_types_emitted=0 ≠ 1 → does not fire
+        stats = _make_stats(unique_knowledge_types_emitted=0, final_observations=10)
+        result = self._run_rule(stats)
+        assert result is None
+
+    def test_no_fire_when_obs_count_too_low(self):
+        # unique_knowledge_types_emitted=1 but final_observations=4 < 5 → does not fire
+        stats = _make_stats(unique_knowledge_types_emitted=1, final_observations=4)
+        result = self._run_rule(stats)
+        assert result is None
+
+    def test_proposed_action_text(self):
+        stats = _make_stats(unique_knowledge_types_emitted=1, final_observations=8)
+        result = self._run_rule(stats)
+        assert result is not None
+        assert "monotone" in result.proposed_action.lower()
+        assert "monothematic" in result.proposed_action.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestAffectSignalNoExtractionRule
+# ---------------------------------------------------------------------------
+
+
+class TestAffectSignalNoExtractionRule:
+    def _run_rule(self, stats: ExtractionRunStats) -> SelfObservation | None:
+        from core.self_reflection_extraction import _RULES
+        for rule in _RULES:
+            if getattr(rule, "__rule_id__", None) == "affect_signal_no_extraction":
+                try:
+                    return rule(stats)
+                except Exception:
+                    return None
+        return None
+
+    def test_fires_at_threshold(self):
+        # windows_with_affect_signal_but_no_card=3 → fires
+        stats = _make_stats(windows_with_affect_signal_but_no_card=3)
+        result = self._run_rule(stats)
+        assert result is not None
+        assert result.rule_id == "affect_signal_no_extraction"
+        assert result.importance == pytest.approx(0.7)
+        assert result.kind == "finding"
+
+    def test_fires_above_threshold(self):
+        stats = _make_stats(windows_with_affect_signal_but_no_card=7)
+        result = self._run_rule(stats)
+        assert result is not None
+        assert result.rule_id == "affect_signal_no_extraction"
+
+    def test_no_fire_below_threshold(self):
+        # windows_with_affect_signal_but_no_card=2 < 3 → does not fire
+        stats = _make_stats(windows_with_affect_signal_but_no_card=2)
+        result = self._run_rule(stats)
+        assert result is None
+
+    def test_no_fire_at_zero(self):
+        stats = _make_stats(windows_with_affect_signal_but_no_card=0)
+        result = self._run_rule(stats)
+        assert result is None
+
+    def test_proposed_action_text(self):
+        stats = _make_stats(windows_with_affect_signal_but_no_card=5)
+        result = self._run_rule(stats)
+        assert result is not None
+        assert "somatic" in result.proposed_action.lower() or "detector" in result.proposed_action.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestForcedClusteringLowImportanceRule
+# ---------------------------------------------------------------------------
+
+
+class TestForcedClusteringLowImportanceRule:
+    def _run_rule(self, stats: ExtractionRunStats) -> SelfObservation | None:
+        from core.self_reflection_extraction import _RULES
+        for rule in _RULES:
+            if getattr(rule, "__rule_id__", None) == "forced_clustering_low_importance":
+                try:
+                    return rule(stats)
+                except Exception:
+                    return None
+        return None
+
+    def _confirmed_audit(self) -> dict:
+        return {
+            "synthesis_overgreedy": {
+                "fire_count": 4,
+                "confidence": "confirmed",
+                "latest": {
+                    "rule_id": "synthesis_overgreedy",
+                    "proposed_action": "inspect lowest importance card",
+                    "ts": "2026-01-01T00:00:00",
+                    "facts": ["all obs clustered into cards"],
+                    "kind": "open_question",
+                },
+                "first_seen": "2026-01-01T00:00:00",
+                "last_seen": "2026-01-01T00:00:00",
+            }
+        }
+
+    def test_fires_when_both_conditions_met(self):
+        # synthesis_overgreedy confirmed AND min_card_importance=0.25 < 0.4 → fires
+        stats = _make_stats(min_card_importance=0.25)
+        with patch(
+            "core.self_reflection_extraction.aggregate_audit",
+            return_value=self._confirmed_audit(),
+        ):
+            result = self._run_rule(stats)
+        assert result is not None
+        assert result.rule_id == "forced_clustering_low_importance"
+        assert result.importance == pytest.approx(0.7)
+        assert result.kind == "finding"
+
+    def test_no_fire_when_only_overgreedy_confirmed(self):
+        # synthesis_overgreedy confirmed but min_card_importance=0.5 >= 0.4 → does not fire
+        stats = _make_stats(min_card_importance=0.5)
+        with patch(
+            "core.self_reflection_extraction.aggregate_audit",
+            return_value=self._confirmed_audit(),
+        ):
+            result = self._run_rule(stats)
+        assert result is None
+
+    def test_no_fire_when_only_low_importance(self):
+        # min_card_importance=0.1 but synthesis_overgreedy not confirmed → does not fire
+        stats = _make_stats(min_card_importance=0.1)
+        with patch(
+            "core.self_reflection_extraction.aggregate_audit",
+            return_value={},
+        ):
+            result = self._run_rule(stats)
+        assert result is None
+
+    def test_no_fire_when_neither_condition(self):
+        # Neither condition met → does not fire
+        stats = _make_stats(min_card_importance=0.8)
+        with patch(
+            "core.self_reflection_extraction.aggregate_audit",
+            return_value={},
+        ):
+            result = self._run_rule(stats)
+        assert result is None
+
+    def test_no_fire_at_importance_boundary(self):
+        # min_card_importance exactly 0.4 → not strictly less than, does not fire
+        stats = _make_stats(min_card_importance=0.4)
+        with patch(
+            "core.self_reflection_extraction.aggregate_audit",
+            return_value=self._confirmed_audit(),
+        ):
+            result = self._run_rule(stats)
+        assert result is None
+
+    def test_proposed_action_text(self):
+        stats = _make_stats(min_card_importance=0.15)
+        with patch(
+            "core.self_reflection_extraction.aggregate_audit",
+            return_value=self._confirmed_audit(),
+        ):
+            result = self._run_rule(stats)
+        assert result is not None
+        assert "synthesis_strict" in result.proposed_action or "orphan" in result.proposed_action
