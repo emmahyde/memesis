@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-from core.issue_cards import synthesize_issue_cards, ISSUE_SYNTHESIS_PROMPT
+from core.issue_cards import synthesize_issue_cards, ISSUE_SYNTHESIS_PROMPT, extract_card_memory_fields
 
 
 class TestRule0EntityGate:
@@ -98,3 +98,94 @@ class TestRule0EntityGate:
         assert orphans == []
         assert stats["outcome"] == "empty"
         assert stats["card_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# TestExtractCardMemoryFields — Task 3.1 acceptance criteria
+# ---------------------------------------------------------------------------
+
+class TestExtractCardMemoryFields:
+    """Unit tests for extract_card_memory_fields helper."""
+
+    def test_scope_mapping(self):
+        card = {"scope": "cross-session-durable"}
+        result = extract_card_memory_fields(card)
+        assert result["temporal_scope"] == "cross-session-durable"
+
+    def test_scope_session_local(self):
+        card = {"scope": "session-local"}
+        result = extract_card_memory_fields(card)
+        assert result["temporal_scope"] == "session-local"
+
+    def test_scope_absent_is_none(self):
+        card = {}
+        result = extract_card_memory_fields(card)
+        assert result["temporal_scope"] is None
+
+    def test_confidence_high(self):
+        card = {"knowledge_type_confidence": "high"}
+        result = extract_card_memory_fields(card)
+        assert result["confidence"] == 0.9
+
+    def test_confidence_low(self):
+        card = {"knowledge_type_confidence": "low"}
+        result = extract_card_memory_fields(card)
+        assert result["confidence"] == 0.5
+
+    def test_confidence_default(self):
+        """None or unknown knowledge_type_confidence → 0.7."""
+        card = {}
+        result = extract_card_memory_fields(card)
+        assert result["confidence"] == 0.7
+
+    def test_confidence_unknown_value(self):
+        card = {"knowledge_type_confidence": "medium"}
+        result = extract_card_memory_fields(card)
+        assert result["confidence"] == 0.7
+
+    def test_affect_valence_passed_through(self):
+        card = {"user_affect_valence": "friction"}
+        result = extract_card_memory_fields(card)
+        assert result["affect_valence"] == "friction"
+
+    def test_affect_valence_absent_is_none(self):
+        card = {}
+        result = extract_card_memory_fields(card)
+        assert result["affect_valence"] is None
+
+    def test_actor_regex_single_name(self):
+        card = {"evidence_quotes": ["Emma approved the design."]}
+        result = extract_card_memory_fields(card)
+        assert result["actor"] == "Emma"
+
+    def test_actor_regex_two_word_name(self):
+        card = {"evidence_quotes": ["John Smith reviewed the PR."]}
+        result = extract_card_memory_fields(card)
+        assert result["actor"] == "John Smith"
+
+    def test_actor_regex_uses_first_quote(self):
+        """Actor is extracted from the first evidence_quote that has a match."""
+        card = {"evidence_quotes": ["Alice suggested the approach.", "Bob disagreed."]}
+        result = extract_card_memory_fields(card)
+        assert result["actor"] == "Alice"
+
+    def test_actor_null_when_no_quote(self):
+        card = {"evidence_quotes": []}
+        result = extract_card_memory_fields(card)
+        assert result["actor"] is None
+
+    def test_actor_null_when_quotes_missing(self):
+        card = {}
+        result = extract_card_memory_fields(card)
+        assert result["actor"] is None
+
+    def test_actor_null_when_no_capitalized_word(self):
+        """Quotes without capitalized words → actor is None."""
+        card = {"evidence_quotes": ["the system crashed at midnight."]}
+        result = extract_card_memory_fields(card)
+        assert result["actor"] is None
+
+    def test_all_fields_returned(self):
+        """Return dict always has all four keys."""
+        result = extract_card_memory_fields({})
+        assert set(result.keys()) == {"temporal_scope", "confidence", "affect_valence", "actor"}
