@@ -369,3 +369,124 @@ class TestContentAwareUsage:
         used_events = [e for e in events if e["event"] == "memory_used"]
         assert len(used_events) == 1
         assert 0 < used_events[0]["confidence"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestCardsUnusedInSubsequentSessions (Wave 3 Task 3.1)
+# ---------------------------------------------------------------------------
+
+
+class TestCardsUnusedInSubsequentSessions:
+    """DB-backed tests for cards_unused_in_subsequent_sessions()."""
+
+    from core.feedback import cards_unused_in_subsequent_sessions
+
+    def _make_memory_with_session(self, session_id, importance=0.9, ts_offset=0):
+        """Create a Memory row with source_session set and a deterministic timestamp."""
+        from datetime import datetime, timedelta
+        base_ts = datetime(2026, 1, 1, 0, 0, 0)
+        ts = (base_ts + timedelta(seconds=ts_offset)).isoformat()
+        mem = Memory.create(
+            stage="consolidated",
+            title=f"Memory from {session_id}",
+            summary="auto-generated",
+            content="some content",
+            importance=importance,
+            source_session=session_id,
+            created_at=ts,
+            updated_at=ts,
+        )
+        return mem.id
+
+    def _record_retrieval(self, memory_id, session_id, was_used=False, ts_offset=0):
+        """Insert a RetrievalLog row."""
+        from datetime import datetime, timedelta
+        base_ts = datetime(2026, 1, 2, 0, 0, 0)
+        ts = (base_ts + timedelta(hours=ts_offset)).isoformat()
+        RetrievalLog.create(
+            timestamp=ts,
+            session_id=session_id,
+            memory_id=memory_id,
+            retrieval_type="injected",
+            was_used=1 if was_used else 0,
+        )
+
+    def test_happy_path_returns_unused_ids(self, base):
+        """3 high-importance memories with 10 subsequent sessions but no retrieval hits."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-001"
+        mem_ids = [self._make_memory_with_session(src, importance=0.9, ts_offset=i) for i in range(3)]
+
+        # Create 10 distinct subsequent sessions with retrieval log entries (not for our memories)
+        other_mem = self._make_memory_with_session("other-session", importance=0.3, ts_offset=100)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"sub-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert sorted(result) == sorted(mem_ids)
+
+    def test_insufficient_lookahead_returns_empty(self, base):
+        """Fewer than `lookahead_sessions` exist → returns [] (no false positives)."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-002"
+        self._make_memory_with_session(src, importance=0.9, ts_offset=0)
+
+        # Only 5 subsequent sessions, lookahead=10 → insufficient
+        other_mem = self._make_memory_with_session("other-s", importance=0.3, ts_offset=50)
+        for i in range(5):
+            self._record_retrieval(other_mem, f"few-sess-{i}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert result == []
+
+    def test_below_threshold_importance_excluded(self, base):
+        """Memories below importance_threshold are not included in result."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-003"
+        high_id = self._make_memory_with_session(src, importance=0.9, ts_offset=0)
+        low_id = self._make_memory_with_session(src, importance=0.5, ts_offset=1)  # below 0.8
+
+        # 10 subsequent sessions
+        other_mem = self._make_memory_with_session("other-sess-003", importance=0.1, ts_offset=50)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"thr-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, importance_threshold=0.8, lookahead_sessions=10)
+        assert high_id in result
+        assert low_id not in result
+
+    def test_retrieved_memories_excluded(self, base):
+        """Memories that were retrieved (was_used=True) in the window are excluded."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-004"
+        used_id = self._make_memory_with_session(src, importance=0.9, ts_offset=0)
+        unused_id = self._make_memory_with_session(src, importance=0.9, ts_offset=1)
+
+        # 10 subsequent sessions; used_id gets retrieved in session 3
+        other_mem = self._make_memory_with_session("other-sess-004", importance=0.1, ts_offset=50)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"ret-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+        # Mark used_id as retrieved in ret-sess-03
+        self._record_retrieval(used_id, "ret-sess-03", was_used=True, ts_offset=4)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert used_id not in result
+        assert unused_id in result
+
+    def test_no_high_importance_memories_returns_empty(self, base):
+        """Source session has no high-importance memories → []."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-005"
+        self._make_memory_with_session(src, importance=0.3, ts_offset=0)
+
+        other_mem = self._make_memory_with_session("other-sess-005", importance=0.1, ts_offset=50)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"nhi-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert result == []

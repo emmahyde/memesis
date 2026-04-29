@@ -410,9 +410,9 @@ class TestListRulesIncludes:
     def test_forced_clustering_low_importance_registered(self):
         assert "forced_clustering_low_importance" in list_rules()
 
-    def test_issue_card_collapse_efficient_still_present(self):
-        # Wave 3 owns removal of this rule; it must remain present through Wave 1.
-        assert "issue_card_collapse_efficient" in list_rules()
+    def test_cards_unused_high_importance_registered(self):
+        # Wave 3 adds this rule.
+        assert "cards_unused_high_importance" in list_rules()
 
 
 # ---------------------------------------------------------------------------
@@ -675,3 +675,101 @@ class TestForcedClusteringLowImportanceRule:
             result = self._run_rule(stats)
         assert result is not None
         assert "synthesis_strict" in result.proposed_action or "orphan" in result.proposed_action
+
+
+# ---------------------------------------------------------------------------
+# TestIssueCardCollapseEfficientRemoved (Wave 3)
+# ---------------------------------------------------------------------------
+
+
+class TestIssueCardCollapseEfficientRemoved:
+    def test_issue_card_collapse_efficient_not_in_list_rules(self):
+        assert "issue_card_collapse_efficient" not in list_rules()
+
+    def test_no_rule_object_with_that_id(self):
+        from core.self_reflection_extraction import _RULES
+        ids = [getattr(r, "__rule_id__", None) for r in _RULES]
+        assert "issue_card_collapse_efficient" not in ids
+
+
+# ---------------------------------------------------------------------------
+# TestCardsUnusedHighImportanceRule (Wave 3)
+# ---------------------------------------------------------------------------
+
+
+class TestCardsUnusedHighImportanceRule:
+    def _run_rule(self, stats: ExtractionRunStats) -> SelfObservation | None:
+        from core.self_reflection_extraction import _RULES
+        for rule in _RULES:
+            if getattr(rule, "__rule_id__", None) == "cards_unused_high_importance":
+                try:
+                    return rule(stats)
+                except Exception:
+                    return None
+        return None
+
+    def test_fires_when_three_or_more_unused(self, memory_store):
+        """Rule fires when feedback returns ≥3 unused high-importance memory IDs."""
+        unused_ids = ["id-a", "id-b", "id-c"]
+        with patch(
+            "core.feedback.cards_unused_in_subsequent_sessions",
+            return_value=unused_ids,
+        ):
+            stats = _make_stats(session_id="session-abc-123")
+            result = self._run_rule(stats)
+
+        assert result is not None
+        assert result.rule_id == "cards_unused_high_importance"
+        assert result.importance == pytest.approx(0.7)
+        assert result.kind == "finding"
+        assert "3" in result.facts[0]
+        assert "session-abc-123" in result.facts[0]
+
+    def test_no_fire_when_fewer_than_three(self, memory_store):
+        """Rule does not fire when feedback returns < 3 unused IDs."""
+        with patch(
+            "core.feedback.cards_unused_in_subsequent_sessions",
+            return_value=["id-x", "id-y"],
+        ):
+            stats = _make_stats(session_id="session-abc-123")
+            result = self._run_rule(stats)
+
+        assert result is None
+
+    def test_no_fire_when_feedback_returns_empty(self, memory_store):
+        with patch(
+            "core.feedback.cards_unused_in_subsequent_sessions",
+            return_value=[],
+        ):
+            stats = _make_stats(session_id="session-abc-123")
+            result = self._run_rule(stats)
+
+        assert result is None
+
+    def test_graceful_when_feedback_raises(self, memory_store):
+        """Rule returns None without exception when feedback function raises."""
+        with patch(
+            "core.feedback.cards_unused_in_subsequent_sessions",
+            side_effect=RuntimeError("db error"),
+        ):
+            stats = _make_stats(session_id="session-abc-123")
+            result = self._run_rule(stats)
+
+        assert result is None
+
+    def test_no_fire_when_session_id_empty(self, memory_store):
+        """Rule skips when session_id is falsy."""
+        stats = _make_stats(session_id="")
+        result = self._run_rule(stats)
+        assert result is None
+
+    def test_proposed_action_mentions_importance_calibration(self, memory_store):
+        with patch(
+            "core.feedback.cards_unused_in_subsequent_sessions",
+            return_value=["x", "y", "z", "w"],
+        ):
+            stats = _make_stats(session_id="session-abc-123")
+            result = self._run_rule(stats)
+
+        assert result is not None
+        assert "importance" in result.proposed_action.lower()

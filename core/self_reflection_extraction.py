@@ -338,37 +338,6 @@ def _rule_affect_blind(stats: ExtractionRunStats) -> SelfObservation | None:
     )
 
 
-@_rule("issue_card_collapse_efficient")
-def _rule_card_collapse(stats: ExtractionRunStats) -> SelfObservation | None:
-    """High raw→card compression with user_reaction usage validates Stage 1.5."""
-    if stats.raw_observations < 8:
-        return None
-    if stats.issue_cards == 0:
-        return None
-    compression = stats.raw_observations / max(stats.issue_cards, 1)
-    if compression < 2.5:
-        return None
-    return SelfObservation(
-        facts=[
-            f"Session {stats.session_id[:12]} compressed "
-            f"{stats.raw_observations} flat observations into "
-            f"{stats.issue_cards} issue cards "
-            f"({compression:.1f}x compression) with "
-            f"{stats.affect_quotes_used} cards bearing user_reaction "
-            f"context; Stage 1.5 synthesis is producing structured output "
-            f"the flat extractor could not."
-        ],
-        kind="finding",
-        importance=0.6,
-        proposed_action=(
-            "Keep Stage 1.5 issue-card synthesis ON for sessions with "
-            "raw_observations ≥ 8."
-        ),
-        evidence=stats.to_dict(),
-        rule_id="issue_card_collapse_efficient",
-    )
-
-
 @_rule("parse_errors_present")
 def _rule_parse_errors(stats: ExtractionRunStats) -> SelfObservation | None:
     if stats.parse_errors == 0:
@@ -674,6 +643,38 @@ def _rule_forced_clustering_low_importance(stats: ExtractionRunStats) -> SelfObs
         ),
         evidence=stats.to_dict(),
         rule_id="forced_clustering_low_importance",
+    )
+
+
+@_rule("cards_unused_high_importance")
+def _rule_cards_unused_high_importance(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Fires when ≥3 high-importance (>=0.8) cards from a session are never
+    retrieved within 10 subsequent sessions. Catches false-positive
+    high-importance scoring at synthesis time.
+    """
+    if not stats.session_id:
+        return None
+    try:
+        from core.feedback import cards_unused_in_subsequent_sessions
+        unused = cards_unused_in_subsequent_sessions(stats.session_id)
+    except Exception:
+        return None
+    if len(unused) < 3:
+        return None
+    return SelfObservation(
+        rule_id="cards_unused_high_importance",
+        importance=0.7,
+        kind="finding",
+        facts=[
+            f"{len(unused)} high-importance memories from session {stats.session_id} "
+            f"never retrieved in next 10 sessions"
+        ],
+        proposed_action=(
+            "False-positive high-importance scoring detected at synthesis time. "
+            "Tighten card importance threshold or refine synthesis prompt's "
+            "importance calibration."
+        ),
+        evidence=stats.to_dict(),
     )
 
 
