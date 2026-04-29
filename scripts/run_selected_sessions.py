@@ -25,6 +25,7 @@ from core.transcript_ingest import (  # noqa: E402
     append_to_ephemeral,
     project_memory_dir,
 )
+from core.rule_registry import resolve_overrides_from_root  # noqa: E402
 from core.session_detector import detect_session_type  # noqa: E402
 from core.self_reflection_extraction import (  # noqa: E402
     ExtractionRunStats,
@@ -63,7 +64,22 @@ def main() -> None:
         default=None,
         help="Optional path to dump per-session JSON results for diff analysis",
     )
+    parser.add_argument(
+        "--prefixes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated session-id prefixes to override the hardcoded "
+            "SELECTED_PREFIXES set."
+        ),
+    )
     args = parser.parse_args()
+
+    selected = (
+        tuple(p.strip() for p in args.prefixes.split(",") if p.strip())
+        if args.prefixes
+        else SELECTED_PREFIXES
+    )
 
     report: dict[str, dict] = {}
 
@@ -74,7 +90,7 @@ def main() -> None:
         ).fetchall()
         targets = [
             r for r in rows
-            if any(r["session_id"].startswith(p) for p in SELECTED_PREFIXES)
+            if any(r["session_id"].startswith(p) for p in selected)
         ]
         logger.info("Selected %d cursors mode=%s", len(targets), args.mode)
         for row in targets:
@@ -115,9 +131,14 @@ def main() -> None:
             chosen_chunking = args.chunking
             if args.chunking == "auto":
                 chosen_chunking = select_chunking(ntu, len(entries))
+            # Resolve confirmed-rule overrides for this run (Stage 2 closed-loop).
+            # Auto-tunes max_windows / max_tokens / affect_pre_filter / etc. based
+            # on which self-reflection rules have reached confirmed status.
+            overrides = resolve_overrides_from_root()
             logger.info(
-                "  cwd=%s session_type=%s entries=%d ntu=%d chunking=%s",
+                "  cwd=%s session_type=%s entries=%d ntu=%d chunking=%s overrides=%s",
                 cwd, session_type, len(entries), ntu, chosen_chunking,
+                list(overrides.notes) or "defaults",
             )
 
             entry_record: dict = {
@@ -151,6 +172,7 @@ def main() -> None:
                     chunking=chosen_chunking,
                     context_before=args.context_before,
                     context_after=args.context_after,
+                    overrides=overrides,
                 )
                 obs_list = result["observations"]
                 cards = result.get("issue_cards", [])
@@ -159,6 +181,7 @@ def main() -> None:
                     "windows": result["windows"],
                     "raw_count": result["raw_count"],
                     "dropped_duplicates": result["dropped_duplicates"],
+                    "low_importance_dropped": result.get("low_importance_dropped", 0),
                     "post_dedupe_count": result.get("post_dedupe_count", 0),
                     "issue_cards": cards,
                     "synthesis": result.get("synthesis", {}),
@@ -215,6 +238,8 @@ def main() -> None:
                     nontrivial_user_turn_count=ntu,
                     entry_count=len(entries),
                     cost_calls=entry_record.get("cost_calls", 0),
+                    dropped_duplicates=entry_record.get("dropped_duplicates", 0),
+                    low_importance_dropped=entry_record.get("low_importance_dropped", 0),
                 )
                 reflections = reflect_on_extraction(stats)
                 entry_record["self_observations"] = [r.to_dict() for r in reflections]

@@ -308,6 +308,156 @@ class FeedbackLoop:
     # Private helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Bridge to extraction-side self-reflection (Stage 3 closed-loop)
+    # ------------------------------------------------------------------
+    #
+    # FeedbackLoop owns retrieval-signal data (was_used, importance trends);
+    # `core/self_reflection_extraction.py` owns extraction-time process data
+    # (productive_rate, parse_errors, etc.). Historically these were fully
+    # disjoint — extraction-side rules could not be confirmed or refuted by
+    # whether their outputs ever got retrieved.
+    #
+    # `reconcile_extraction_rules()` writes meta-rule findings into the same
+    # `self_observations.jsonl` that `aggregate_audit()` already consumes, so
+    # `core/rule_registry.RULE_OVERRIDES` can act on them uniformly.
+
+    def reconcile_extraction_rules(
+        self,
+        *,
+        lookback_days: int = 14,
+        importance_threshold: float = 0.7,
+        unused_count_threshold: int = 3,
+    ) -> list[str]:
+        """Emit meta-rules that judge extraction quality from retrieval data.
+
+        Currently fires:
+
+          - `cards_unused_high_importance` — at least N cards with
+            `importance >= threshold` in the lookback window have never been
+            retrieved (no RetrievalLog entry with `was_used=1`). Refutes the
+            celebratory `issue_card_collapse_efficient` rule when the cards
+            it celebrates aren't actually useful.
+
+          - `extraction_under_retrieval_pressure` — there are repeated
+            `injected` retrievals (≥3) that resulted in no `was_used=1`
+            event AND fewer than 5 distinct memory_ids were retrieved across
+            those injections (signal: same small pool re-served, store likely
+            missing topic coverage).
+
+        Returns the list of rule_ids that fired this run.
+        """
+        # Late import: avoid pulling self_reflection_extraction at module-load
+        # time (keeps test isolation simple and breaks an otherwise circular
+        # import potential if extraction-side ever needs FeedbackLoop).
+        from datetime import timedelta
+
+        from core.self_reflection_extraction import (
+            SelfObservation,
+            _append_audit,
+        )
+
+        cutoff = datetime.now() - timedelta(days=lookback_days)
+        fired: list[str] = []
+        now_iso = datetime.now().isoformat()
+
+        # Rule A: high-importance memories with no successful retrieval
+        recent_high = (
+            Memory
+            .select(Memory.id, Memory.importance, Memory.source_session)
+            .where(
+                Memory.importance >= importance_threshold,
+                Memory.created_at >= cutoff,
+            )
+        )
+        unused_ids: list[str] = []
+        for row in recent_high:
+            used = (
+                RetrievalLog
+                .select()
+                .where(
+                    RetrievalLog.memory_id == row.id,
+                    RetrievalLog.was_used == 1,
+                )
+                .exists()
+            )
+            if not used:
+                unused_ids.append(row.id)
+        if len(unused_ids) >= unused_count_threshold:
+            obs = SelfObservation(
+                facts=[
+                    f"{len(unused_ids)} memories with importance>="
+                    f"{importance_threshold} created in the last "
+                    f"{lookback_days} days have zero successful retrievals. "
+                    f"Extraction is over-confident on importance — these "
+                    f"cards looked load-bearing at write time but the "
+                    f"retrieval pipeline never surfaced them as useful."
+                ],
+                kind="correction",
+                importance=0.7,
+                proposed_action=(
+                    "Tighten Stage 1 importance gate (current default 0.3); "
+                    "consider raising the synthesis threshold for what counts "
+                    "as a 0.7+ card."
+                ),
+                evidence={
+                    "unused_count": len(unused_ids),
+                    "importance_threshold": importance_threshold,
+                    "lookback_days": lookback_days,
+                    "sample_ids": unused_ids[:5],
+                },
+                rule_id="cards_unused_high_importance",
+                ts=now_iso,
+            )
+            _append_audit([obs])
+            fired.append("cards_unused_high_importance")
+
+        # Rule B: retrieval pressure with low diversity
+        recent_injections = (
+            RetrievalLog
+            .select(RetrievalLog.memory_id, RetrievalLog.was_used)
+            .where(
+                RetrievalLog.retrieval_type == 'injected',
+                RetrievalLog.timestamp >= cutoff,
+            )
+        )
+        rows = list(recent_injections)
+        if len(rows) >= 3:
+            distinct = {r.memory_id for r in rows}
+            any_used = any(r.was_used == 1 for r in rows)
+            if not any_used and len(distinct) < 5:
+                obs = SelfObservation(
+                    facts=[
+                        f"{len(rows)} injection events across only "
+                        f"{len(distinct)} distinct memories in the last "
+                        f"{lookback_days} days, with zero was_used=1. The "
+                        f"retrieval layer is re-serving a small pool that "
+                        f"isn't matching response context — extraction is "
+                        f"likely missing whole topic regions the user is "
+                        f"actually working in."
+                    ],
+                    kind="open_question",
+                    importance=0.65,
+                    proposed_action=(
+                        "Audit the last N user prompts against the "
+                        "consolidated memory store; if recurring topics have "
+                        "no matching cards, expand session_type coverage in "
+                        "OBSERVATION_EXTRACT_PROMPT or revisit synthesis "
+                        "clustering."
+                    ),
+                    evidence={
+                        "injection_count": len(rows),
+                        "distinct_memories": len(distinct),
+                        "lookback_days": lookback_days,
+                    },
+                    rule_id="extraction_under_retrieval_pressure",
+                    ts=now_iso,
+                )
+                _append_audit([obs])
+                fired.append("extraction_under_retrieval_pressure")
+
+        return fired
+
     def _has_three_consecutive_unused(self, memory_id: str) -> bool:
         """
         Return True if the last 3 injections for this memory all have was_used=0.

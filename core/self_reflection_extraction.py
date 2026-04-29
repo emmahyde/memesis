@@ -645,6 +645,8 @@ def select_chunking(
     """
     by_rule = aggregate_audit(root)
     rule = by_rule.get("chunking_suboptimal")
+    # Note: was "chunking_mismatch_user_anchored_low_turns" pre-Phase-E rename;
+    # leaving anchor here so future renames don't silently break the lookup.
     # Threshold from rule definition: <5 substantive user turns OR
     # entries-per-user-turn ratio > 30 → agent-driven, prefer stride
     user_to_entry_ratio = (

@@ -366,6 +366,7 @@ def extract_observations_hierarchical(
     chunking: str = "stride",
     context_before: int = 2,
     context_after: int = 8,
+    overrides: ParameterOverrides | None = None,
 ) -> dict:
     """Map-reduce extraction over overlapping windows.
 
@@ -387,6 +388,21 @@ def extract_observations_hierarchical(
           "skips": list[dict],                # per-window skip records
         }
     """
+    # Apply confirmed-rule overrides (Stage 2 closed-loop). When `overrides`
+    # is provided, it wins over kwargs — caller (run_selected_sessions) is
+    # expected to pass either kwargs OR overrides, not both. See
+    # `core/rule_registry.py` for how overrides are composed from confirmed
+    # rules in the audit log.
+    if overrides is None:
+        overrides = ParameterOverrides()
+    else:
+        window_chars = overrides.window_chars
+        stride_chars = overrides.stride_chars
+        max_windows = overrides.max_windows
+        if overrides.chunking_strategy is not None:
+            chunking = overrides.chunking_strategy
+    assert overrides is not None  # narrow for type checker
+
     if chunking == "user_anchored":
         windows = iter_user_anchored_windows(
             entries,
@@ -427,7 +443,33 @@ def extract_observations_hierarchical(
         OBSERVATION_EXTRACT_PROMPT.format(transcript=w, session_type=session_type)
         for w in windows
     ]
-    raw_responses = call_llm_batch(prompts, max_concurrency=4)
+    # affect_pre_filter: when `low_productive_rate` is confirmed, skip the
+    # LLM call entirely on windows with no somatic affect signal. Recorded
+    # as a `pre_filtered_low_affect` skip so we still account for them.
+    if overrides.affect_pre_filter:
+        active_indices: list[int] = [
+            i for i, a in enumerate(affect_signals) if a.max_boost > 0.0
+        ]
+        for i, a in enumerate(affect_signals):
+            if a.max_boost == 0.0:
+                skips.append({
+                    "window_index": i,
+                    "outcome": "pre_filtered_low_affect",
+                    "affect_intensity": a.max_boost,
+                    "affect_valence": a.valence,
+                })
+        active_prompts = [prompts[i] for i in active_indices]
+        active_responses = call_llm_batch(
+            active_prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+        )
+        # Reassemble full-length response list with empty strings for skipped windows
+        raw_responses = [""] * len(prompts)
+        for src_i, dst_i in enumerate(active_indices):
+            raw_responses[dst_i] = active_responses[src_i]
+    else:
+        raw_responses = call_llm_batch(
+            prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+        )
 
     for i, (w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):
         if raw.startswith("[ERROR]"):
