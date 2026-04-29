@@ -20,6 +20,7 @@ from core.self_reflection import (
     OBSERVATION_HABIT_TITLE, OBSERVATION_HABIT_CONTENT,
     COMPACTION_GUIDANCE_TITLE, COMPACTION_GUIDANCE_CONTENT,
 )
+from core.self_reflection_extraction import select_chunking, self_model_audit_path
 
 
 @pytest.fixture
@@ -234,3 +235,80 @@ class TestInstinctiveLayer:
         injected = engine.inject_for_session("test-session")
         assert "Self-Model" in injected
         assert "Observation Habit" in injected
+
+
+class TestSelectChunkingRule:
+    """Regression tests for the chunking_suboptimal rule lookup in select_chunking().
+
+    Bug: the lookup previously used the stale key
+    "chunking_mismatch_user_anchored_low_turns" which was renamed to
+    "chunking_suboptimal" in PHASE-E. The confirmed-rule branch was silently
+    dead. These tests verify the canonical key name is used.
+    """
+
+    def _write_audit_log(self, root: Path, rule_id: str, fire_count: int = 3) -> None:
+        """Write fake audit log entries to make aggregate_audit() return a confirmed rule."""
+        audit_path = self_model_audit_path(root)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = "2026-01-01T00:00:00"
+        with audit_path.open("w", encoding="utf-8") as fh:
+            for _ in range(fire_count):
+                fh.write(json.dumps({
+                    "rule_id": rule_id,
+                    "ts": ts,
+                    "recommendation": "use stride chunking",
+                }) + "\n")
+
+    def test_confirmed_chunking_suboptimal_returns_stride_for_agent_driven(self, tmp_path):
+        """select_chunking() returns 'stride' when chunking_suboptimal is confirmed
+        and session is agent-driven (low user turn count)."""
+        self._write_audit_log(tmp_path, "chunking_suboptimal", fire_count=3)
+        # agent-driven: nontrivial_user_turn_count < 5
+        result = select_chunking(2, 100, root=tmp_path)
+        assert result == "stride"
+
+    def test_confirmed_chunking_suboptimal_returns_stride_for_dense_agent_session(self, tmp_path):
+        """Stride returned when entry_count > 50 and user_to_entry_ratio < 0.03."""
+        self._write_audit_log(tmp_path, "chunking_suboptimal", fire_count=3)
+        # entry_count=200, nontrivial_user_turn_count=4 → ratio = 4/200 = 0.02 < 0.03
+        result = select_chunking(4, 200, root=tmp_path)
+        assert result == "stride"
+
+    def test_old_key_name_does_not_trigger_override(self, tmp_path):
+        """A confirmed rule stored under the OLD key name must NOT trigger the override.
+
+        This is the regression check: if the lookup were still using
+        'chunking_mismatch_user_anchored_low_turns', it would find the entry and
+        return 'stride'. With the correct key 'chunking_suboptimal', no match is
+        found and the heuristic-only path fires (also 'stride' here due to shape) —
+        but the confirmed-rule branch itself is not exercised.
+
+        We verify this by checking with a non-agent-driven session shape, so the
+        heuristic path returns 'user_anchored'. The old key can never cause 'stride'
+        through the confirmed-rule branch.
+        """
+        self._write_audit_log(tmp_path, "chunking_mismatch_user_anchored_low_turns", fire_count=3)
+        # non-agent-driven: 10 user turns, 20 entries → ratio = 0.5 (not agent-driven)
+        result = select_chunking(10, 20, root=tmp_path)
+        # With no matching confirmed rule and not agent-driven → user_anchored
+        assert result == "user_anchored"
+
+    def test_no_audit_log_heuristic_still_applies(self, tmp_path):
+        """With no audit log, heuristic fallback still returns stride for agent-driven."""
+        result = select_chunking(2, 100, root=tmp_path)
+        assert result == "stride"
+
+    def test_no_audit_log_non_agent_driven_returns_user_anchored(self, tmp_path):
+        """With no audit log and non-agent-driven shape, returns user_anchored."""
+        result = select_chunking(10, 20, root=tmp_path)
+        assert result == "user_anchored"
+
+    def test_tentative_rule_does_not_override(self, tmp_path):
+        """A rule with only 2 fires (tentative) does not override via confirmed branch.
+
+        The heuristic still applies independently.
+        """
+        self._write_audit_log(tmp_path, "chunking_suboptimal", fire_count=2)
+        # non-agent-driven: heuristic also returns user_anchored
+        result = select_chunking(10, 20, root=tmp_path)
+        assert result == "user_anchored"

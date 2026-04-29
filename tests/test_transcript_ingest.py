@@ -6,7 +6,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.cursors import CursorStore
-from core.transcript_ingest import tick, extract_observations  # type: ignore[import]
+from core.transcript_ingest import tick, extract_observations, _dedupe_observations  # type: ignore[import]
 
 
 def test_new_session_seeds_cursor_at_eof(tmp_path):
@@ -271,3 +271,42 @@ def test_tick_writing_cwd_produces_writing_session_type(tmp_path):
 
     assert len(captured_obs) == 1
     assert captured_obs[0][0]["session_type"] == "writing"
+
+
+# ---------------------------------------------------------------------------
+# Content-hash dedup — Task 1.2
+# ---------------------------------------------------------------------------
+
+
+class TestContentHashDedup:
+    def test_exact_duplicate_dropped_highest_importance_retained(self):
+        """Identical content+facts → second copy dropped; highest-importance copy kept."""
+        obs_a = {"content": "Auth uses JWT", "facts": ["JWT", "24h TTL"], "importance": 0.6}
+        obs_b = {"content": "Auth uses JWT", "facts": ["JWT", "24h TTL"], "importance": 0.9}
+        deduped, n_dropped = _dedupe_observations([obs_a, obs_b])
+        assert n_dropped == 1
+        assert len(deduped) == 1
+        assert deduped[0]["importance"] == 0.9
+
+    def test_paraphrase_both_kept(self):
+        """Different wording for the same meaning → both kept (no false-positive collapse)."""
+        obs_a = {"content": "Auth uses JWT with 24h TTL", "facts": [], "importance": 0.7}
+        obs_b = {"content": "Authentication relies on JSON web tokens expiring after one day", "facts": [], "importance": 0.7}
+        deduped, n_dropped = _dedupe_observations([obs_a, obs_b])
+        assert n_dropped == 0
+        assert len(deduped) == 2
+
+    def test_empty_list_returns_empty(self):
+        """Empty input → ([], 0)."""
+        deduped, n_dropped = _dedupe_observations([])
+        assert deduped == []
+        assert n_dropped == 0
+
+    def test_case_and_punctuation_difference_still_deduped(self):
+        """Case and punctuation differences are normalized before hashing → still deduped."""
+        obs_a = {"content": "Foo Bar.", "facts": [], "importance": 0.5}
+        obs_b = {"content": "foo bar", "facts": [], "importance": 0.7}
+        deduped, n_dropped = _dedupe_observations([obs_a, obs_b])
+        assert n_dropped == 1
+        assert len(deduped) == 1
+        assert deduped[0]["importance"] == 0.7

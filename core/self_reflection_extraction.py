@@ -1,0 +1,694 @@
+"""
+Self-reflection framework for the transcript-extraction layer (C scaffolding).
+
+Closes the loop: after each extraction run, the system observes ITSELF —
+which windows produced signal, which were skipped, where token budget was
+spent without yield, what affect cues went unused. Produces self-observations
+that feed back into the next run via a `self_model.md` file.
+
+Theoretical basis:
+- Park et al. 2023 (arXiv 2304.03442 §3.3) "Reflection" mechanism:
+  agents periodically synthesize lower-level observations into higher-level
+  abstractions about themselves and their environment. The same loop, but
+  scoped to extraction process metacognition.
+- Schön 1983 (The Reflective Practitioner) — reflection-on-action: knowing
+  THAT a skill worked is incomplete without knowing WHY and HOW. Stored
+  process knowledge enables transfer to novel contexts.
+- Anderson 1983 (ACT-R, Cognitive Skills and their Acquisition, ch. 4) —
+  production-rule learning: refining IF-THEN rules from declarative
+  observation. self_model.md entries are early-stage productions waiting
+  for compilation into procedural memory.
+
+Status — this module is the FRAMEWORK ONLY:
+- Data structures + loading/saving + minimal observation generation are
+  implemented and exercised.
+- Heuristic library that turns run statistics into self-observations is
+  bootstrapped with a small ruleset and is the iteration surface.
+- Integration with the full memesis Memory model + consolidator is left
+  as a follow-up; for now self-observations live in the on-disk
+  `self_model.md` and a JSONL audit log.
+
+The framework is intentionally additive: if the self-model file is missing
+or empty, extraction proceeds as if the loop did not exist. Failures in
+this module never block extraction — they are logged and skipped.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Storage layout
+# ---------------------------------------------------------------------------
+
+_DEFAULT_ROOT = Path.home() / ".claude" / "memesis"
+
+
+def _self_model_dir(root: Path | None = None) -> Path:
+    base = root or _DEFAULT_ROOT
+    out = base / "self-model"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def self_model_path(root: Path | None = None) -> Path:
+    """Active self-model markdown file the next extraction reads as context."""
+    return _self_model_dir(root) / "self_model.md"
+
+
+def self_model_audit_path(root: Path | None = None) -> Path:
+    """Append-only JSONL of every self-observation produced."""
+    return _self_model_dir(root) / "self_observations.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SelfObservation:
+    """A metacognitive observation about the extraction process itself.
+
+    Mirrors the W5 Stage 1 observation schema where it makes sense (kind,
+    knowledge_type, importance, facts) so a future consolidator can ingest
+    self-observations alongside session observations without a new pipeline.
+    """
+
+    facts: list[str]
+    kind: str = "finding"  # finding | correction | open_question | preference
+    knowledge_type: str = "metacognitive"
+    knowledge_type_confidence: str = "high"
+    importance: float = 0.5
+    subject: str = "self"  # always "self" for this module
+    work_event: str | None = None  # null per session_type contract
+    evidence: dict = field(default_factory=dict)  # raw stats that triggered
+    proposed_action: str | None = None  # what the rule recommends doing
+    rule_id: str = ""  # the heuristic that fired
+    ts: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "facts": self.facts,
+            "kind": self.kind,
+            "knowledge_type": self.knowledge_type,
+            "knowledge_type_confidence": self.knowledge_type_confidence,
+            "importance": self.importance,
+            "subject": self.subject,
+            "work_event": self.work_event,
+            "evidence": self.evidence,
+            "proposed_action": self.proposed_action,
+            "rule_id": self.rule_id,
+            "ts": self.ts,
+        }
+
+
+@dataclass
+class ExtractionRunStats:
+    """Per-session run statistics consumed by the reflection rules."""
+
+    session_id: str
+    session_type: str
+    chunking: str  # "stride" | "user_anchored" | "flat"
+    windows: int
+    productive_windows: int  # windows that produced ≥1 obs
+    raw_observations: int
+    final_observations: int  # post-dedup, post-issue-card synthesis
+    issue_cards: int
+    orphans: int
+    skipped_windows: int
+    parse_errors: int
+    affect_signals_total: int  # n windows with non-zero importance_prior
+    affect_quotes_used: int  # n cards with user_reaction populated
+    nontrivial_user_turn_count: int
+    entry_count: int
+    cost_calls: int  # LLM calls made
+    dropped_duplicates: int = 0  # Jaccard near-dup losses
+    low_importance_dropped: int = 0  # obs filtered at importance < 0.3
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def productive_rate(self) -> float:
+        if self.windows == 0:
+            return 0.0
+        return self.productive_windows / self.windows
+
+    @property
+    def cost_per_obs(self) -> float:
+        if self.final_observations == 0:
+            return float("inf") if self.cost_calls > 0 else 0.0
+        return self.cost_calls / self.final_observations
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "session_type": self.session_type,
+            "chunking": self.chunking,
+            "windows": self.windows,
+            "productive_windows": self.productive_windows,
+            "raw_observations": self.raw_observations,
+            "final_observations": self.final_observations,
+            "issue_cards": self.issue_cards,
+            "orphans": self.orphans,
+            "skipped_windows": self.skipped_windows,
+            "parse_errors": self.parse_errors,
+            "affect_signals_total": self.affect_signals_total,
+            "affect_quotes_used": self.affect_quotes_used,
+            "nontrivial_user_turn_count": self.nontrivial_user_turn_count,
+            "entry_count": self.entry_count,
+            "cost_calls": self.cost_calls,
+            "productive_rate": self.productive_rate,
+            "cost_per_obs": self.cost_per_obs,
+            "notes": self.notes,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Heuristic rules — each maps (run_stats) → SelfObservation | None
+# ---------------------------------------------------------------------------
+
+_RULES: list = []
+
+
+def _rule(rule_id: str):
+    """Decorator: register a reflection rule."""
+    def deco(fn):
+        fn.__rule_id__ = rule_id
+        _RULES.append(fn)
+        return fn
+    return deco
+
+
+@_rule("low_productive_rate")
+def _rule_low_productive_rate(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Productive window rate below 30% wastes LLM budget."""
+    if stats.windows < 4:
+        return None
+    if stats.productive_rate >= 0.3:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Extraction over session {stats.session_id[:12]} "
+            f"({stats.chunking} chunking, {stats.windows} windows) had "
+            f"{stats.productive_windows} productive windows "
+            f"({stats.productive_rate:.0%}); LLM budget on the other "
+            f"{stats.skipped_windows} windows produced no observations."
+        ],
+        kind="finding",
+        importance=0.7,
+        proposed_action=(
+            "Reduce max_windows from current value or pre-filter to "
+            "high-affect / decision-anchored segments before LLM call."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="low_productive_rate",
+    )
+
+
+@_rule("chunking_suboptimal")
+def _rule_chunking_suboptimal(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Chunking strategy was a poor fit for the session shape.
+
+    Bidirectional: catches both directions of mismatch.
+
+      Arm A (original): user_anchored chosen on agent-driven session with
+        few user turns → strides past the agent monologue and misses signal.
+
+      Arm B (added 2026-04-28 Phase E): stride chosen on user-dense session
+        with many short user turns and low yield → user_anchored would have
+        framed each user pivot as a window centroid and likely surfaced
+        more decisions.
+    """
+    arm_a = (
+        stats.chunking == "user_anchored"
+        and stats.nontrivial_user_turn_count < 5
+        and stats.final_observations < 3
+    )
+    arm_b = (
+        stats.chunking == "stride"
+        and stats.nontrivial_user_turn_count >= 8
+        and stats.final_observations < 3
+    )
+    if not (arm_a or arm_b):
+        return None
+    if arm_a:
+        fact = (
+            f"user_anchored chunking on session {stats.session_id[:12]} "
+            f"with only {stats.nontrivial_user_turn_count} substantive user "
+            f"turns produced {stats.final_observations} observations; "
+            f"agent-driven sessions need stride chunking to surface signal "
+            f"buried in long autonomous executions."
+        )
+        action = (
+            "When nontrivial_user_turn_count < 5 OR entries/user_turn ratio "
+            "> 30, prefer chunking='stride' over 'user_anchored'."
+        )
+    else:  # arm_b
+        fact = (
+            f"stride chunking on session {stats.session_id[:12]} with "
+            f"{stats.nontrivial_user_turn_count} substantive user turns "
+            f"produced only {stats.final_observations} observations; "
+            f"user-dense sessions benefit from user_anchored chunking that "
+            f"centers each window on a user pivot."
+        )
+        action = (
+            "When nontrivial_user_turn_count >= 8 and final_observations "
+            "< 3, prefer chunking='user_anchored' over 'stride'."
+        )
+    return SelfObservation(
+        facts=[fact],
+        kind="correction",
+        importance=0.85,
+        proposed_action=action,
+        evidence=stats.to_dict(),
+        rule_id="chunking_suboptimal",
+    )
+
+
+@_rule("affect_blind_spot")
+def _rule_affect_blind(stats: ExtractionRunStats) -> SelfObservation | None:
+    """High volume, zero affect signals suggests detector is missing cues.
+
+    Universalized: fires on any session_type, since the affect detector
+    is supposed to work everywhere. Phase E audit (2026-04-28) confirmed
+    that research sessions also produce 0 affect signals despite cards
+    bearing user_reaction text, so the original code-only gate hid a
+    real gap.
+    """
+    if stats.entry_count < 50:
+        return None
+    if stats.affect_signals_total > 0:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} ({stats.entry_count} entries, "
+            f"session_type={stats.session_type}) produced 0 windows with "
+            f"non-zero affect prior; either the user was uniformly neutral "
+            f"(possible) or the somatic detector missed pushback/repetition "
+            f"cues that the observation set contains."
+        ],
+        kind="open_question",
+        importance=0.6,
+        proposed_action=(
+            "Manually inspect 3 random windows from this session for affect "
+            "markers the detector missed; consider expanding somatic.py "
+            "lexicon."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="affect_blind_spot",
+    )
+
+
+@_rule("issue_card_collapse_efficient")
+def _rule_card_collapse(stats: ExtractionRunStats) -> SelfObservation | None:
+    """High raw→card compression with user_reaction usage validates Stage 1.5."""
+    if stats.raw_observations < 8:
+        return None
+    if stats.issue_cards == 0:
+        return None
+    compression = stats.raw_observations / max(stats.issue_cards, 1)
+    if compression < 2.5:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} compressed "
+            f"{stats.raw_observations} flat observations into "
+            f"{stats.issue_cards} issue cards "
+            f"({compression:.1f}x compression) with "
+            f"{stats.affect_quotes_used} cards bearing user_reaction "
+            f"context; Stage 1.5 synthesis is producing structured output "
+            f"the flat extractor could not."
+        ],
+        kind="finding",
+        importance=0.6,
+        proposed_action=(
+            "Keep Stage 1.5 issue-card synthesis ON for sessions with "
+            "raw_observations ≥ 8."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="issue_card_collapse_efficient",
+    )
+
+
+@_rule("parse_errors_present")
+def _rule_parse_errors(stats: ExtractionRunStats) -> SelfObservation | None:
+    if stats.parse_errors == 0:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Extraction on session {stats.session_id[:12]} encountered "
+            f"{stats.parse_errors} JSON parse errors from LLM responses; "
+            f"hierarchical recovery saved them as orphans, but the prompt "
+            f"is letting the model emit unparseable output."
+        ],
+        kind="correction",
+        importance=0.7,
+        proposed_action=(
+            "Tighten OBSERVATION_EXTRACT_PROMPT or ISSUE_SYNTHESIS_PROMPT "
+            "with stricter 'no markdown, no commentary' enforcement; add a "
+            "single-shot retry on parse failure before falling through to "
+            "orphan-only path."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="parse_errors_present",
+    )
+
+
+@_rule("dedup_inert")
+def _rule_dedup_inert(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Jaccard dedup never fires despite high observation volume.
+
+    Added 2026-04-28 (Phase E audit). Across 5 dense sessions / 211 raw
+    observations, only 1 dedup happened — suggesting either the threshold
+    (jaccard >= 0.7) is too tight or the LLM rephrases enough across
+    windows that the bag-of-words overlap stays low. Either way, the
+    dedup pass is paying compute cost for ~zero return.
+    """
+    if stats.raw_observations < 30:
+        return None
+    if stats.dropped_duplicates > 0:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} produced "
+            f"{stats.raw_observations} raw observations across "
+            f"{stats.windows} windows but the Jaccard dedup pass dropped "
+            f"zero. Either the 0.7 threshold is too tight or LLM rewording "
+            f"across windows defeats bag-of-words overlap."
+        ],
+        kind="open_question",
+        importance=0.55,
+        proposed_action=(
+            "Sample 5 raw observations from adjacent windows on this "
+            "session and compute pairwise Jaccard manually; consider "
+            "lowering the threshold to 0.55 or switching to embedding "
+            "cosine similarity."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="dedup_inert",
+    )
+
+
+@_rule("synthesis_overgreedy")
+def _rule_synthesis_overgreedy(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Issue-card synthesis clustered every observation — no orphans left.
+
+    Added 2026-04-28 (Phase E audit). 4 of 5 audited sessions ended with
+    orphan_count=0 despite 20-50 raw observations spanning multiple
+    sub-topics. Real session diversity should produce some unclustered
+    findings; zero orphans suggests synthesis is forcing weak observations
+    into cards rather than discarding or floating them.
+    """
+    if stats.raw_observations < 20:
+        return None
+    if stats.orphans > 0:
+        return None
+    if stats.issue_cards == 0:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Issue-card synthesis on session {stats.session_id[:12]} "
+            f"clustered all {stats.raw_observations} raw observations into "
+            f"{stats.issue_cards} cards with zero orphans. Genuine session "
+            f"diversity should leave some observations unclustered; zero "
+            f"orphans suggests the synthesis prompt is forcing weak "
+            f"observations into cards instead of dropping them."
+        ],
+        kind="open_question",
+        importance=0.6,
+        proposed_action=(
+            "Inspect the lowest-importance card on this session — if its "
+            "evidence is thin, tighten ISSUE_SYNTHESIS_PROMPT to drop or "
+            "orphan observations that don't share at least one entity with "
+            "an existing cluster."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="synthesis_overgreedy",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def reflect_on_extraction(
+    stats: ExtractionRunStats,
+    *,
+    root: Path | None = None,
+) -> list[SelfObservation]:
+    """Run all rules over a single session's run stats.
+
+    Returns the list of fired self-observations (may be empty). Side
+    effects: appends every observation to the audit JSONL and refreshes
+    the active self_model.md file.
+    """
+    obs: list[SelfObservation] = []
+    now = datetime.now(timezone.utc).isoformat()
+    for rule in _RULES:
+        try:
+            result = rule(stats)
+        except Exception as exc:
+            logger.warning(
+                "self-reflection rule %s raised: %s",
+                getattr(rule, "__rule_id__", rule.__name__),
+                exc,
+            )
+            continue
+        if result is not None:
+            result.ts = now
+            obs.append(result)
+
+    if obs:
+        _append_audit(obs, root=root)
+        _refresh_self_model_doc(obs, stats, root=root)
+
+    return obs
+
+
+def load_self_model(root: Path | None = None) -> str:
+    """Return the current self_model.md text (empty if not yet written).
+
+    The next extraction can pass this into prompts as additional context so
+    the model can avoid known failure modes.
+    """
+    p = self_model_path(root)
+    if not p.exists():
+        return ""
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _append_audit(obs: list[SelfObservation], root: Path | None = None) -> None:
+    p = self_model_audit_path(root)
+    try:
+        with p.open("a", encoding="utf-8") as fh:
+            for o in obs:
+                fh.write(json.dumps(o.to_dict()) + "\n")
+    except OSError as exc:
+        logger.warning("self-reflection: failed to write audit: %s", exc)
+
+
+def _refresh_self_model_doc(
+    new_obs: list[SelfObservation],
+    stats: ExtractionRunStats,
+    root: Path | None = None,
+) -> None:
+    """Rewrite self_model.md with the most recent ruleset findings.
+
+    Aggregates the last N audit entries by rule_id, keeps the single most
+    recent per rule (rules tend to be deterministic — the latest evidence
+    is the most relevant), and writes a markdown doc.
+    """
+    audit_p = self_model_audit_path(root)
+    by_rule: dict[str, dict] = {}
+    if audit_p.exists():
+        try:
+            with audit_p.open(encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    rid = rec.get("rule_id") or "unknown"
+                    by_rule[rid] = rec  # last-wins
+        except OSError:
+            pass
+
+    for o in new_obs:
+        by_rule[o.rule_id] = o.to_dict()
+
+    md_lines: list[str] = [
+        "# Self-Model — Extraction-Process Metacognition",
+        "",
+        f"_Last refreshed: {datetime.now(timezone.utc).isoformat()}_",
+        "",
+        f"_Latest run: session={stats.session_id[:12]}, chunking={stats.chunking}, "
+        f"windows={stats.windows}, productive={stats.productive_windows}, "
+        f"final_obs={stats.final_observations}_",
+        "",
+        "This file is read by the next extraction as context. Each entry is a "
+        "production rule the system learned about its own behavior; the "
+        "**Action** line is the recommended adjustment.",
+        "",
+        "---",
+        "",
+    ]
+
+    for rid in sorted(by_rule.keys()):
+        rec = by_rule[rid]
+        md_lines.append(f"## {rid}")
+        md_lines.append("")
+        md_lines.append(f"_kind={rec.get('kind')}, importance={rec.get('importance')}, "
+                         f"ts={rec.get('ts','?')}_")
+        md_lines.append("")
+        for f in rec.get("facts", []):
+            md_lines.append(f"- {f}")
+        action = rec.get("proposed_action")
+        if action:
+            md_lines.append("")
+            md_lines.append(f"**Action:** {action}")
+        md_lines.append("")
+        md_lines.append("---")
+        md_lines.append("")
+
+    p = self_model_path(root)
+    try:
+        p.write_text("\n".join(md_lines), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("self-reflection: failed to write self_model.md: %s", exc)
+
+
+def list_rules() -> list[str]:
+    """Inventory of registered rule_ids — useful for tests / debugging."""
+    return [getattr(r, "__rule_id__", r.__name__) for r in _RULES]
+
+
+# ---------------------------------------------------------------------------
+# Cross-run aggregation + feedback into next extraction
+# ---------------------------------------------------------------------------
+
+
+def aggregate_audit(root: Path | None = None) -> dict[str, dict]:
+    """Aggregate every prior self-observation by rule_id.
+
+    Returns dict keyed by rule_id with:
+      {
+        "fire_count": int,
+        "first_seen": ts,
+        "last_seen": ts,
+        "confidence": "tentative" | "confirmed",
+        "latest": <full SelfObservation dict>
+      }
+
+    Confirmed = rule fired ≥3 times across runs (Anderson 1983 production-rule
+    compilation: a rule becomes procedural only after repeated successful firing).
+    """
+    audit_p = self_model_audit_path(root)
+    if not audit_p.exists():
+        return {}
+    by_rule: dict[str, dict] = {}
+    try:
+        with audit_p.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rid = rec.get("rule_id") or "unknown"
+                slot = by_rule.setdefault(rid, {
+                    "fire_count": 0,
+                    "first_seen": rec.get("ts"),
+                    "last_seen": rec.get("ts"),
+                    "latest": rec,
+                })
+                slot["fire_count"] += 1
+                ts = rec.get("ts")
+                if ts:
+                    if not slot["first_seen"] or ts < slot["first_seen"]:
+                        slot["first_seen"] = ts
+                    if not slot["last_seen"] or ts > slot["last_seen"]:
+                        slot["last_seen"] = ts
+                slot["latest"] = rec
+    except OSError:
+        return {}
+    for rid, slot in by_rule.items():
+        slot["confidence"] = "confirmed" if slot["fire_count"] >= 3 else "tentative"
+    return by_rule
+
+
+def select_chunking(
+    nontrivial_user_turn_count: int,
+    entry_count: int,
+    *,
+    root: Path | None = None,
+) -> str:
+    """Apply rule chunking_suboptimal automatically.
+
+    This is the "feedback into next extraction" channel — instead of writing
+    the recommendation to a doc and hoping a human reads it, the system
+    consults the audit log and acts on confirmed rules directly.
+
+    Returns "stride" or "user_anchored". Default is "user_anchored" because
+    most Claude Code sessions are direction-driven; we only override when
+    there's a confirmed rule and the session shape matches its trigger.
+    """
+    by_rule = aggregate_audit(root)
+    rule = by_rule.get("chunking_suboptimal")
+    # Threshold from rule definition: <5 substantive user turns OR
+    # entries-per-user-turn ratio > 30 → agent-driven, prefer stride
+    user_to_entry_ratio = (
+        nontrivial_user_turn_count / max(entry_count, 1)
+        if entry_count > 0 else 0
+    )
+    is_agent_driven = (
+        nontrivial_user_turn_count < 5
+        or (entry_count > 50 and user_to_entry_ratio < 0.03)
+    )
+    if rule and rule.get("confidence") == "confirmed" and is_agent_driven:
+        return "stride"
+    if not rule and is_agent_driven:
+        # No confirmed evidence yet, but heuristic still applies
+        return "stride"
+    return "user_anchored"
+
+
+def build_self_model_preamble(root: Path | None = None) -> str:
+    """Produce a short preamble that can be injected into the extraction prompt.
+
+    Reads only CONFIRMED rules (≥3 fires) so we don't pollute the prompt
+    with one-off observations. Output is a compact bullet list of action
+    recommendations. Empty string if no confirmed rules — caller can skip.
+    """
+    by_rule = aggregate_audit(root)
+    confirmed = {
+        rid: slot for rid, slot in by_rule.items()
+        if slot.get("confidence") == "confirmed"
+    }
+    if not confirmed:
+        return ""
+    lines = [
+        "## Self-model (confirmed extraction-process rules from prior runs)",
+        "",
+        "These are calibrations the system has learned from prior extractions. "
+        "Apply when relevant, ignore otherwise — they are heuristics, not gospel.",
+        "",
+    ]
+    for rid in sorted(confirmed.keys()):
+        slot = confirmed[rid]
+        rec = slot["latest"]
+        action = rec.get("proposed_action") or "(no action recorded)"
+        fires = slot["fire_count"]
+        lines.append(f"- **{rid}** (fired {fires}x): {action}")
+    lines.append("")
+    return "\n".join(lines)
