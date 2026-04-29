@@ -31,6 +31,18 @@ Status — this module is the FRAMEWORK ONLY:
 The framework is intentionally additive: if the self-model file is missing
 or empty, extraction proceeds as if the loop did not exist. Failures in
 this module never block extraction — they are logged and skipped.
+
+Cross-session meta-rule (recurrent_agent_failure):
+  Implemented via Option A: a standalone `reflect_on_corpus` helper that the
+  caller (e.g. run_selected_sessions.py) invokes after processing all sessions,
+  passing the accumulated correction cards. Option B was rejected because the
+  audit JSONL stores SelfObservation dicts — not card content — so we cannot
+  reconstruct card problem text from it.
+
+  Caller wiring needed (not implemented here):
+  - run_selected_sessions.py: collect CorrectionCard objects during the run
+    loop, then call reflect_on_corpus(cards, root=...) once after the loop.
+  - transcript_ingest.py: same pattern if it runs multi-session sweeps.
 """
 
 from __future__ import annotations
@@ -137,6 +149,10 @@ class ExtractionRunStats:
     low_importance_dropped: int = 0  # obs filtered at importance < 0.3
     notes: list[str] = field(default_factory=list)
     repeated_fact_hashes: list[str] = field(default_factory=list)  # MD5 hashes of raw obs facts
+    unique_knowledge_types_emitted: int = 0  # distinct knowledge_type values in final observations
+    repeated_facts_count: int = 0  # fuzzy Jaccard ≥0.55 vs memory store (cross-session paraphrase repeats)
+    windows_with_affect_signal_but_no_card: int = 0  # windows with affect max_boost > 0 but no extraction
+    min_card_importance: float = 1.0  # lowest importance among final cards
 
     @property
     def productive_rate(self) -> float:
@@ -179,6 +195,10 @@ class ExtractionRunStats:
             "obs_per_cost_call": self.obs_per_cost_call,
             "repeated_fact_hashes": self.repeated_fact_hashes,
             "notes": self.notes,
+            "unique_knowledge_types_emitted": self.unique_knowledge_types_emitted,
+            "repeated_facts_count": self.repeated_facts_count,
+            "windows_with_affect_signal_but_no_card": self.windows_with_affect_signal_but_no_card,
+            "min_card_importance": self.min_card_importance,
         }
 
 
@@ -562,6 +582,101 @@ def _rule_synthesis_overgreedy(stats: ExtractionRunStats) -> SelfObservation | N
     )
 
 
+@_rule("monotone_knowledge_lens")
+def _rule_monotone_knowledge_lens(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Extractor emitted observations of only one knowledge_type across ≥5 final obs.
+
+    A single knowledge_type across a substantial session usually means the lens
+    is too narrow — either the prompt template constrains the classifier or the
+    session is genuinely monothematic. The rule flags the pattern so it can be
+    verified before accepting the extraction.
+    """
+    if stats.unique_knowledge_types_emitted != 1:
+        return None
+    if stats.final_observations < 5:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} produced {stats.final_observations} "
+            f"observations all classified under a single knowledge_type; "
+            f"a monotone lens may indicate prompt-driven classifier collapse "
+            f"rather than genuine session homogeneity."
+        ],
+        kind="finding",
+        importance=0.6,
+        proposed_action=(
+            "Extractor running with monotone lens; verify session content "
+            "actually monothematic before accepting."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="monotone_knowledge_lens",
+    )
+
+
+@_rule("affect_signal_no_extraction")
+def _rule_affect_signal_no_extraction(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Somatic detector fires on windows where LLM extracts nothing.
+
+    When affect signals accumulate across windows but the LLM produces no
+    observation cards for those same windows, either the prompt is under-
+    specifying how to handle affect-flagged content or the detector has a
+    false-positive rate worth investigating.
+    """
+    if stats.windows_with_affect_signal_but_no_card < 3:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} had "
+            f"{stats.windows_with_affect_signal_but_no_card} windows where the "
+            f"somatic affect detector fired but the LLM produced no observation "
+            f"cards; signal is being detected but not converted to memory."
+        ],
+        kind="finding",
+        importance=0.7,
+        proposed_action=(
+            "Somatic detector fires on windows where LLM extracts nothing — "
+            "investigate prompt clarity or detector false positives."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="affect_signal_no_extraction",
+    )
+
+
+@_rule("forced_clustering_low_importance")
+def _rule_forced_clustering_low_importance(stats: ExtractionRunStats) -> SelfObservation | None:
+    """Synthesis is force-clustering low-importance observations.
+
+    Co-condition: synthesis_overgreedy must be confirmed (≥3 fires in audit)
+    AND the minimum card importance on this run is below 0.4. Together they
+    indicate the synthesis prompt is pulling weak observations into cards
+    rather than orphaning or dropping them.
+    """
+    try:
+        audit = aggregate_audit(root=None)
+    except Exception:
+        return None
+    if (audit.get("synthesis_overgreedy") or {}).get("confidence") != "confirmed":
+        return None
+    if stats.min_card_importance >= 0.4:
+        return None
+    return SelfObservation(
+        facts=[
+            f"Session {stats.session_id[:12]} has min_card_importance="
+            f"{stats.min_card_importance:.2f} and synthesis_overgreedy is "
+            f"confirmed across prior runs; synthesis is likely force-clustering "
+            f"low-importance observations into cards rather than leaving orphans."
+        ],
+        kind="finding",
+        importance=0.7,
+        proposed_action=(
+            "Synthesis is force-clustering low-importance observations; "
+            "tighten orphan threshold or enable synthesis_strict."
+        ),
+        evidence=stats.to_dict(),
+        rule_id="forced_clustering_low_importance",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -790,6 +905,105 @@ def select_chunking(
         # No confirmed evidence yet, but heuristic still applies
         return "stride"
     return "user_anchored"
+
+
+# ---------------------------------------------------------------------------
+# Cross-session meta-rule: recurrent_agent_failure (Option A)
+# ---------------------------------------------------------------------------
+
+# Keywords triggering the cross-session failure cluster signal.
+_RECURRENT_FAILURE_KEYWORDS: frozenset[str] = frozenset({
+    "without reading",
+    "spec drift",
+    "api mismatch",
+    "api drift",
+    "without verifying",
+    "did not check",
+    "did not read",
+    "wrong api",
+    "outdated spec",
+})
+
+
+@dataclass
+class CorrectionCard:
+    """Minimal representation of a correction-kind card for cross-session analysis."""
+
+    card_id: str
+    session_id: str
+    problem: str
+    decision_or_outcome: str
+
+
+def reflect_on_corpus(
+    cards: list[CorrectionCard],
+    *,
+    root: Path | None = None,
+) -> list[SelfObservation]:
+    """Run the recurrent_agent_failure cross-session meta-rule over a corpus of cards.
+
+    Called by the sweep runner after all sessions are processed. Returns fired
+    self-observations and appends them to the audit log (same path as per-session
+    rules). Empty list when no cluster meets the threshold.
+
+    Fire condition: >=2 correction-kind cards across >=2 distinct session_ids
+    share >=1 keyword from _RECURRENT_FAILURE_KEYWORDS (case-insensitive substring
+    match against problem + decision_or_outcome concatenated).
+    """
+    # Group cards by keyword: keyword → list of (session_id, card_id, excerpt)
+    keyword_hits: dict[str, list[dict[str, str]]] = {}
+    for card in cards:
+        # Combine both text fields for matching — one place to search
+        haystack = (card.problem + " " + card.decision_or_outcome).lower()
+        for kw in _RECURRENT_FAILURE_KEYWORDS:
+            if kw in haystack:
+                keyword_hits.setdefault(kw, []).append({
+                    "session_id": card.session_id,
+                    "card_id": card.card_id,
+                    "card_problem_excerpt": card.problem[:120],
+                })
+
+    obs: list[SelfObservation] = []
+    now = datetime.now(timezone.utc).isoformat()
+    for kw, hits in keyword_hits.items():
+        # Require >=2 hits across >=2 distinct sessions
+        distinct_sessions = {h["session_id"] for h in hits}
+        if len(hits) < 2 or len(distinct_sessions) < 2:
+            continue
+        # Cap evidence list at 3 entries to keep the record compact
+        evidence_entries = hits[:3]
+        total = len(hits)
+        card_ids = [h["card_id"] for h in hits]
+        observation = SelfObservation(
+            facts=[
+                f"Recurrent agent failure pattern detected: keyword '{kw}' matched "
+                f"{total} correction card(s) across {len(distinct_sessions)} distinct "
+                f"session(s) ({', '.join(sorted(distinct_sessions)[:3])}). "
+                f"Repeated cross-session corrections sharing the same root cause "
+                f"indicate a systemic failure mode, not a one-off mistake."
+            ],
+            kind="correction",
+            importance=0.9,
+            proposed_action=(
+                f"Surface to Stage 1 prompt: warn extractor that prior sessions showed "
+                f"pattern '{kw}' across cards {card_ids}. Consider tightening "
+                f"pre-extraction read-source verification."
+            ),
+            evidence={
+                "keyword_matched": kw,
+                "card_count": total,
+                "sessions": list(sorted(distinct_sessions)),
+                "entries": evidence_entries,
+            },
+            rule_id="recurrent_agent_failure",
+        )
+        observation.ts = now
+        obs.append(observation)
+
+    if obs:
+        _append_audit(obs, root=root)
+
+    return obs
 
 
 def build_self_model_preamble(root: Path | None = None) -> str:

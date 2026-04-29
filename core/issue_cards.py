@@ -71,13 +71,20 @@ OUTPUT a single JSON object:
       "options_considered": ["option1", "option2", ...],   // empty list if none
       "decision_or_outcome": "1-2 sentences — what was decided/found/changed",
       "user_reaction": "short phrase — the user's affective response (e.g. 'rejected with frustration', 'enthusiastic accept', 'silent acquiescence', 'unresolved')",
-      "user_affect_valence": "friction|delight|surprise|neutral|mixed",
+      "user_affect_valence": "friction|delight|surprise|neutral|mixed",  // Use 'mixed' when the user's reaction evolved across the card's span (e.g., initial friction then accept). Track the trajectory in 'user_reaction' text.
       "evidence_quotes": ["verbatim quote from input observations[].facts[]", ...],
       "evidence_obs_indices": [0, 3, 7],
       "kind": "decision|finding|preference|constraint|correction|open_question",
       "knowledge_type": "factual|conceptual|procedural|metacognitive",
       "importance": 0.0,
-      "scope": "session-local | cross-session-durable"
+      "scope": "session-local | cross-session-durable",
+      // decision-kind only — both fields are OPTIONAL; omit for non-decision cards
+      "criterion_weights": {{
+        "<criterion>": "hard_veto|strong|weak|mentioned"
+      }},
+      "rejected_options": [
+        {{"option": "<name>", "reason": "<why rejected, or 'rejected without recorded reason'>"}}
+      ]
     }}
   ],
   "orphans": [
@@ -114,6 +121,77 @@ QUALITY RULES:
    entities (proper nouns, type names, file paths) without a unifying decision
    or problem that applies to all of them, split into orphans rather than
    synthesize. Lookup-table content belongs as orphans, not cards.
+10. DROP GATE: An observation with importance < 0.3 sharing no named entity
+    with any sibling MAY be dropped entirely (omit from both issue_cards[]
+    and orphans[]). Use sparingly — preserves orphan signal but reduces
+    noise floor. The synthesis_notes should mention how many were dropped.
+
+---
+
+DECISION-KIND RULES (apply when kind == "decision"):
+
+RULE D1 — REJECTION RATIONALE (applies when options_considered has ≥2 entries):
+  evidence_quotes MUST include ≥1 quote per rejected option explaining WHY it was
+  rejected. If the source observations contain no recorded rationale for a rejected
+  option, add a synthetic note in rejected_options[]:
+    {{"option": "<name>", "reason": "<rejected without recorded reason>"}}
+  Do not silently drop unchosen options — the rejection reason is often more
+  durable than the chosen path.
+
+RULE D2 — ATTRIBUTION RUBRIC:
+  When writing decision_or_outcome or any attribution language, use the rubric below.
+  Default to "Emma chose" when ambiguous — Emma is the decision authority.
+
+  "Emma chose"      — source quotes contain Emma's imperative or hard veto:
+                      "we must", "no", "stop", "do X", "don't X", explicit rejection
+  "Emma confirmed"  — Claude proposed, Emma approved:
+                      "yes", "good", "ship it", "go", "looks good", "okay"
+  "Emma and Claude" — ONLY when source quotes show genuine joint exploration:
+                      both parties proposing distinct variants and iterating together
+
+  Do NOT default to "Emma and Claude" just because both names appear in the session.
+  The test is whether Claude's proposals were substantively adopted or merely executed.
+
+RULE D3 — CRITERION WEIGHTS:
+  For decision cards, populate criterion_weights{{}} for each evaluation criterion
+  that appears in the source observations. Use these four levels:
+
+  "hard_veto"  — Emma stated it as non-negotiable; any option violating it was
+                 automatically rejected (e.g. "test invalidation is a blocker")
+  "strong"     — explicitly weighted heavily, but trade-offs were discussed
+  "weak"       — mentioned as a consideration but not pivotal to the outcome
+  "mentioned"  — surfaced once without weight indication
+
+  If no criteria are discernible from the source, omit criterion_weights entirely
+  (the field is optional).
+
+EXAMPLE — fully populated decision card showing new fields:
+{{
+  "title": "Skill taxonomy 13 + Command + Trade",
+  "problem": "Taxonomy needed to cover Command and Trade skills without invalidating existing tests.",
+  "options_considered": ["13-category flat list", "13 + Command + Trade extension", "full redesign"],
+  "decision_or_outcome": "Emma chose 13 + Command + Trade extension; full redesign rejected as test-invalidating.",
+  "user_reaction": "hard veto on full redesign",
+  "user_affect_valence": "friction",
+  "evidence_quotes": [
+    "Emma stated test invalidation is a blocker — any option breaking existing tests is off the table",
+    "Emma rejected full redesign citing test-invalidation risk"
+  ],
+  "evidence_obs_indices": [2, 5],
+  "kind": "decision",
+  "knowledge_type": "conceptual",
+  "importance": 0.85,
+  "scope": "cross-session-durable",
+  "criterion_weights": {{
+    "test preservation": "hard_veto",
+    "coverage of Command and Trade": "strong",
+    "migration effort": "weak"
+  }},
+  "rejected_options": [
+    {{"option": "full redesign", "reason": "would invalidate existing skill taxonomy tests — Emma's hard veto"}},
+    {{"option": "13-category flat list", "reason": "rejected without recorded reason"}}
+  ]
+}}
 
 {strict_clause}
 
@@ -206,6 +284,22 @@ def synthesize_issue_cards(
         logger.warning("issue_synthesis: bad shape — keeping flat obs as orphans")
         return [], observations, {"outcome": "bad_shape"}
 
+    # Validate evidence_obs_indices against input observation count
+    n_obs = len(observations)
+    dropped_invalid_indices = 0
+    for card in cards:
+        indices = card.get("evidence_obs_indices") or []
+        valid_indices = [i for i in indices if isinstance(i, int) and 0 <= i < n_obs]
+        dropped = len(indices) - len(valid_indices)
+        if dropped:
+            dropped_invalid_indices += 1
+            logger.info(
+                "issue_synthesis: dropped %d out-of-range indices in card '%s'",
+                dropped,
+                card.get("title", "?"),
+            )
+        card["evidence_obs_indices"] = valid_indices
+
     # Sanity: every card must have ≥1 evidence_quote
     valid_cards = [c for c in cards if (c.get("evidence_quotes") or [])]
     dropped_cards = len(cards) - len(valid_cards)
@@ -219,12 +313,28 @@ def synthesize_issue_cards(
         card["evidence_quotes"] = deduped
         total_deduped += n_removed
 
+    # dropped_weak_observations: observations the LLM dropped per Rule 10 (DROP GATE).
+    # This is a prompt-instruction stat — actual tracking requires LLM cooperation.
+    # We approximate: obs that appear in neither evidence_obs_indices nor orphans.
+    # When LLM doesn't return counts, this estimate may undercount (some obs are
+    # legitimately uncited). Initialize conservatively to max(0, delta).
+    obs_in_cards: set[int] = set()
+    for card in valid_cards:
+        for idx in card.get("evidence_obs_indices") or []:
+            if isinstance(idx, int) and 0 <= idx < n_obs:
+                obs_in_cards.add(idx)
+    dropped_weak_observations = max(
+        0, n_obs - len(orphans) - len(obs_in_cards)
+    )
+
     stats = {
         "outcome": "ok",
         "card_count": len(valid_cards),
         "orphan_count": len(orphans),
         "dropped_evidenceless": dropped_cards,
         "quotes_deduped": total_deduped,
+        "dropped_invalid_indices": dropped_invalid_indices,
+        "dropped_weak_observations": dropped_weak_observations,
         "synthesis_notes": parsed.get("synthesis_notes", ""),
     }
     return valid_cards, orphans, stats
@@ -263,4 +373,6 @@ def extract_card_memory_fields(card: dict) -> dict:
         "confidence": confidence,
         "affect_valence": affect_valence,
         "actor": actor,
+        "criterion_weights": card.get("criterion_weights"),
+        "rejected_options": card.get("rejected_options"),
     }
