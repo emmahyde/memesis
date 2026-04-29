@@ -110,6 +110,17 @@ class Memory(BaseModel):
     expires_at = IntegerField(null=True)          # Unix timestamp; NULL = never expires (T1)
     source = TextField(default='human')           # 'human' | 'agent'; guards poisoning (E3)
 
+    # Stage 1.5 / tasks #14-#18: extended observation metadata
+    temporal_scope = TextField(null=True)         # session-local | cross-session-durable; gates expiry/injection
+    extraction_confidence = FloatField(null=True) # 0-1 certainty of extraction; distinct from raw_importance
+    actor = TextField(null=True)                  # user | assistant | system | external; who produced the observation
+    polarity = TextField(null=True)               # positive | negative | corrective | neutral; sign within kind=finding
+    revisable = TextField(default='0', null=True) # '0'=stable, '1'=provisional; reciprocal to is_pinned
+
+    # Task 3.1 — card→memory field promotion (Wave 3)
+    confidence = FloatField(null=True)            # 0.0–1.0; default 0.7 at write time; derived from knowledge_type_confidence
+    affect_valence = TextField(null=True)         # friction|delight|surprise|neutral|mixed
+
     class Meta:
         table_name = "memories"
 

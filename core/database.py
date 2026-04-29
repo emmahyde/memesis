@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+_SCHEMA_VERSION = 2
+
 from .models import (
     AffectLog,
     ConsolidationLog,
@@ -206,6 +208,15 @@ def _run_migrations():
         ("resolves_question_id", "TEXT"),
         ("resolved_at", "TEXT"),
         ("is_pinned", "INTEGER DEFAULT 0"),
+        # Stage 1.5 / tasks #14-#18: extended observation metadata
+        ("temporal_scope", "TEXT"),
+        ("extraction_confidence", "REAL"),
+        ("actor", "TEXT"),
+        ("polarity", "TEXT"),
+        ("revisable", "TEXT"),
+        # Task 3.1 — card→memory field promotion (Wave 3)
+        ("confidence", "REAL"),
+        ("affect_valence", "TEXT"),
     ]:
         if col not in mem_cols:
             try:
@@ -311,3 +322,12 @@ def _run_migrations():
                 db.execute_sql(f"ALTER TABLE consolidation_log ADD COLUMN {col} {typ}")
             except Exception:
                 pass
+
+    # Schema version bump — idempotent: only write if current < target
+    try:
+        cursor = db.execute_sql("PRAGMA user_version")
+        current_version = cursor.fetchone()[0]
+        if current_version < _SCHEMA_VERSION:
+            db.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    except Exception:
+        pass
