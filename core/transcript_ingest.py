@@ -44,10 +44,39 @@ from core.self_reflection_extraction import (
     ExtractionRunStats,
     reflect_on_extraction,
     select_chunking,
-    build_self_model_preamble,
 )
+from core.rule_registry import ParameterOverrides
 
 logger = logging.getLogger(__name__)
+
+REFINE_PROMPT = """You are reviewing observations extracted from overlapping windows of a single session.
+Your job: identify cross-window patterns, merge near-duplicates that the
+content-hash deduper missed (same finding, different phrasing), and adjust
+importance scores when full-session context warrants it.
+
+DO NOT invent new observations. Only refine, merge, or re-score existing ones.
+DO NOT drop observations unless they are confirmed duplicates of others in
+the same input list (in which case keep the higher-importance copy or merge
+their facts into one observation).
+
+SESSION SYNOPSIS:
+{synopsis}
+
+SESSION AFFECT (for importance calibration):
+{affect_summary}
+
+OBSERVATIONS FROM HIERARCHICAL EXTRACTION (JSON list):
+{observations_json}
+
+Output ONLY a JSON object:
+{{
+  "refined": [/* observations in same schema as input */],
+  "merges": [/* {{"merged_into_index": int, "from_indices": [int,...], "reason": str}} */],
+  "rescores": [/* {{"index": int, "old": float, "new": float, "reason": str}} */]
+}}
+
+If no refinement is warranted, return {{"refined": <input observations unchanged>, "merges": [], "rescores": []}}.
+"""
 
 
 def discover_transcripts(max_age_hours: int = 25) -> list[Path]:
@@ -274,6 +303,58 @@ def _dedupe_observations(observations: list[dict]) -> tuple[list[dict], int]:
     return kept, dropped
 
 
+def _refine_observations(
+    observations: list[dict],
+    synopsis: str,
+    affect_summary: dict,
+) -> tuple[list[dict], dict]:
+    """Run the Wu-2021 refine pass: merge cross-window paraphrases and rescore importance.
+
+    Empty input returns immediately without an LLM call.
+    Lists of ≤3 observations are skipped (no merges possible on tiny sets).
+
+    Returns (refined_observations, stats_dict).
+    """
+    if not observations:
+        return [], {"merges": 0, "rescores": 0, "outcome": "empty"}
+
+    if len(observations) <= 3:
+        return observations, {"merges": 0, "rescores": 0, "outcome": "skipped_too_few"}
+
+    prompt = REFINE_PROMPT.format(
+        synopsis=synopsis[:6000],
+        affect_summary=json.dumps(affect_summary),
+        observations_json=json.dumps(observations, indent=2),
+    )
+
+    try:
+        raw = call_llm(prompt, max_tokens=8192)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_refine_observations: LLM call failed: %s", exc)
+        return observations, {"merges": 0, "rescores": 0, "outcome": "llm_error", "error": str(exc)}
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("_refine_observations: failed to parse LLM response as JSON")
+        return observations, {"merges": 0, "rescores": 0, "outcome": "parse_error"}
+
+    refined = parsed.get("refined")
+    if not isinstance(refined, list):
+        logger.warning("_refine_observations: response missing 'refined' list key")
+        return observations, {"merges": 0, "rescores": 0, "outcome": "missing_refined"}
+
+    merges = parsed.get("merges", [])
+    rescores = parsed.get("rescores", [])
+    return refined, {
+        "merges": len(merges),
+        "rescores": len(rescores),
+        "outcome": "ok",
+        "merges_detail": merges,
+        "rescores_detail": rescores,
+    }
+
+
 def extract_observations_hierarchical(
     entries: list[dict],
     session_type: str = "code",
@@ -391,13 +472,22 @@ def extract_observations_hierarchical(
 
     deduped, dropped = _dedupe_observations(all_obs)
 
-    # Stage 1.5 — issue-card synthesis (replaces Wu 2021 refine)
+    # Stage 1.5 — Wu-2021 refine pass + issue-card synthesis
     cards: list[dict] = []
     orphans: list[dict] = deduped
     synthesis_stats: dict = {"outcome": "skipped"}
+    refine_stats: dict = {"outcome": "skipped"}
     affect_summary = _aggregate_session_affect(affect_signals)
     if refine and deduped:
         synopsis = summarize(entries, max_chars=6000)
+        deduped, refine_stats = _refine_observations(deduped, synopsis, affect_summary)
+        if refine_stats.get("outcome") == "ok":
+            cost_calls += 1
+            logger.info(
+                "refine: %d merges, %d rescores",
+                refine_stats.get("merges", 0),
+                refine_stats.get("rescores", 0),
+            )
         cards, orphans, synthesis_stats = synthesize_issue_cards(
             deduped, synopsis, session_affect_summary=affect_summary
         )
@@ -423,6 +513,7 @@ def extract_observations_hierarchical(
         "low_importance_dropped": drop_stats.get("low_importance_dropped", 0),
         "parse_errors_repaired": drop_stats.get("parse_errors_repaired", 0),
         "post_dedupe_count": len(deduped),
+        "refine": refine_stats,
         "synthesis": synthesis_stats,
         "skips": skips,
         "affect_signals": [a.to_dict() for a in affect_signals],

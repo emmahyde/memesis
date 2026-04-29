@@ -12,6 +12,7 @@ from core.transcript_ingest import (  # type: ignore[import]
     _dedupe_observations,
     _merge_card_affect,
     _parse_extract_response,
+    _refine_observations,
 )
 
 
@@ -450,3 +451,166 @@ class TestJsonRepair:
         skips = result["skips"]
         assert len(skips) == 1
         assert skips[0].get("reason") == "window too short"
+
+
+# ---------------------------------------------------------------------------
+# _refine_observations — Wave 3 Wu-2021 refine pass
+# ---------------------------------------------------------------------------
+
+
+class TestRefineObservations:
+    def _make_obs(self, n: int) -> list[dict]:
+        return [
+            {"content": f"observation {i}", "facts": [f"fact {i}"], "importance": 0.5 + i * 0.05}
+            for i in range(n)
+        ]
+
+    def test_empty_obs_returns_empty_no_llm_call(self):
+        """Empty input → ([], {"outcome": "empty"}), call_llm NOT called."""
+        with patch("core.transcript_ingest.call_llm") as mock_llm:
+            result, stats = _refine_observations([], "synopsis", {})
+        mock_llm.assert_not_called()
+        assert result == []
+        assert stats["outcome"] == "empty"
+        assert stats["merges"] == 0
+        assert stats["rescores"] == 0
+
+    def test_three_or_fewer_obs_skipped_no_llm_call(self):
+        """≤3 obs → returns input unchanged, outcome=skipped_too_few, no LLM call."""
+        obs = self._make_obs(3)
+        with patch("core.transcript_ingest.call_llm") as mock_llm:
+            result, stats = _refine_observations(obs, "synopsis", {})
+        mock_llm.assert_not_called()
+        assert result is obs
+        assert stats["outcome"] == "skipped_too_few"
+        assert stats["merges"] == 0
+        assert stats["rescores"] == 0
+
+    def test_happy_path_merge_and_rescore(self):
+        """5 obs in, LLM returns 4 after merge + 1 rescore → correct result and stats."""
+        import json
+        obs = self._make_obs(5)
+        merged_obs = self._make_obs(4)  # one fewer after merge
+        llm_response = json.dumps({
+            "refined": merged_obs,
+            "merges": [{"merged_into_index": 0, "from_indices": [4], "reason": "paraphrase"}],
+            "rescores": [{"index": 2, "old": 0.6, "new": 0.75, "reason": "session-wide pattern"}],
+        })
+        with patch("core.transcript_ingest.call_llm", return_value=llm_response):
+            result, stats = _refine_observations(obs, "synopsis", {"dominant_valence": "friction"})
+        assert len(result) == 4
+        assert stats["outcome"] == "ok"
+        assert stats["merges"] == 1
+        assert stats["rescores"] == 1
+        assert len(stats["merges_detail"]) == 1
+        assert len(stats["rescores_detail"]) == 1
+
+    def test_llm_exception_returns_pre_refine_list(self):
+        """LLM raises Exception → returns original obs, outcome=llm_error, error in stats."""
+        obs = self._make_obs(5)
+        with patch("core.transcript_ingest.call_llm", side_effect=Exception("network timeout")):
+            result, stats = _refine_observations(obs, "synopsis", {})
+        assert result is obs
+        assert stats["outcome"] == "llm_error"
+        assert "network timeout" in stats["error"]
+        assert stats["merges"] == 0
+        assert stats["rescores"] == 0
+
+    def test_json_parse_error_returns_pre_refine_list(self):
+        """LLM returns garbage JSON → returns original obs, outcome=parse_error."""
+        obs = self._make_obs(5)
+        with patch("core.transcript_ingest.call_llm", return_value="not valid json }{"):
+            result, stats = _refine_observations(obs, "synopsis", {})
+        assert result is obs
+        assert stats["outcome"] == "parse_error"
+        assert stats["merges"] == 0
+        assert stats["rescores"] == 0
+
+    def test_missing_refined_key_returns_pre_refine_list(self):
+        """Valid JSON but missing 'refined' key → returns original obs, outcome=missing_refined."""
+        import json
+        obs = self._make_obs(5)
+        llm_response = json.dumps({"merges": [], "rescores": []})
+        with patch("core.transcript_ingest.call_llm", return_value=llm_response):
+            result, stats = _refine_observations(obs, "synopsis", {})
+        assert result is obs
+        assert stats["outcome"] == "missing_refined"
+        assert stats["merges"] == 0
+        assert stats["rescores"] == 0
+
+    def test_integration_refine_true_populates_report(self):
+        """extract_observations_hierarchical with refine=True populates report['refine']."""
+        import json
+        from unittest.mock import MagicMock
+        from core.transcript_ingest import extract_observations_hierarchical
+        from core.extraction_affect import WindowAffect
+
+        # 5 obs with distinct content so dedup keeps all (>3 triggers refine)
+        topics = ["authentication", "database", "caching", "networking", "logging"]
+        obs_list = [
+            {"content": f"{t} configuration uses tls", "facts": [f"{t} requires ssl cert"], "importance": 0.5}
+            for t in topics
+        ]
+        batch_response = json.dumps(obs_list)
+
+        fake_affect = MagicMock(spec=WindowAffect)
+        fake_affect.max_boost = 0.1
+        fake_affect.valence = "neutral"
+        fake_affect.has_repetition = False
+        fake_affect.has_pushback = False
+        fake_affect.evidence_quotes = []
+        fake_affect.importance_prior = 0.0
+        fake_affect.to_dict.return_value = {"valence": "neutral", "max_boost": 0.1}
+
+        refined_obs = obs_list[:4]
+        refined_response = json.dumps({
+            "refined": refined_obs,
+            "merges": [{"merged_into_index": 0, "from_indices": [4], "reason": "dup"}],
+            "rescores": [],
+        })
+
+        with patch("core.transcript_ingest.iter_windows", return_value=["window text"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[batch_response]), \
+             patch("core.transcript_ingest.call_llm", return_value=refined_response), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis text"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], refined_obs, {"outcome": "ok", "card_count": 0, "orphan_count": 4})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                refine=True,
+            )
+
+        assert "refine" in result
+        assert result["refine"]["outcome"] == "ok"
+
+    def test_integration_refine_false_returns_skipped(self):
+        """extract_observations_hierarchical with refine=False sets report['refine']['outcome'] == 'skipped'."""
+        import json
+        from unittest.mock import MagicMock
+        from core.transcript_ingest import extract_observations_hierarchical
+        from core.extraction_affect import WindowAffect
+
+        obs_list = [{"content": "obs", "facts": ["fact"], "importance": 0.5}]
+        batch_response = json.dumps(obs_list)
+
+        fake_affect = MagicMock(spec=WindowAffect)
+        fake_affect.max_boost = 0.0
+        fake_affect.valence = "neutral"
+        fake_affect.has_repetition = False
+        fake_affect.has_pushback = False
+        fake_affect.evidence_quotes = []
+        fake_affect.importance_prior = 0.0
+        fake_affect.to_dict.return_value = {"valence": "neutral", "max_boost": 0.0}
+
+        with patch("core.transcript_ingest.iter_windows", return_value=["window text"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[batch_response]), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis text"):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                refine=False,
+            )
+
+        assert "refine" in result
+        assert result["refine"]["outcome"] == "skipped"
