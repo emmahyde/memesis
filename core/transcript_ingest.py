@@ -21,17 +21,31 @@ indexing, but functionally this implements elaborative curation
 """
 
 import fcntl
+import hashlib
 import json
 import logging
 import time
 from datetime import date
 from pathlib import Path
 
-from core.transcript import read_transcript_from, summarize
+from core.transcript import (
+    read_transcript_from,
+    summarize,
+    iter_windows,
+    iter_user_anchored_windows,
+)
 from core.cursors import CursorStore
-from core.llm import call_llm
+from core.llm import call_llm, call_llm_batch
 from core.prompts import OBSERVATION_EXTRACT_PROMPT, OBSERVATION_TYPES, format_observation
 from core.session_detector import detect_session_type
+from core.extraction_affect import aggregate_window_affect, apply_affect_prior, WindowAffect
+from core.issue_cards import synthesize_issue_cards
+from core.self_reflection_extraction import (
+    ExtractionRunStats,
+    reflect_on_extraction,
+    select_chunking,
+    build_self_model_preamble,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +89,11 @@ def _write_ingest_trace(outcome: str, reason: str, raw_excerpt: str) -> None:
         pass
 
 
-def extract_observations(rendered: str, session_type: str = "code") -> list[dict]:
+def extract_observations(
+    rendered: str,
+    session_type: str = "code",
+    drop_stats: dict | None = None,
+) -> list[dict]:
     """Call LLM to extract observations; filter low-importance entries.
 
     Handles two LLM response formats:
@@ -88,6 +106,11 @@ def extract_observations(rendered: str, session_type: str = "code") -> list[dict
         rendered: Summarised transcript slice text.
         session_type: 'code', 'writing', or 'research' — injected into Stage 1
                       prompt context block so the LLM knows the session genre.
+        drop_stats: optional mutable dict; if provided, the count of obs
+                    filtered by the importance < 0.3 gate is added to
+                    drop_stats["low_importance_dropped"] (key created if absent).
+                    Phase E audit (2026-04-28) added this so the silent
+                    importance drop is observable downstream.
     """
     raw = call_llm(OBSERVATION_EXTRACT_PROMPT.format(transcript=rendered, session_type=session_type))
     try:
@@ -98,7 +121,13 @@ def extract_observations(rendered: str, session_type: str = "code") -> list[dict
 
     if isinstance(parsed, list):
         # Existing behavior — array of observations (may be empty).
-        return [o for o in parsed if o.get("importance", 0) >= 0.3]
+        kept = [o for o in parsed if o.get("importance", 0) >= 0.3]
+        if drop_stats is not None:
+            drop_stats["low_importance_dropped"] = (
+                drop_stats.get("low_importance_dropped", 0)
+                + (len(parsed) - len(kept))
+            )
+        return kept
 
     if isinstance(parsed, dict):
         if parsed.get("skipped") is True:
@@ -128,6 +157,286 @@ def extract_observations(rendered: str, session_type: str = "code") -> list[dict
     return []
 
 
+def _parse_extract_response(
+    raw: str,
+    *,
+    affect=None,
+    drop_stats: dict | None = None,
+) -> list[dict]:
+    """Parse a Stage 1 LLM response with the same semantics as extract_observations.
+
+    Returns the observation list (possibly empty after filter / on skip).
+    Raises only json.JSONDecodeError-equivalent on malformed input — the
+    caller decides how to count parse_errors. Otherwise mirrors the skip /
+    rejected / unexpected-type handling of extract_observations() so the
+    batched and one-at-a-time paths produce identical outputs.
+
+    drop_stats: optional mutable dict; receives "low_importance_dropped"
+                accumulating count of obs filtered at importance < 0.3
+                (Phase E audit instrumentation, 2026-04-28).
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("_parse_extract_response: JSON decode failed: %s", exc)
+        return []
+
+    if isinstance(parsed, list):
+        kept = [o for o in parsed if o.get("importance", 0) >= 0.3]
+        if drop_stats is not None:
+            drop_stats["low_importance_dropped"] = (
+                drop_stats.get("low_importance_dropped", 0)
+                + (len(parsed) - len(kept))
+            )
+        return kept
+
+    if isinstance(parsed, dict):
+        if parsed.get("skipped") is True:
+            reason = parsed.get("reason", "(no reason given)")
+            logger.info("_parse_extract_response: intentional skip — %s", reason)
+            _write_ingest_trace("skipped", reason, raw[:80])
+            return []
+        logger.warning(
+            "_parse_extract_response: LLM returned a dict without 'skipped' key — treating as malformed"
+        )
+        _write_ingest_trace("rejected", "dict response without skipped=true", raw[:80])
+        return []
+
+    logger.warning(
+        "_parse_extract_response: unexpected parsed type %s — discarding",
+        type(parsed).__name__,
+    )
+    return []
+
+
+def _normalize_for_dedupe(text: str) -> frozenset[str]:
+    """Lower-case word-set for dedup. Drops short words and punctuation."""
+    import re
+    words = re.findall(r"[a-z][a-z0-9_]{2,}", text.lower())
+    return frozenset(words)
+
+
+def _dedupe_observations(observations: list[dict]) -> tuple[list[dict], int]:
+    """Deduplicate observations across windows using normalized content hash. Keeps highest-importance copy.
+
+    Builds hash key via _normalize_for_dedupe so case and punctuation differences
+    are collapsed before comparison. Only catches exact / normalized-exact duplicates.
+    Paraphrases are intentionally passed through to Stage 1.5 synthesis which handles
+    semantic dedup.
+
+    Returns (deduped, n_dropped).
+    """
+    seen: dict[str, int] = {}  # hash -> index in kept
+    kept: list[dict] = []
+    dropped = 0
+    for obs in observations:
+        content = obs.get("content", "")
+        facts_str = " ".join(obs.get("facts", []) or [])
+        normalized = _normalize_for_dedupe(f"{content} {facts_str}")
+        if not normalized:
+            kept.append(obs)
+            continue
+        key = hashlib.md5(",".join(sorted(normalized)).encode()).hexdigest()
+        if key not in seen:
+            seen[key] = len(kept)
+            kept.append(obs)
+        else:
+            if obs.get("importance", 0) > kept[seen[key]].get("importance", 0):
+                kept[seen[key]] = obs
+            dropped += 1
+    return kept, dropped
+
+
+def extract_observations_hierarchical(
+    entries: list[dict],
+    session_type: str = "code",
+    *,
+    window_chars: int = 16000,
+    stride_chars: int = 12800,
+    max_windows: int = 10,
+    refine: bool = True,
+    chunking: str = "stride",
+    context_before: int = 2,
+    context_after: int = 8,
+) -> dict:
+    """Map-reduce extraction over overlapping windows.
+
+    Method (academically grounded):
+      - Map: extract_observations() per overlapping window (Beltagy 2020,
+        Wu 2021 hierarchical book summarization).
+      - Reduce: content-hash exact-duplicate dedup across windows,
+        keeping the highest-importance copy of each duplicate cluster.
+
+    Window sizing avoids the lost-in-the-middle U-shape (Liu 2023) by
+    keeping each call below ~30% of the model's effective attention range.
+
+    Returns:
+        {
+          "observations": list[dict],         # deduped final set
+          "windows": int,                     # how many LLM calls made
+          "raw_count": int,                   # pre-dedup observation count
+          "dropped_duplicates": int,
+          "skips": list[dict],                # per-window skip records
+        }
+    """
+    if chunking == "user_anchored":
+        windows = iter_user_anchored_windows(
+            entries,
+            context_before=context_before,
+            context_after=context_after,
+            max_chars_per_window=window_chars,
+            max_windows=max_windows,
+        )
+    else:
+        windows = iter_windows(
+            entries,
+            window_chars=window_chars,
+            stride_chars=stride_chars,
+            max_windows=max_windows,
+        )
+    if not windows:
+        return {
+            "observations": [],
+            "windows": 0,
+            "raw_count": 0,
+            "dropped_duplicates": 0,
+            "skips": [],
+        }
+
+    all_obs: list[dict] = []
+    skips: list[dict] = []
+    affect_signals: list[WindowAffect] = [
+        aggregate_window_affect(w) for w in windows
+    ]
+    productive_windows = 0
+    parse_errors = 0
+    cost_calls = 0
+    drop_stats: dict = {"low_importance_dropped": 0}
+
+    # Concurrent LLM batch — agent-SDK serializes OAuth refresh internally
+    # so this no longer races against itself the way raw subprocess did.
+    prompts = [
+        OBSERVATION_EXTRACT_PROMPT.format(transcript=w, session_type=session_type)
+        for w in windows
+    ]
+    raw_responses = call_llm_batch(prompts, max_concurrency=4)
+
+    for i, (w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):
+        if raw.startswith("[ERROR]"):
+            logger.warning("hierarchical: window %d/%d failed: %s",
+                           i + 1, len(windows), raw[:200])
+            skips.append({
+                "window_index": i,
+                "outcome": "exception",
+                "reason": raw[:300],
+                "affect_intensity": affect.max_boost,
+                "affect_valence": affect.valence,
+            })
+            parse_errors += 1
+            continue
+        cost_calls += 1
+        try:
+            obs = _parse_extract_response(raw, affect=affect, drop_stats=drop_stats)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("hierarchical: window %d/%d parse failed: %s",
+                           i + 1, len(windows), exc)
+            skips.append({"window_index": i, "outcome": "parse_error", "reason": str(exc)})
+            parse_errors += 1
+            continue
+        if obs:
+            productive_windows += 1
+            apply_affect_prior(obs, affect)
+        else:
+            skips.append({
+                "window_index": i,
+                "outcome": "empty_or_skipped",
+                "affect_intensity": affect.max_boost,
+                "affect_valence": affect.valence,
+            })
+        all_obs.extend(obs)
+        logger.info(
+            "hierarchical: window %d/%d → %d obs (affect=%s/%.2f)",
+            i + 1, len(windows), len(obs), affect.valence, affect.max_boost,
+        )
+
+    deduped, dropped = _dedupe_observations(all_obs)
+
+    # Stage 1.5 — issue-card synthesis (replaces Wu 2021 refine)
+    cards: list[dict] = []
+    orphans: list[dict] = deduped
+    synthesis_stats: dict = {"outcome": "skipped"}
+    if refine and deduped:
+        synopsis = summarize(entries, max_chars=6000)
+        affect_summary = _aggregate_session_affect(affect_signals)
+        cards, orphans, synthesis_stats = synthesize_issue_cards(
+            deduped, synopsis, session_affect_summary=affect_summary
+        )
+        if synthesis_stats.get("outcome") == "ok":
+            cost_calls += 1
+            logger.info(
+                "issue_synthesis: %d→%d cards + %d orphans",
+                len(deduped), synthesis_stats.get("card_count", 0),
+                synthesis_stats.get("orphan_count", 0),
+            )
+        else:
+            logger.info("issue_synthesis: %s — keeping flat obs as orphans",
+                        synthesis_stats.get("outcome"))
+
+    return {
+        "observations": orphans,  # flat fallback / orphans
+        "issue_cards": cards,
+        "windows": len(windows),
+        "raw_count": len(all_obs),
+        "dropped_duplicates": dropped,
+        "low_importance_dropped": drop_stats.get("low_importance_dropped", 0),
+        "post_dedupe_count": len(deduped),
+        "synthesis": synthesis_stats,
+        "skips": skips,
+        "affect_signals": [a.to_dict() for a in affect_signals],
+        "productive_windows": productive_windows,
+        "parse_errors": parse_errors,
+        "cost_calls": cost_calls,
+    }
+
+
+def _aggregate_session_affect(signals: list[WindowAffect]) -> dict:
+    """Roll up per-window affect into a session-level summary.
+
+    Used as input to issue-card synthesis so the LLM can attribute
+    user_reaction even on cards drawn from multiple windows.
+    """
+    if not signals:
+        return {"valence": "neutral", "intensity": 0.0}
+    valences = [s.valence for s in signals if s.valence != "neutral"]
+    counts: dict[str, int] = {}
+    for v in valences:
+        counts[v] = counts.get(v, 0) + 1
+    dominant = (
+        max(counts.items(), key=lambda x: x[1])[0]
+        if counts else "neutral"
+    )
+    if "friction" in counts and "delight" in counts:
+        dominant = "mixed"
+    quotes: list[str] = []
+    for s in signals:
+        for q in s.evidence_quotes:
+            if q not in quotes:
+                quotes.append(q)
+            if len(quotes) >= 6:
+                break
+        if len(quotes) >= 6:
+            break
+    return {
+        "dominant_valence": dominant,
+        "max_intensity": max(s.max_boost for s in signals),
+        "any_repetition": any(s.has_repetition for s in signals),
+        "any_pushback": any(s.has_pushback for s in signals),
+        "evidence_quotes": quotes,
+        "windows_with_signal": sum(1 for s in signals if s.max_boost > 0),
+        "windows_total": len(signals),
+    }
+
+
 def append_to_ephemeral(
     memory_dir: Path,
     observations: list[dict],
@@ -140,9 +449,22 @@ def append_to_ephemeral(
     target = memory_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
     lines = []
     for obs in observations:
+        # W5 lean schema: facts[] is the canonical field. obs["content"] is
+        # the legacy pre-W5 single-string field. Support both for backward
+        # compatibility with any in-flight ephemeral writers.
+        if "facts" in obs and isinstance(obs["facts"], list):
+            content_text = "\n".join(f"- {f}" for f in obs["facts"] if f)
+        elif "content" in obs:
+            content_text = obs["content"]
+        else:
+            continue  # malformed observation — skip rather than crash
+        kind = obs.get("kind")
         mode = obs.get("mode")
-        obs_type = mode if mode in OBSERVATION_TYPES else None
-        lines.append(format_observation(obs["content"], obs_type=obs_type))
+        # Prefer W5 'kind'; fall back to legacy 'mode' for ephemeral header tag.
+        obs_type = kind if kind in OBSERVATION_TYPES else (
+            mode if mode in OBSERVATION_TYPES else None
+        )
+        lines.append(format_observation(content_text, obs_type=obs_type))
 
     formatted_text = "\n".join(lines) + "\n"
 
