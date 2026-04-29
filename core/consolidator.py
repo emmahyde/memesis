@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .database import get_base_dir, get_vec_store
+from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
 from .linking import link_memory as _link_memory
 from .llm import call_llm as _call_llm_transport
@@ -507,6 +508,19 @@ class Consolidator:
                 raise ValueError(f"Duplicate content detected (hash: {content_hash})")
 
             now = datetime.now().isoformat()
+
+            # Card→memory field promotion (Task 3.1): detect card-shaped decisions
+            is_card = "scope" in decision or "evidence_quotes" in decision
+            if is_card:
+                card_fields = extract_card_memory_fields(decision)
+            else:
+                card_fields = {
+                    "temporal_scope": None,
+                    "confidence": None,
+                    "affect_valence": None,
+                    "actor": None,
+                }
+
             mem = Memory.create(
                 stage="consolidated",
                 title=title,
@@ -519,6 +533,10 @@ class Consolidator:
                 updated_at=now,
                 source_session=session_id,
                 content_hash=content_hash,
+                temporal_scope=card_fields["temporal_scope"],
+                confidence=card_fields["confidence"],
+                affect_valence=card_fields["affect_valence"],
+                actor=card_fields["actor"],
             )
             memory_id = mem.id
 

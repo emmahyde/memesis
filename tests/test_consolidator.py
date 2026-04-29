@@ -787,3 +787,109 @@ class TestContradictionResolution:
         assert any(t.startswith("scope:") for t in tags)
         assert "relative" in updated.content.lower()
         assert updated.archived_at is None
+
+
+# ---------------------------------------------------------------------------
+# TestCardToMemoryPromotion — Task 3.1 acceptance criteria
+# ---------------------------------------------------------------------------
+
+class TestCardToMemoryPromotion:
+    """Verify that card fields are promoted to Memory columns during KEEP decisions."""
+
+    def _card_decision(self, **overrides) -> dict:
+        """Return a minimal card-shaped KEEP decision with given overrides."""
+        base = {
+            "observation": "The team approved the new schema design.",
+            "action": "keep",
+            "rationale": "Important architectural decision.",
+            "title": "Schema approval",
+            "summary": "Schema design approved by team.",
+            "tags": ["schema"],
+            "target_path": "decisions/schema.md",
+            "reinforces": None,
+            "contradicts": None,
+            # Card-shape fields:
+            "scope": "cross-session-durable",
+            "knowledge_type_confidence": "high",
+            "user_affect_valence": "delight",
+            "evidence_quotes": ["Emma approved the design."],
+        }
+        base.update(overrides)
+        return base
+
+    def test_temporal_scope_promoted(self, consolidator, base, ephemeral_file):
+        decision = self._card_decision(scope="cross-session-durable")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "card-001")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.temporal_scope == "cross-session-durable"
+
+    def test_confidence_promoted_high(self, consolidator, base, ephemeral_file):
+        decision = self._card_decision(knowledge_type_confidence="high")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "card-002")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.confidence == pytest.approx(0.9)
+
+    def test_affect_valence_promoted(self, consolidator, base, ephemeral_file):
+        decision = self._card_decision(user_affect_valence="friction")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "card-003")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.affect_valence == "friction"
+
+    def test_actor_extracted_from_quote(self, consolidator, base, ephemeral_file):
+        decision = self._card_decision(
+            evidence_quotes=["Emma approved the design."],
+        )
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "card-004")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.actor == "Emma"
+
+    def test_actor_null_when_no_quote(self, consolidator, base, ephemeral_file):
+        decision = self._card_decision(evidence_quotes=[])
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "card-005")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.actor is None
+
+    def test_non_card_decision_has_null_card_fields(self, consolidator, base, ephemeral_file):
+        """Flat (non-card) decisions must produce None for all four card fields."""
+        decision = {
+            "observation": "User prefers snake_case.",
+            "action": "keep",
+            "rationale": "Style preference.",
+            "title": "snake_case preference",
+            "summary": "Prefer snake_case.",
+            "tags": [],
+            "target_path": "prefs/style.md",
+            "reinforces": None,
+            "contradicts": None,
+            # No scope, evidence_quotes — not a card
+        }
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "card-006")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.temporal_scope is None
+        assert mem.confidence is None
+        assert mem.affect_valence is None
+        assert mem.actor is None
