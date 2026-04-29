@@ -51,6 +51,10 @@ class ParameterOverrides:
     chunking_strategy: str | None = None  # "stride" | "user_anchored" | None=auto
     affect_pre_filter: bool = False  # gate Stage 1 LLM on max_boost > 0
     synthesis_strict: bool = False  # tighter ISSUE_SYNTHESIS_PROMPT (orphan weak obs)
+    prefilter_research_neutral: bool = True  # research-session neutral-affect window skip
+    prefilter_density_threshold_chars: int = 200  # avg chars/entry below = low-density
+    prefilter_ttr_threshold: float = 0.25  # type/token ratio below = self-referential
+    prefilter_observer_density_threshold_chars: int = 400  # observer-cwd density gate
     notes: tuple[str, ...] = ()  # human-readable trace of which rules fired
 
     def with_note(self, note: str) -> ParameterOverrides:
@@ -151,6 +155,62 @@ def _override_cards_unused_high_importance(rec: dict, base: ParameterOverrides) 
     )
 
 
+def _override_monotone_knowledge_lens(rec: dict, base: ParameterOverrides) -> ParameterOverrides:
+    """`monotone_knowledge_lens` confirmed → informational stub.
+
+    When confirmed, extraction is repeatedly collapsing all observations into
+    a single knowledge_type, indicating a classifier collapse or genuinely
+    monothematic sessions. No direct knob yet — the parameter
+    `knowledge_type_diversity_floor` would gate synthesis to require ≥2 distinct
+    types, but that field doesn't exist in the synthesis prompt currently.
+
+    This stub documents the intent and surface the confirmation in audit
+    output so the pattern isn't invisible.
+    """
+    return base.with_note(
+        "monotone_knowledge_lens confirmed → informational (no diversity-floor knob yet)"
+    )
+
+
+def _override_affect_signal_no_extraction(rec: dict, base: ParameterOverrides) -> ParameterOverrides:
+    """`affect_signal_no_extraction` confirmed → informational stub.
+
+    When confirmed, windows with somatic affect signals are consistently
+    failing to produce observation cards. Ideally this would flip an
+    `affect_signal_audit_required` flag causing the pipeline to log
+    those window pairs for prompt-debugging, but that logging path
+    doesn't exist yet.
+
+    This stub records the confirmation in audit output and notes the
+    intended future parameter.
+    """
+    return base.with_note(
+        "affect_signal_no_extraction confirmed → informational (affect_signal_audit_required not yet wired)"
+    )
+
+
+def _override_forced_clustering_low_importance(rec: dict, base: ParameterOverrides) -> ParameterOverrides:
+    """`forced_clustering_low_importance` confirmed → raise synthesis_strict_floor.
+
+    Co-condition: synthesis_overgreedy already confirmed (that rule's override
+    sets synthesis_strict=True). This rule fires when the minimum card importance
+    is also below 0.4 on top of overgreedy clustering.
+
+    The intended knob is `synthesis_strict_floor` — a minimum importance a card
+    must meet to survive strict-mode synthesis. No such field exists in
+    ParameterOverrides today; adding synthesis_strict=True here ensures the strict
+    path is at least engaged, even if the floor isn't numerically enforced yet.
+    """
+    return replace(
+        base,
+        synthesis_strict=True,
+        notes=base.notes + (
+            "forced_clustering_low_importance confirmed → synthesis_strict=True "
+            "(synthesis_strict_floor=0.4 pending prompt wiring)",
+        ),
+    )
+
+
 # Registry: rule_id -> override function -------------------------------------
 
 RULE_OVERRIDES: dict[str, Callable[[dict, ParameterOverrides], ParameterOverrides]] = {
@@ -161,6 +221,55 @@ RULE_OVERRIDES: dict[str, Callable[[dict, ParameterOverrides], ParameterOverride
     "synthesis_overgreedy": _override_synthesis_overgreedy,
     "parse_errors_present": _override_parse_errors,
     "cards_unused_high_importance": _override_cards_unused_high_importance,
+    "monotone_knowledge_lens": _override_monotone_knowledge_lens,
+    "affect_signal_no_extraction": _override_affect_signal_no_extraction,
+    "forced_clustering_low_importance": _override_forced_clustering_low_importance,
+}
+
+
+# Metadata for registry_status CLI — describes knobs each rule touches -------
+
+RULE_METADATA: dict[str, dict] = {
+    "chunking_suboptimal": {
+        "knobs": ["chunking_strategy"],
+        "note": "Sets chunking_strategy via select_chunking() bidirectional logic.",
+    },
+    "low_productive_rate": {
+        "knobs": ["max_windows", "affect_pre_filter"],
+        "note": "Caps max_windows=6; enables affect pre-filter to reduce LLM spend.",
+    },
+    "affect_blind_spot": {
+        "knobs": [],
+        "note": "Informational; _merge_card_affect overlay runs unconditionally.",
+    },
+    "dedup_inert": {
+        "knobs": [],
+        "note": "STUB — no Jaccard/cosine knob yet; MD5 exact-hash only.",
+    },
+    "synthesis_overgreedy": {
+        "knobs": ["synthesis_strict"],
+        "note": "Sets synthesis_strict=True; tightens orphan pressure in synthesis.",
+    },
+    "parse_errors_present": {
+        "knobs": ["max_tokens_stage1"],
+        "note": "Bumps max_tokens_stage1 to 12288 to reduce truncation parse errors.",
+    },
+    "cards_unused_high_importance": {
+        "knobs": ["importance_gate"],
+        "note": "Raises importance_gate to 0.45 when high-imp cards go unused.",
+    },
+    "monotone_knowledge_lens": {
+        "knobs": [],
+        "note": "STUB — knowledge_type_diversity_floor not yet wired in synthesis.",
+    },
+    "affect_signal_no_extraction": {
+        "knobs": [],
+        "note": "STUB — affect_signal_audit_required logging path not yet wired.",
+    },
+    "forced_clustering_low_importance": {
+        "knobs": ["synthesis_strict"],
+        "note": "Sets synthesis_strict=True; synthesis_strict_floor=0.4 pending prompt wiring.",
+    },
 }
 
 
