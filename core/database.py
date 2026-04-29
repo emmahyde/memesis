@@ -323,6 +323,15 @@ def _run_migrations():
             except Exception:
                 pass
 
+    # retrieval_log composite index for cards_unused_high_importance cross-session join
+    try:
+        db.execute_sql(
+            "CREATE INDEX IF NOT EXISTS idx_retrieval_log_memid_session "
+            "ON retrieval_log(memory_id, session_id, was_used)"
+        )
+    except Exception:
+        pass
+
     # Schema version bump — idempotent: only write if current < target
     try:
         cursor = db.execute_sql("PRAGMA user_version")

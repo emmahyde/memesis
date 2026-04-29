@@ -335,9 +335,9 @@ class FeedbackLoop:
 
           - `cards_unused_high_importance` — at least N cards with
             `importance >= threshold` in the lookback window have never been
-            retrieved (no RetrievalLog entry with `was_used=1`). Refutes the
-            celebratory `issue_card_collapse_efficient` rule when the cards
-            it celebrates aren't actually useful.
+            retrieved (no RetrievalLog entry with `was_used=1`). Detects
+            high-confidence extraction that produces cards never actually
+            used downstream — the closed-loop quality signal.
 
           - `extraction_under_retrieval_pressure` — there are repeated
             `injected` retrievals (≥3) that resulted in no `was_used=1`
@@ -477,6 +477,68 @@ class FeedbackLoop:
             return False
 
         return all(v == 0 for v in usage_vals)
+
+
+def cards_unused_in_subsequent_sessions(
+    source_session_id: str,
+    importance_threshold: float = 0.8,
+    lookahead_sessions: int = 10,
+) -> list[str]:
+    """Return memory IDs from `source_session_id` with importance >= threshold
+    that have NOT been retrieved in any of the next `lookahead_sessions`
+    distinct sessions following the source session.
+
+    Returns empty list if not enough subsequent sessions exist yet
+    (no false positives on recent sessions).
+    """
+    # Get all high-importance memories from the source session
+    high_imp = list(
+        Memory.select()
+        .where(
+            (Memory.source_session == source_session_id)
+            & (Memory.importance >= importance_threshold)
+        )
+    )
+    if not high_imp:
+        return []
+
+    # Find the most recent created_at among those memories to use as the
+    # cutoff for "subsequent sessions"
+    cutoff_ts = max(m.created_at or "" for m in high_imp)
+
+    # Get distinct subsequent session_ids from RetrievalLog in chronological order
+    subsequent_rows = (
+        RetrievalLog.select(RetrievalLog.session_id, fn.MIN(RetrievalLog.timestamp).alias("first_ts"))
+        .where(
+            RetrievalLog.session_id != source_session_id,
+            RetrievalLog.timestamp > cutoff_ts,
+        )
+        .group_by(RetrievalLog.session_id)
+        .order_by(fn.MIN(RetrievalLog.timestamp))
+        .limit(lookahead_sessions)
+    )
+    subsequent_sessions = [row.session_id for row in subsequent_rows]
+
+    if len(subsequent_sessions) < lookahead_sessions:
+        # Not enough lookahead — avoid false positives on recent sessions
+        return []
+
+    # For each high-importance memory, check if retrieved (was_used=True) in any subsequent session
+    unused_ids: list[str] = []
+    for mem in high_imp:
+        was_retrieved = (
+            RetrievalLog.select()
+            .where(
+                RetrievalLog.memory_id == mem.id,
+                RetrievalLog.session_id.in_(subsequent_sessions),
+                RetrievalLog.was_used == 1,
+            )
+            .exists()
+        )
+        if not was_retrieved:
+            unused_ids.append(mem.id)
+
+    return unused_ids
 
 
 def _record_usage(memory_id: str, session_id: str) -> None:
