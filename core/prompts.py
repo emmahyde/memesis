@@ -151,7 +151,25 @@ work_event — only when the observation traces directly to a discrete code acti
   bugfix | feature | refactor | discovery | change
   Set to null for preference, constraint, correction, and open_question observations.
   Most observations should have work_event=null. Do not hallucinate a code action.
-  Set work_event=null when session_type != 'code' (writing and research sessions have no code actions).
+
+  HARD RULE — work_event MUST be null when session_type != 'code'.
+  Research and writing sessions have no code actions; assigning bugfix/feature/refactor
+  to them is hallucination. The post-parse layer will null these out and log a
+  violation, but you should not produce them in the first place.
+
+  WRONG (session_type=research):
+    {{"facts": ["Emma compared mem0 vs zep across recall benchmarks"],
+      "work_event": "discovery"}}        ← wrong: no code action occurred
+  RIGHT (session_type=research):
+    {{"facts": ["Emma compared mem0 vs zep across recall benchmarks"],
+      "work_event": null}}
+
+  WRONG (session_type=writing):
+    {{"facts": ["Emma rewrote chapter 3 opening for tighter pacing"],
+      "work_event": "refactor"}}         ← wrong: refactor is a code term
+  RIGHT (session_type=writing):
+    {{"facts": ["Emma rewrote chapter 3 opening for tighter pacing"],
+      "work_event": null}}
 
 subtitle — ≤24 words. Acts as a retrieval card: enough context to judge relevance without
   loading full content. Do not exceed 24 words.
@@ -280,6 +298,7 @@ OBSERVATION_EXTRACT_PROMPT = """Extract every durable observation that passes th
 
 Session type: {session_type}
 
+{affect_hint}
 A short slice may have zero qualifying observations. A dense one may have many.
 Quality, not quota.
 
@@ -296,6 +315,30 @@ Skip:
 - File reads with no conclusion drawn
 - Status checks, test runs that passed without incident
 - Anything obvious from the codebase itself
+
+---
+
+SESSION_TYPE GUIDANCE — what counts as durable depends on session_type:
+
+  code      — durable: bugfixes with diagnosed root cause, refactor decisions with
+              rationale, performance findings, API/contract corrections, build/test
+              gotchas, configuration constraints. Skip: green test runs, file
+              navigation, tool call traces without a conclusion.
+
+  research  — durable: conceptual outcomes ("X library uses Y mechanism because Z"),
+              decisions to adopt/reject an approach, comparisons with explicit
+              trade-offs, prior-art findings that change future direction. Skip: raw
+              search results, tool calls, summaries of pages without a synthesis,
+              "looked at X" without a takeaway. A research session can have many
+              durable observations even if no code changed — bias toward extracting
+              conceptual findings over skipping. Force work_event=null.
+
+  writing   — durable: authoring decisions (structure, voice, scene order), aesthetic choices
+              with rationale, rejected options with reason, style commitments, named characters/locations
+              with established traits. Skip: aesthetic preferences without rationale,
+              one-off word choices, summaries of what was written.
+
+  general   — apply the QUALITY GATE directly without session-type bias.
 
 ---
 
@@ -350,6 +393,14 @@ optimized, added, refactored, discovered, confirmed, traced.
   NO:  "It uses Y" — use "The validator uses dataclass-based schema"
   NO:  "They migrated" — use "The memesis team migrated"
 
+ANTI-INVENTION RULE (per-observation, not just per-fact):
+  DO NOT invent observations the transcript does not support. Every observation
+  you emit must be grounded in the transcript: at minimum one of its facts must
+  paraphrase a span actually present in the transcript above, AND its kind/
+  knowledge_type must follow from what was said or done — not from plausible
+  surrounding context. If you cannot point to the span the observation is built
+  from, do not emit it. Skip is cheaper than confabulation.
+
 ---
 
 RETIRED VOCABULARY — DO NOT USE these legacy values, they will be rejected:
@@ -360,18 +411,58 @@ RETIRED VOCABULARY — DO NOT USE these legacy values, they will be rejected:
 
 ---
 
-IMPORTANCE ANCHORS:
-  0.2  routine finding ("this module uses pytest")
-  0.5  useful context ("auth tokens stored in Redis with 24h TTL")
-  0.8  load-bearing decision ("chose cron over hooks to avoid blocking the hook path")
-  0.95 correction or hard constraint ("must call _resolve_db_path before init_db")
+IMPORTANCE — WINDOW-LOCAL SALIENCE ONLY:
+
+  You are looking at ONE window of a longer session. You can judge how prominent
+  this finding is *within this window* — you cannot judge how it compares to
+  observations from other windows you have not seen, nor whether the user
+  reinforces it later. Stage 1.5 owns session-level importance and will rescore
+  with full-session context, the affect summary, and cross-window mentions.
+
+  Your job: emit a window-local salience score in the `importance` field using
+  the anchors below. Do NOT inflate to compensate for "Stage 1.5 might miss this"
+  and do NOT deflate because "this might not matter session-wide". Score what
+  you see, in this window only.
+
+WINDOW-LOCAL SALIENCE ANCHORS:
+  0.2  passing mention, single sentence, no follow-up in the window
+  0.5  discussed once with a concrete outcome in the window
+  0.8  central finding of the window — drove user action or correction
+  0.95 explicit user correction, hard constraint, or load-bearing decision
+
+  Do not bias toward 0.6–0.85 just to be "safe". Use 0.2 freely for window-local
+  background facts; Stage 1.5 will promote them if they recur across windows.
 
 ---
 
+SKIP DISCIPLINE: Before deciding to skip a window, name one specific
+observation you evaluated and rejected (with your reason). A skip without
+a named candidate is a refusal to engage, not a judgment.
+
 SKIP PROTOCOL:
-If this slice has no qualifying observation, return:
-  {{"skipped": true, "reason": "<one sentence>"}}
+A skip is a real cost: the LLM call to read this window has already happened.
+Before skipping, sweep the slice once more for ANY durable signal — a passing aside,
+a constraint mentioned in passing, a rejected option, a configuration value used.
+Bias toward extracting one low-importance observation over skipping outright.
+
+If — after that sweep — the slice still has no qualifying observation, you MUST
+return a structured skip with `considered` listing every candidate fact you swept
+and rejected. The `considered` list must be non-empty — if you can name nothing
+you looked at, that signals the sweep was skipped, not the window.
+
+  {{"skipped": true,
+    "failed_gate": "<falsifiable|durable|novel|load_bearing>",
+    "reason": "<one sentence naming what the slice contained instead>",
+    "considered": ["brief description of each fact/span you evaluated and rejected"]}}
+
+The failed_gate field MUST be the FIRST quality-gate criterion the slice failed.
 Do NOT return an empty array — that signals extraction failure, not intentional skip.
+Affect signals (pushback / repetition / non-neutral valence) override skip: if the
+AFFECT HINT shows any of those, you MUST extract at least one observation.
+
+A skip without `considered`, or where `considered` is empty, will be treated by the
+parser as a downgraded skip — the affect signal is preserved and logged as a warning
+rather than silently discarded.
 
 ---
 
@@ -391,8 +482,8 @@ Array form:
   }}
 ]
 
-Skip form:
-{{"skipped": true, "reason": "no durable signal in this slice"}}
+Skip form (considered list REQUIRED):
+{{"skipped": true, "failed_gate": "durable", "reason": "slice contained only passing test output", "considered": ["test suite ran green — no root-cause or finding attached"]}}
 
 Session slice:
 {transcript}

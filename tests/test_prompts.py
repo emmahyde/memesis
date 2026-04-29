@@ -12,8 +12,6 @@ Asserts:
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import core.prompts as prompts_module
@@ -133,6 +131,7 @@ class TestStage1PromptStructure:
         formatted = OBSERVATION_EXTRACT_PROMPT.format(
             transcript="mock session content",
             session_type="code",
+            affect_hint="",
         )
         assert "mock session content" in formatted
 
@@ -201,7 +200,6 @@ class TestStage2PromptStructure:
         assert '"contradicts"' in CONSOLIDATION_PROMPT
 
     def test_empty_buffer_returns_decisions_array(self):
-        lower = CONSOLIDATION_PROMPT.lower()
         assert '"decisions": []' in CONSOLIDATION_PROMPT or '{"decisions": []}' in CONSOLIDATION_PROMPT
 
     def test_no_concept_tags_in_output_schema(self):
@@ -220,6 +218,50 @@ class TestStage2PromptStructure:
         )
         assert "observation 1" in formatted
         assert "existing memories" in formatted
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2 — Session-type extraction guidance + skip-friction
+# ---------------------------------------------------------------------------
+
+
+class TestSessionTypeGuidance:
+    def test_research_guidance_present(self):
+        assert "research" in OBSERVATION_EXTRACT_PROMPT
+        # work_event=null guidance must appear in the prompt (via SESSION_TYPE GUIDANCE)
+        assert "work_event=null" in OBSERVATION_EXTRACT_PROMPT
+
+    def test_writing_guidance_present(self):
+        assert "writing" in OBSERVATION_EXTRACT_PROMPT
+        assert "aesthetic choices" in OBSERVATION_EXTRACT_PROMPT
+
+    def test_skip_friction_present(self):
+        # "name one specific" must appear before the skip sentinel ({{"skipped": true, ...}})
+        skip_sentinel = '{{"skipped": true,'
+        friction_phrase = "name one specific"
+        prompt = OBSERVATION_EXTRACT_PROMPT
+        assert friction_phrase in prompt, f"'{friction_phrase}' not found in OBSERVATION_EXTRACT_PROMPT"
+        friction_pos = prompt.index(friction_phrase)
+        sentinel_pos = prompt.index(skip_sentinel)
+        assert friction_pos < sentinel_pos, (
+            "SKIP DISCIPLINE ('name one specific') must appear before the skip sentinel"
+        )
+
+    def test_no_new_format_placeholders(self):
+        # Ensure no new {placeholder} keys were introduced beyond the expected set
+        import re
+        # Find all {word} patterns (single-word placeholders, not {{ or }})
+        placeholders = set(re.findall(r'(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})', OBSERVATION_EXTRACT_PROMPT))
+        expected = {"session_type", "affect_hint", "transcript"}
+        assert placeholders <= expected, (
+            f"Unexpected format placeholders introduced: {placeholders - expected}"
+        )
+
+    def test_session_type_guidance_block_header(self):
+        assert "SESSION_TYPE GUIDANCE" in OBSERVATION_EXTRACT_PROMPT or "SESSION-TYPE EXTRACTION GUIDANCE" in OBSERVATION_EXTRACT_PROMPT
+
+    def test_code_session_type_guidance_present(self):
+        assert "code" in OBSERVATION_EXTRACT_PROMPT
 
 
 # ---------------------------------------------------------------------------
