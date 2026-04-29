@@ -757,13 +757,13 @@ class TestPrefilterResearchNeutral:
         assert result["prefilter_skipped_count"] == 0
 
     def test_constant_false_disables_gate(self, monkeypatch):
-        """Setting PREFILTER_RESEARCH_NEUTRAL=False disables the gate entirely."""
+        """ParameterOverrides.prefilter_research_neutral=False disables the gate entirely."""
         import json
         from unittest.mock import patch
         from core.transcript_ingest import extract_observations_hierarchical
-        import core.transcript_ingest as ti
+        from core.rule_registry import ParameterOverrides
 
-        monkeypatch.setattr(ti, "PREFILTER_RESEARCH_NEUTRAL", False)
+        overrides = ParameterOverrides(prefilter_research_neutral=False)
 
         fake_affect = self._make_fake_affect(max_boost=0.0)
         obs_response = json.dumps([])
@@ -778,6 +778,7 @@ class TestPrefilterResearchNeutral:
                 [{"type": "user", "message": {"role": "user", "content": "hi"}}],
                 session_type="research",
                 refine=False,
+                overrides=overrides,
             )
 
         # With gate disabled, both windows go to LLM
@@ -831,3 +832,277 @@ class TestPrefilterResearchNeutral:
 
         assert "prefilter_skipped_count" in result2
         assert result2["prefilter_skipped_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Reframe A — stateful incremental extraction (Task 4.1)
+# ---------------------------------------------------------------------------
+
+
+class TestReframeA:
+    """Tests for REFRAME_A_ENABLED flag and in-session vector index behavior.
+
+    All tests mock core.embeddings.embed_text — no real Bedrock calls.
+    Mock vectors use small deterministic bytes matching _DIM=512 floats.
+    """
+
+    def _make_fake_affect(self, max_boost: float = 0.0, valence: str = "neutral"):
+        from unittest.mock import MagicMock
+        from core.extraction_affect import WindowAffect
+
+        a = MagicMock(spec=WindowAffect)
+        a.max_boost = max_boost
+        a.valence = valence
+        a.has_repetition = False
+        a.has_pushback = False
+        a.evidence_quotes = []
+        a.importance_prior = 0.0
+        a.to_dict.return_value = {"valence": valence, "max_boost": max_boost}
+        return a
+
+    def _embed_a(self) -> bytes:
+        """Deterministic 512-float embedding bytes for 'topic A'."""
+        import struct
+        floats = [1.0] + [0.0] * 511
+        return struct.pack(f"512f", *floats)
+
+    def _embed_b(self) -> bytes:
+        """Deterministic 512-float embedding bytes for 'topic B' — orthogonal to A."""
+        import struct
+        floats = [0.0, 1.0] + [0.0] * 510
+        return struct.pack(f"512f", *floats)
+
+    def test_disabled_default_no_change(self, tmp_path):
+        """REFRAME_A_ENABLED=False (default) → cross_window_dedup_hits==0, no embed calls."""
+        import json
+        from unittest.mock import patch, MagicMock
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        fake_affect = self._make_fake_affect()
+        obs_response = json.dumps([{"content": "obs", "facts": ["fact1"], "importance": 0.5}])
+
+        with patch.object(ti, "REFRAME_A_ENABLED", False), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [{"content": "obs", "facts": ["fact1"], "importance": 0.5}],
+                                 {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="code",
+                refine=False,
+                session_id="test-session-disabled",
+            )
+
+        assert "cross_window_dedup_hits" in result
+        assert result["cross_window_dedup_hits"] == 0
+
+    def test_cross_window_dedup_hits_in_return(self, tmp_path):
+        """cross_window_dedup_hits key always present in return dict."""
+        import json
+        from unittest.mock import patch
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        fake_affect = self._make_fake_affect()
+        obs_response = json.dumps([])
+
+        with patch.object(ti, "REFRAME_A_ENABLED", False), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                refine=False,
+            )
+
+        assert "cross_window_dedup_hits" in result
+
+    def test_enabled_first_window_no_priors_empty_prior_block(self, tmp_path):
+        """With Reframe A enabled, first window prompt has empty prior_extractions block.
+
+        We verify by capturing what prompt is passed to call_llm_batch and
+        checking that the 'PRIOR EXTRACTIONS' header is NOT present (since
+        no prior obs have been indexed yet for window 0).
+        """
+        import json
+        import struct
+        from unittest.mock import patch, MagicMock
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        try:
+            import sqlite_vec  # noqa: F401
+        except ImportError:
+            pytest.skip("sqlite-vec not available")
+
+        fake_affect = self._make_fake_affect(max_boost=0.1)
+        obs_response = json.dumps([{"content": "obs", "facts": ["auth JWT"], "importance": 0.6}])
+
+        embed_a = self._embed_a()
+        captured_prompts: list[str] = []
+
+        def fake_batch(prompts, **kwargs):
+            captured_prompts.extend(prompts)
+            return [obs_response]
+
+        with patch.object(ti, "REFRAME_A_ENABLED", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["window text"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", side_effect=fake_batch), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [{"content": "obs", "facts": ["auth JWT"], "importance": 0.6}],
+                                 {"outcome": "skipped"})), \
+             patch("core.embeddings.embed_text", return_value=embed_a), \
+             patch("core.database.get_db_path", return_value=tmp_path / "index.db"):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="code",
+                refine=False,
+                session_id="test-session-first-window",
+            )
+
+        assert len(captured_prompts) == 1
+        # First window: no prior extractions yet → PRIOR EXTRACTIONS block absent
+        assert "PRIOR EXTRACTIONS" not in captured_prompts[0]
+
+    def test_enabled_subsequent_window_has_priors(self, tmp_path):
+        """With Reframe A enabled and similar embeddings, second window prompt includes prior obs."""
+        import json
+        import struct
+        from unittest.mock import patch, MagicMock, call as mock_call
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        try:
+            import sqlite_vec  # noqa: F401
+        except ImportError:
+            pytest.skip("sqlite-vec not available")
+
+        fake_affect = self._make_fake_affect(max_boost=0.1)
+        obs_w1 = json.dumps([{"content": "auth", "facts": ["auth uses JWT"], "importance": 0.6}])
+        obs_w2 = json.dumps([{"content": "db", "facts": ["db uses postgres"], "importance": 0.6}])
+        captured_prompts: list[str] = []
+
+        responses = [obs_w1, obs_w2]
+        call_idx = [0]
+
+        def fake_batch(prompts, **kwargs):
+            captured_prompts.extend(prompts)
+            resp = responses[call_idx[0]]
+            call_idx[0] += 1
+            return [resp]
+
+        # Same embedding for both windows and observations → high similarity → second window gets priors
+        embed_same = self._embed_a()
+
+        with patch.object(ti, "REFRAME_A_ENABLED", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1", "win2"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", side_effect=fake_batch), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})), \
+             patch("core.embeddings.embed_text", return_value=embed_same), \
+             patch("core.database.get_db_path", return_value=tmp_path / "index.db"):
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="code",
+                refine=False,
+                session_id="test-session-two-windows",
+            )
+
+        assert len(captured_prompts) == 2
+        # First window: no priors
+        assert "PRIOR EXTRACTIONS" not in captured_prompts[0]
+        # Second window: priors injected (first window obs stored in index)
+        assert "PRIOR EXTRACTIONS" in captured_prompts[1]
+        assert "auth uses JWT" in captured_prompts[1]
+
+        # cross_window_dedup_hits should be >= 1 (second window had prior hits)
+        assert result["cross_window_dedup_hits"] >= 1
+
+    def test_index_cleared_after_extraction(self, tmp_path):
+        """After extract_observations_hierarchical completes with Reframe A, session vec table is gone."""
+        import json
+        import struct
+        from unittest.mock import patch
+        from core.transcript_ingest import extract_observations_hierarchical
+        from core.session_vec import SessionVecStore, _slug
+        import core.transcript_ingest as ti
+
+        try:
+            import apsw
+            import sqlite_vec  # noqa: F401
+        except ImportError:
+            pytest.skip("sqlite-vec not available")
+
+        db_path = tmp_path / "index.db"
+        session_id = "test-clear-session"
+        embed_a = self._embed_a()
+        fake_affect = self._make_fake_affect(max_boost=0.1)
+        obs_response = json.dumps([{"content": "obs", "facts": ["fact"], "importance": 0.5}])
+
+        with patch.object(ti, "REFRAME_A_ENABLED", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]), \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [{"content": "obs", "facts": ["fact"], "importance": 0.5}],
+                                 {"outcome": "skipped"})), \
+             patch("core.embeddings.embed_text", return_value=embed_a), \
+             patch("core.database.get_db_path", return_value=db_path):
+            extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="code",
+                refine=False,
+                session_id=session_id,
+            )
+
+        # After extraction, the table should have been dropped.
+        # We verify by creating a new SessionVecStore pointing at the same DB
+        # and checking that the table doesn't exist (query returns empty without error).
+        store = SessionVecStore(db_path, session_id)
+        # The table will be re-created on __init__ (CREATE VIRTUAL TABLE IF NOT EXISTS),
+        # so the store will be available but the entries should be 0.
+        if store.available:
+            results = store.query_similar(embed_a, k=3)
+            assert results == [], "Expected no entries after table was dropped and recreated"
+            store.drop()
+
+    def test_enabled_no_session_id_falls_back_to_batch(self, tmp_path):
+        """With Reframe A enabled but session_id=None, falls back to standard batch flow."""
+        import json
+        from unittest.mock import patch
+        from core.transcript_ingest import extract_observations_hierarchical
+        import core.transcript_ingest as ti
+
+        fake_affect = self._make_fake_affect()
+        obs_response = json.dumps([])
+
+        with patch.object(ti, "REFRAME_A_ENABLED", True), \
+             patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
+             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]) as mock_batch, \
+             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+             patch("core.transcript_ingest.synthesize_issue_cards",
+                   return_value=([], [], {"outcome": "skipped"})):
+            # session_id=None → Reframe A skips vec initialization
+            result = extract_observations_hierarchical(
+                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                session_type="code",
+                refine=False,
+                session_id=None,
+            )
+
+        # Standard batch flow fires
+        mock_batch.assert_called_once()
+        assert result["cross_window_dedup_hits"] == 0
