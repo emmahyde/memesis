@@ -36,14 +36,35 @@ from core.transcript import (
 )
 from core.cursors import CursorStore
 from core.llm import call_llm, call_llm_batch, _repair_json  # noqa: F401
-from core.prompts import OBSERVATION_EXTRACT_PROMPT, OBSERVATION_TYPES, format_observation
+from core.prompts import (
+    OBSERVATION_EXTRACT_PROMPT,
+    OBSERVATION_TYPES,
+    format_observation,
+    format_extract_prompt,
+    _OBSERVATION_EXTRACT_PROMPT_TEMPLATE,
+    SESSION_TYPE_GUIDANCE,
+)
 from core.session_detector import detect_session_type, RESEARCH_PATH_HINTS_PREPEND
 from core.extraction_affect import aggregate_window_affect, apply_affect_prior, format_affect_hint, WindowAffect
 from core.issue_cards import synthesize_issue_cards
 from core.card_validators import _card_evidence_load_bearing
 from core.rule_registry import ParameterOverrides
 
+# Module-level prefilter knobs are deprecated — settings now live on
+# `ParameterOverrides` (core.rule_registry) so the closed-loop registry can
+# flip them off if a future rule (e.g. prefilter_dropping_signal) confirms
+# the gate is over-aggressive. Constants retained for backward compatibility
+# with any external caller still importing them; the pipeline reads from
+# `overrides.prefilter_*` exclusively.
 PREFILTER_RESEARCH_NEUTRAL: bool = True
+
+# Reframe A — stateful incremental extraction.
+# When True, each window's prompt is augmented with top-K similar prior
+# observations extracted from earlier windows in the same session. This
+# reduces cross-window paraphrase re-extraction by giving Stage 1 explicit
+# dedup context. Default: False (opt-in) until validated end-to-end.
+# See .context/PLAN-tier2-audit-fixes.md Task 4.1 and CONTEXT Item 18.
+REFRAME_A_ENABLED: bool = False
 PREFILTER_DENSITY_THRESHOLD_CHARS: int = 200
 PREFILTER_TTR_THRESHOLD: float = 0.25
 PREFILTER_OBSERVER_DENSITY_THRESHOLD_CHARS: int = 400
@@ -191,7 +212,8 @@ def extract_observations(
                     Phase E audit (2026-04-28) added this so the silent
                     importance drop is observable downstream.
     """
-    raw = call_llm(OBSERVATION_EXTRACT_PROMPT.format(
+    # #33: use format_extract_prompt() to inject per-session-type guidance
+    raw = call_llm(format_extract_prompt(
         transcript=rendered, session_type=session_type, affect_hint=""
     ))
     try:
@@ -434,6 +456,7 @@ def extract_observations_hierarchical(
     context_after: int = 8,
     overrides: ParameterOverrides | None = None,
     cwd: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """Map-reduce extraction over overlapping windows.
 
@@ -510,10 +533,10 @@ def extract_observations_hierarchical(
     #   entropy_gate   — per-window TTR below threshold (self-summarizing)
     avg_chars = _avg_chars_per_entry(entries)
     is_observer = _is_research_observer(cwd)
-    density_low = avg_chars < PREFILTER_DENSITY_THRESHOLD_CHARS
-    observer_density_low = avg_chars < PREFILTER_OBSERVER_DENSITY_THRESHOLD_CHARS
+    density_low = avg_chars < overrides.prefilter_density_threshold_chars
+    observer_density_low = avg_chars < overrides.prefilter_observer_density_threshold_chars
     prefiltered: list[int] = []
-    if PREFILTER_RESEARCH_NEUTRAL and session_type == "research":
+    if overrides.prefilter_research_neutral and session_type == "research":
         for i, a in enumerate(affect_signals):
             outcome: str | None = None
             reason: str | None = None
@@ -530,7 +553,7 @@ def extract_observations_hierarchical(
                 reason = "[affect_gate] neutral research window + low session density"
             else:
                 ttr = _compute_ttr(windows[i])
-                if affect_neutral and ttr < PREFILTER_TTR_THRESHOLD:
+                if affect_neutral and ttr < overrides.prefilter_ttr_threshold:
                     outcome = "pre_filtered_low_entropy"
                     reason = f"[entropy_gate] low diversity ttr={ttr:.2f}"
             if outcome:
@@ -548,107 +571,268 @@ def extract_observations_hierarchical(
             windows = [w for i, w in enumerate(windows) if i in _keep]
             affect_signals = [a for i, a in enumerate(affect_signals) if i in _keep]
 
-    # Concurrent LLM batch — agent-SDK serializes OAuth refresh internally
-    # so this no longer races against itself the way raw subprocess did.
-    prompts = [
-        OBSERVATION_EXTRACT_PROMPT.format(
-            transcript=w,
-            session_type=session_type,
-            affect_hint=format_affect_hint(a),
-        )
-        for w, a in zip(windows, affect_signals)
-    ]
-    # affect_pre_filter: when `low_productive_rate` is confirmed, skip the
-    # LLM call entirely on windows with no somatic affect signal. Recorded
-    # as a `pre_filtered_low_affect` skip so we still account for them.
-    if overrides.affect_pre_filter:
-        active_indices: list[int] = [
-            i for i, a in enumerate(affect_signals) if a.max_boost > 0.0
-        ]
-        for i, a in enumerate(affect_signals):
-            if a.max_boost == 0.0:
+    # Reframe A — stateful incremental extraction.
+    # When REFRAME_A_ENABLED=True, each window's prompt is built sequentially
+    # with top-K similar prior observations injected. This requires a sequential
+    # loop (not batch) because each window's index state depends on prior outputs.
+    # When False (default), the existing concurrent batch flow runs unchanged.
+    cross_window_dedup_hits = 0
+    svec = None  # SessionVecStore instance, or None when Reframe A is disabled
+
+    if REFRAME_A_ENABLED and session_id is not None:
+        from core.database import get_db_path
+        from core.embeddings import embed_text
+        from core.session_vec import SessionVecStore
+
+        _db_path = get_db_path()
+        if _db_path is not None:
+            svec = SessionVecStore(_db_path, session_id)
+            if not svec.available:
+                logger.warning(
+                    "hierarchical: SessionVecStore unavailable for session %s — running without Reframe A",
+                    session_id,
+                )
+                svec = None
+
+    if svec is not None:
+        # --- Reframe A: sequential per-window loop ---
+        # Stores (obs_idx, text) pairs for the index; obs_idx monotonically
+        # increases across windows within this session.
+        _reframe_obs_idx = 0
+        # _session_obs maps obs_idx -> observation text (joined facts or content)
+        _session_obs_texts: dict[int, str] = {}
+
+        for i, (w, affect) in enumerate(zip(windows, affect_signals)):
+            # Skip windows with zero affect when affect_pre_filter is on
+            if overrides.affect_pre_filter and affect.max_boost == 0.0:
                 skips.append({
                     "window_index": i,
                     "outcome": "pre_filtered_low_affect",
-                    "affect_intensity": a.max_boost,
-                    "affect_valence": a.valence,
+                    "affect_intensity": affect.max_boost,
+                    "affect_valence": affect.valence,
                 })
-        active_prompts = [prompts[i] for i in active_indices]
-        active_responses = call_llm_batch(
-            active_prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
-        )
-        # Reassemble full-length response list with empty strings for skipped windows
-        raw_responses = [""] * len(prompts)
-        for src_i, dst_i in enumerate(active_indices):
-            raw_responses[dst_i] = active_responses[src_i]
-    else:
-        raw_responses = call_llm_batch(
-            prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
-        )
+                continue
 
-    for i, (_w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):
-        # Pre-call warning: log if rendered window is unusually large
-        if len(_w) > 12000:
-            logger.warning(
-                "hierarchical: window %d/%d is large (%d chars) — may exceed effective attention range",
-                i + 1, len(windows), len(_w),
+            # Query in-session index for top-3 similar prior observations
+            prior_block = ""
+            win_embedding = embed_text(w[:4000])
+            if win_embedding is not None:
+                prior_indices = svec.query_similar(win_embedding, k=3)
+                if prior_indices:
+                    cross_window_dedup_hits += 1
+                    bullets = [
+                        f"- {_session_obs_texts[idx]}"
+                        for idx in prior_indices
+                        if idx in _session_obs_texts
+                    ]
+                    if bullets:
+                        prior_block = (
+                            "PRIOR EXTRACTIONS from this session"
+                            " (do not duplicate — these facts have already been captured"
+                            " from earlier windows in this session):\n"
+                            + "\n".join(bullets)
+                        )
+
+            prompt = format_extract_prompt(
+                transcript=w,
+                session_type=session_type,
+                affect_hint=format_affect_hint(affect),
+                prior_extractions=prior_block,
             )
-        if raw.startswith("[ERROR]"):
-            logger.warning("hierarchical: window %d/%d failed: %s",
-                           i + 1, len(windows), raw[:200])
-            skips.append({
-                "window_index": i,
-                "outcome": "exception",
-                "reason": raw[:300],
-                "raw_response_excerpt": raw[:500],
-                "affect_intensity": affect.max_boost,
-                "affect_valence": affect.valence,
-            })
-            parse_errors += 1
-            continue
-        cost_calls += 1
-        try:
-            obs, skip_reason = _parse_extract_response(raw, affect=affect, drop_stats=drop_stats)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("hierarchical: window %d/%d parse failed: %s",
-                           i + 1, len(windows), exc)
-            skips.append({
-                "window_index": i,
-                "outcome": "parse_error",
-                "reason": str(exc),
-                "raw_response_excerpt": raw[:500],
-            })
-            parse_errors += 1
-            continue
-        if obs:
-            productive_windows += 1
-            apply_affect_prior(obs, affect)
-        else:
-            # Attempt to extract llm_reason from the raw response (if LLM emitted {"reason": ...})
-            llm_reason: str | None = None
+
+            if len(w) > 12000:
+                logger.warning(
+                    "hierarchical (reframe_a): window %d/%d is large (%d chars)",
+                    i + 1, len(windows), len(w),
+                )
+
+            raw_list = call_llm_batch(
+                [prompt], max_concurrency=1, max_tokens=overrides.max_tokens_stage1,
+            )
+            raw = raw_list[0] if raw_list else "[ERROR] empty batch response"
+            cost_calls += 1
+
+            if raw.startswith("[ERROR]"):
+                logger.warning(
+                    "hierarchical (reframe_a): window %d/%d failed: %s",
+                    i + 1, len(windows), raw[:200],
+                )
+                skips.append({
+                    "window_index": i,
+                    "outcome": "exception",
+                    "reason": raw[:300],
+                    "raw_response_excerpt": raw[:500],
+                    "affect_intensity": affect.max_boost,
+                    "affect_valence": affect.valence,
+                })
+                parse_errors += 1
+                continue
+
             try:
-                _parsed_raw = json.loads(raw)
-                if isinstance(_parsed_raw, dict) and "reason" in _parsed_raw:
-                    llm_reason = _parsed_raw["reason"]
-            except (json.JSONDecodeError, TypeError):
-                pass
-            skip_record: dict = {
-                "window_index": i,
-                "outcome": "empty_or_skipped",
-                "raw_response_excerpt": raw[:500],
-                "affect_intensity": affect.max_boost,
-                "affect_valence": affect.valence,
-            }
-            if skip_reason is not None:
-                skip_record["reason"] = skip_reason
-            if llm_reason is not None:
-                skip_record["llm_reason"] = llm_reason
-            skips.append(skip_record)
-        all_obs.extend(obs)
-        logger.info(
-            "hierarchical: window %d/%d → %d obs (affect=%s/%.2f)",
-            i + 1, len(windows), len(obs), affect.valence, affect.max_boost,
-        )
+                obs, skip_reason = _parse_extract_response(raw, affect=affect, drop_stats=drop_stats)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "hierarchical (reframe_a): window %d/%d parse failed: %s",
+                    i + 1, len(windows), exc,
+                )
+                skips.append({
+                    "window_index": i,
+                    "outcome": "parse_error",
+                    "reason": str(exc),
+                    "raw_response_excerpt": raw[:500],
+                })
+                parse_errors += 1
+                continue
+
+            if obs:
+                productive_windows += 1
+                apply_affect_prior(obs, affect)
+
+                # Embed each new observation and add to the in-session index.
+                # Join facts[] or fall back to content for embedding text.
+                for ob in obs:
+                    facts = ob.get("facts") or []
+                    obs_text = " ".join(facts) if facts else (ob.get("content") or "")
+                    if obs_text:
+                        obs_embedding = embed_text(obs_text[:4000])
+                        if obs_embedding is not None:
+                            svec.add(_reframe_obs_idx, obs_embedding)
+                            _session_obs_texts[_reframe_obs_idx] = obs_text
+                        _reframe_obs_idx += 1
+            else:
+                llm_reason: str | None = None
+                try:
+                    _parsed_raw = json.loads(raw)
+                    if isinstance(_parsed_raw, dict) and "reason" in _parsed_raw:
+                        llm_reason = _parsed_raw["reason"]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                skip_record: dict = {
+                    "window_index": i,
+                    "outcome": "empty_or_skipped",
+                    "raw_response_excerpt": raw[:500],
+                    "affect_intensity": affect.max_boost,
+                    "affect_valence": affect.valence,
+                }
+                if skip_reason is not None:
+                    skip_record["reason"] = skip_reason
+                if llm_reason is not None:
+                    skip_record["llm_reason"] = llm_reason
+                skips.append(skip_record)
+
+            all_obs.extend(obs)
+            logger.info(
+                "hierarchical (reframe_a): window %d/%d → %d obs (affect=%s/%.2f)",
+                i + 1, len(windows), len(obs), affect.valence, affect.max_boost,
+            )
+
+        # Drop the ephemeral session table after extraction
+        svec.drop()
+
+    else:
+        # --- Default: concurrent LLM batch (Reframe A disabled) ---
+        # agent-SDK serializes OAuth refresh internally so this no longer
+        # races against itself the way raw subprocess did.
+        # #33: use format_extract_prompt() to inject per-session-type guidance
+        prompts = [
+            format_extract_prompt(
+                transcript=w,
+                session_type=session_type,
+                affect_hint=format_affect_hint(a),
+            )
+            for w, a in zip(windows, affect_signals)
+        ]
+        # affect_pre_filter: when `low_productive_rate` is confirmed, skip the
+        # LLM call entirely on windows with no somatic affect signal. Recorded
+        # as a `pre_filtered_low_affect` skip so we still account for them.
+        if overrides.affect_pre_filter:
+            active_indices: list[int] = [
+                i for i, a in enumerate(affect_signals) if a.max_boost > 0.0
+            ]
+            for i, a in enumerate(affect_signals):
+                if a.max_boost == 0.0:
+                    skips.append({
+                        "window_index": i,
+                        "outcome": "pre_filtered_low_affect",
+                        "affect_intensity": a.max_boost,
+                        "affect_valence": a.valence,
+                    })
+            active_prompts = [prompts[i] for i in active_indices]
+            active_responses = call_llm_batch(
+                active_prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+            )
+            # Reassemble full-length response list with empty strings for skipped windows
+            raw_responses = [""] * len(prompts)
+            for src_i, dst_i in enumerate(active_indices):
+                raw_responses[dst_i] = active_responses[src_i]
+        else:
+            raw_responses = call_llm_batch(
+                prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+            )
+
+        for i, (_w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):
+            # Pre-call warning: log if rendered window is unusually large
+            if len(_w) > 12000:
+                logger.warning(
+                    "hierarchical: window %d/%d is large (%d chars) — may exceed effective attention range",
+                    i + 1, len(windows), len(_w),
+                )
+            if raw.startswith("[ERROR]"):
+                logger.warning("hierarchical: window %d/%d failed: %s",
+                               i + 1, len(windows), raw[:200])
+                skips.append({
+                    "window_index": i,
+                    "outcome": "exception",
+                    "reason": raw[:300],
+                    "raw_response_excerpt": raw[:500],
+                    "affect_intensity": affect.max_boost,
+                    "affect_valence": affect.valence,
+                })
+                parse_errors += 1
+                continue
+            cost_calls += 1
+            try:
+                obs, skip_reason = _parse_extract_response(raw, affect=affect, drop_stats=drop_stats)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("hierarchical: window %d/%d parse failed: %s",
+                               i + 1, len(windows), exc)
+                skips.append({
+                    "window_index": i,
+                    "outcome": "parse_error",
+                    "reason": str(exc),
+                    "raw_response_excerpt": raw[:500],
+                })
+                parse_errors += 1
+                continue
+            if obs:
+                productive_windows += 1
+                apply_affect_prior(obs, affect)
+            else:
+                # Attempt to extract llm_reason from the raw response (if LLM emitted {"reason": ...})
+                llm_reason: str | None = None
+                try:
+                    _parsed_raw = json.loads(raw)
+                    if isinstance(_parsed_raw, dict) and "reason" in _parsed_raw:
+                        llm_reason = _parsed_raw["reason"]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                skip_record: dict = {
+                    "window_index": i,
+                    "outcome": "empty_or_skipped",
+                    "raw_response_excerpt": raw[:500],
+                    "affect_intensity": affect.max_boost,
+                    "affect_valence": affect.valence,
+                }
+                if skip_reason is not None:
+                    skip_record["reason"] = skip_reason
+                if llm_reason is not None:
+                    skip_record["llm_reason"] = llm_reason
+                skips.append(skip_record)
+            all_obs.extend(obs)
+            logger.info(
+                "hierarchical: window %d/%d → %d obs (affect=%s/%.2f)",
+                i + 1, len(windows), len(obs), affect.valence, affect.max_boost,
+            )
 
     deduped, dropped = _dedupe_observations(all_obs)
 
@@ -669,7 +853,10 @@ def extract_observations_hierarchical(
                 refine_stats.get("rescores", 0),
             )
         cards, orphans, synthesis_stats = synthesize_issue_cards(
-            deduped, synopsis, session_affect_summary=affect_summary
+            deduped,
+            synopsis,
+            session_affect_summary=affect_summary,
+            synthesis_strict=overrides.synthesis_strict,
         )
         # Circular-evidence demotion: single-quote cards whose lone quote merely
         # restates the card body add no retrieval value — demote them to orphans.
@@ -723,6 +910,7 @@ def extract_observations_hierarchical(
         "parse_errors": parse_errors,
         "cost_calls": cost_calls,
         "prefilter_skipped_count": len(prefiltered),
+        "cross_window_dedup_hits": cross_window_dedup_hits,
     }
 
 
