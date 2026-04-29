@@ -58,7 +58,7 @@ def _make_client():
 def call_llm(
     prompt: str,
     *,
-    max_tokens: int = 1024,
+    max_tokens: int = 8192,
     temperature: float = 0,
     model: str | None = None,
 ) -> str:
