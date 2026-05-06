@@ -152,7 +152,6 @@ def _render_module(spec: EvalSpec, replay_store_path: str, assertion_body: str) 
     polarity_repr = repr(spec.polarity)
     stage_repr = repr(spec.stage_target)
     mode_repr = repr(spec.match_mode)
-    description_repr = repr(spec.description)
 
     return f'''\
 """

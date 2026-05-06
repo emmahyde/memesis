@@ -9,5 +9,8 @@
   "reportOptionalOperand": "none",
   "reportIncompatibleVariableOverride": "none",
   "reportUnusedVariable": "none",
-  "reportUnusedImport": "none"
+  "reportUnusedImport": "none",
+  "reportUnusedParameter": "none",
+  "reportUnusedFunction": "none",
+  "reportPrivateUsage": "none"
 }
