@@ -23,6 +23,41 @@ from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
+# Session-type extraction guidance
+# ---------------------------------------------------------------------------
+
+SESSION_TYPE_GUIDANCE = {
+    # Per-session-type filter applied inside OBSERVATION_EXTRACT_PROMPT.
+    # Callers that invoke OBSERVATION_EXTRACT_PROMPT.format(...) MUST pass
+    # `session_type_guidance=SESSION_TYPE_GUIDANCE.get(session_type, SESSION_TYPE_GUIDANCE["unknown"])`.
+    # Use `format_extract_prompt()` (defined at the bottom of this module) to get
+    # this right automatically.  Invocation sites that need updating in Wave C:
+    #   core/transcript_ingest.py:200  — extract_observations()
+    #   core/transcript_ingest.py:560  — batch prompt list comprehension
+    #   tests/test_prompts.py:131      — smoke-test format call
+    "research": (
+        "Target conceptual and metacognitive findings only. Skip tool logs and per-call"
+        " narration. Surface novel framings, deferred questions, and abandoned approaches."
+    ),
+    "writing": (
+        "Target authoring decisions and aesthetic choices (voice, structure, scope). Skip"
+        " word-level edits unless they reveal a stylistic principle."
+    ),
+    "code": (
+        "Target current behavior — corrections, gotchas, decisions, library/API choices,"
+        " debugging insights. Skip routine implementation steps."
+    ),
+    "agent_driven": (
+        "Target task structure, decisions, and surprising agent failures. Skip per-tool-call"
+        " narration and routine progress updates."
+    ),
+    "unknown": (
+        "Use general extraction heuristics. No session-type-specific filter applied."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Observation taxonomy
 # ---------------------------------------------------------------------------
 
@@ -294,9 +329,15 @@ Respond ONLY with valid JSON:
 # Transcript delta extraction prompt
 # ---------------------------------------------------------------------------
 
-OBSERVATION_EXTRACT_PROMPT = """Extract every durable observation that passes the quality gate from this Claude Code session slice.
+# Raw template — use format_extract_prompt() (bottom of module) to populate all
+# placeholders correctly.  OBSERVATION_EXTRACT_PROMPT is a pre-baked alias that
+# substitutes session_type_guidance with the "unknown" default so existing callers
+# using .format(transcript=..., session_type=..., affect_hint=...) do not raise
+# KeyError before Wave C migrates them to format_extract_prompt().
+_OBSERVATION_EXTRACT_PROMPT_TEMPLATE = """Extract every durable observation that passes the quality gate from this Claude Code session slice.
 
 Session type: {session_type}
+Session-type guidance: {session_type_guidance}
 
 {affect_hint}
 A short slice may have zero qualifying observations. A dense one may have many.
@@ -308,7 +349,7 @@ QUALITY GATE — an observation qualifies only if ALL of the following are true:
 - Falsifiable: could be discovered wrong later
 - Durable: still relevant in a future session, not just today's task
 - Novel: not derivable from reading the codebase, docs, or git history directly
-- Load-bearing: without this, I would do something wrong next time
+- Load-bearing: without this, I would do something wrong OR miss something useful next time
 
 Skip:
 - Tool call logs without a finding attached
@@ -316,14 +357,43 @@ Skip:
 - Status checks, test runs that passed without incident
 - Anything obvious from the codebase itself
 
+USER INTERRUPTIONS are behavioral friction — do NOT skip a window solely because
+it contains a user interruption (ctrl-c, "stop", "cancel", request cancelled).
+An interruption is itself a durable signal: the user stopped Claude mid-task.
+Extract what was interrupted, what the user redirected to (if visible), and what
+this implies about preference or pain. Use kind="correction" or kind="preference".
+Importance floor: 0.5. Example:
+  "User interrupted Claude mid-implementation to redirect scope — indicates the
+   prior approach was not aligned with intent before code was written."
+  → kind: "correction", knowledge_type: "procedural", importance: 0.6
+
+POSITIVE FINDS ARE LOAD-BEARING TOO: A workflow shortcut, tooling win, or process
+discovery that saves meaningful time or unblocks future work qualifies — even when
+there is no friction, problem, or correction attached. Extract these explicitly.
+
+  Positive example:
+    "bin/test runs both Sector.Engine.Tests and Sector.Game.Tests by default — no need
+     to specify project; Emma discovered this while debugging a filter flag."
+    → kind: "finding", knowledge_type: "procedural", importance: 0.7
+    → This is durable gold: saves 30s every test run, not derivable without discovery.
+
+  Negative example (skip): "Tests passed" — no finding attached, not novel.
+
+knowledge_type values `tooling_win` and `workflow_discovery` are NOT valid vocab —
+use `procedural` for how-to discoveries and `factual` for specific tool behaviors.
+But the SUBSTANCE of tooling wins and workflow discoveries should be extracted
+freely, without requiring a friction or problem frame to justify inclusion.
+
 ---
 
 SESSION_TYPE GUIDANCE — what counts as durable depends on session_type:
 
   code      — durable: bugfixes with diagnosed root cause, refactor decisions with
               rationale, performance findings, API/contract corrections, build/test
-              gotchas, configuration constraints. Skip: green test runs, file
-              navigation, tool call traces without a conclusion.
+              gotchas, configuration constraints, tooling wins (commands that save
+              time, flags that simplify workflow), workflow discoveries (shortcuts,
+              defaults, implicit behaviors). Skip: green test runs with no finding,
+              file navigation, tool call traces without a conclusion.
 
   research  — durable: conceptual outcomes ("X library uses Y mechanism because Z"),
               decisions to adopt/reject an approach, comparisons with explicit
@@ -459,14 +529,24 @@ The failed_gate field MUST be the FIRST quality-gate criterion the slice failed.
 Do NOT return an empty array — that signals extraction failure, not intentional skip.
 Affect signals (pushback / repetition / non-neutral valence) override skip: if the
 AFFECT HINT shows any of those, you MUST extract at least one observation.
+User interruptions (ctrl-c, "stop", "cancel", request cancelled mid-execution) also
+override skip — treat them as behavioral friction regardless of the affect score.
 
 A skip without `considered`, or where `considered` is empty, will be treated by the
 parser as a downgraded skip — the affect signal is preserved and logged as a warning
 rather than silently discarded.
 
+- Before listing items in `considered:[]`, name the FIRST rejected candidate explicitly
+  and state which gate it failed (importance < threshold? duplicate? off-topic? out of scope?).
+  Format: `considered: ["<first_candidate> — failed <gate_name>", ...]`. This raises the cost
+  of reflexive skipping on ambiguous windows; if you cannot name even one candidate, you may
+  skip without it but the absence flags a low-signal slice rather than a routine skip.
+
 ---
 
 Return either an array of observations OR a skip signal. No markdown fences. No commentary.
+
+{prior_extractions}
 
 Array form:
 [
@@ -488,3 +568,71 @@ Skip form (considered list REQUIRED):
 Session slice:
 {transcript}
 """
+
+# Pre-baked alias: session_type_guidance defaults to "unknown" and prior_extractions
+# defaults to "" so existing callers that use OBSERVATION_EXTRACT_PROMPT.format(
+# transcript=..., session_type=..., affect_hint=...) continue to work without
+# KeyError until Wave C migrates them.
+# Wave 4 / Reframe A: use _OBSERVATION_EXTRACT_PROMPT_TEMPLATE directly and pass
+# prior_extractions= for per-window injection.
+OBSERVATION_EXTRACT_PROMPT = _OBSERVATION_EXTRACT_PROMPT_TEMPLATE.replace(
+    "{session_type_guidance}",
+    SESSION_TYPE_GUIDANCE["unknown"],
+).replace(
+    "{prior_extractions}",
+    "",
+)
+
+
+def format_extract_prompt(
+    transcript: str,
+    session_type: str,
+    affect_hint: str = "",
+    prior_extractions: str = "",
+    recurrent_failure_patterns: tuple[str, ...] = (),
+) -> str:
+    """
+    Preferred caller for _OBSERVATION_EXTRACT_PROMPT_TEMPLATE.
+
+    Populates all placeholders including `session_type_guidance` from
+    SESSION_TYPE_GUIDANCE, keyed by session_type.  Wave C should migrate the two
+    call sites in transcript_ingest.py and the smoke-test in tests/test_prompts.py
+    to use this helper instead of OBSERVATION_EXTRACT_PROMPT.format(...) directly.
+
+    Call sites to update in Wave C:
+      core/transcript_ingest.py:200  — extract_observations()
+      core/transcript_ingest.py:560  — batch prompt list comprehension
+      tests/test_prompts.py:131      — smoke-test format call
+
+    Args:
+        transcript: The session window text.
+        session_type: One of "code", "research", "writing", "agent_driven", "unknown".
+        affect_hint: Pre-formatted affect hint string (may be empty).
+        prior_extractions: Reframe A — pre-formatted block of prior observations
+            from earlier windows in this session, or empty string for first window
+            / when Reframe A is disabled. When non-empty, rendered as a block
+            prefixed "PRIOR EXTRACTIONS (do not duplicate...)".
+
+    Returns:
+        Fully formatted prompt string ready to send to the LLM.
+    """
+    guidance = SESSION_TYPE_GUIDANCE.get(session_type, SESSION_TYPE_GUIDANCE["unknown"])
+    failure_block = ""
+    if recurrent_failure_patterns:
+        patterns_list = "\n".join(f"  - {p}" for p in recurrent_failure_patterns)
+        failure_block = (
+            f"KNOWN FAILURE PATTERNS (confirmed across prior sessions):\n"
+            f"The following root-cause keywords appeared in correction cards from previous sessions.\n"
+            f"Do NOT repeat these mistakes — extract observations that would prevent recurrence:\n"
+            f"{patterns_list}\n"
+        )
+    prompt = _OBSERVATION_EXTRACT_PROMPT_TEMPLATE.format(
+        transcript=transcript,
+        session_type=session_type,
+        session_type_guidance=guidance,
+        affect_hint=affect_hint,
+        prior_extractions=prior_extractions,
+    )
+    if failure_block:
+        prompt = failure_block + "\n" + prompt
+    return prompt

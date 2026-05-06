@@ -893,3 +893,126 @@ class TestCardToMemoryPromotion:
         assert mem.confidence is None
         assert mem.affect_valence is None
         assert mem.actor is None
+
+
+# ---------------------------------------------------------------------------
+# TestCardImportance — tier3 #32 / D2 acceptance criteria
+# ---------------------------------------------------------------------------
+
+class TestCardImportance:
+    """Card-path importance flows from card.importance, Kensinger bump only for friction."""
+
+    def _card_decision(self, **overrides) -> dict:
+        # neutral observation text → importance_boost == 0.0 from somatic
+        base = {
+            "observation": "The database schema was updated to add two columns.",
+            "action": "keep",
+            "rationale": "Architectural decision.",
+            "title": "Schema update",
+            "summary": "Two new columns added.",
+            "tags": [],
+            "target_path": "decisions/schema_update.md",
+            "reinforces": None,
+            "contradicts": None,
+            # Card-shape fields:
+            "scope": "cross-session-durable",
+            "knowledge_type_confidence": "high",
+            "user_affect_valence": "neutral",
+            "evidence_quotes": ["Schema updated."],
+            "importance": 0.8,
+        }
+        base.update(overrides)
+        return base
+
+    def test_card_importance_flows_from_card_dict(self, consolidator, base, ephemeral_file):
+        """Card decision uses card.importance as base, not somatic boost-based formula."""
+        decision = self._card_decision(importance=0.8, user_affect_valence="neutral")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cimp-001")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        # importance must come from card, not somatic (which gives ~0.5 for neutral)
+        assert mem.importance == pytest.approx(0.8)
+
+    def test_friction_valence_triggers_kensinger_bump(self, consolidator, base, ephemeral_file):
+        """Card with affect_valence=friction gets +0.05 Kensinger bump."""
+        decision = self._card_decision(importance=0.8, user_affect_valence="friction")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cimp-002")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.importance == pytest.approx(0.85)
+
+    def test_non_friction_card_does_not_get_kensinger_bump(self, consolidator, base, ephemeral_file):
+        """Card with affect_valence=delight does NOT get the +0.05 bump."""
+        decision = self._card_decision(importance=0.8, user_affect_valence="delight")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cimp-003")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.importance == pytest.approx(0.8)
+
+    def test_malformed_card_importance_falls_back_with_warning(
+        self, consolidator, base, ephemeral_file
+    ):
+        """Non-numeric card importance falls back to boost-based value (somatic)."""
+        import logging
+        decision = self._card_decision(importance="not-a-number", user_affect_valence="neutral")
+        log_records = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                log_records.append(record)
+
+        handler = _Capture(level=logging.WARNING)
+        core_logger = logging.getLogger("core.consolidator")
+        core_logger.addHandler(handler)
+        try:
+            with patch("core.consolidator._call_llm_transport") as mock_transport:
+                mock_transport.return_value = _llm_response_text([decision])
+                result = consolidator.consolidate_session(ephemeral_file, "cimp-004")
+        finally:
+            core_logger.removeHandler(handler)
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        # Fallback: 0.5 + importance_boost (neutral obs → boost ≈ 0) = ~0.5
+        assert 0.4 <= mem.importance <= 0.6
+        # Warning must have been logged
+        assert any(
+            "malformed" in r.getMessage().lower() or "falling back" in r.getMessage().lower()
+            for r in log_records
+        )
+
+    def test_non_card_path_uses_boost_formula(self, consolidator, base, ephemeral_file):
+        """Non-card decision ignores card.importance, uses somatic boost formula."""
+        decision = {
+            "observation": "The database schema was updated to add two columns.",
+            "action": "keep",
+            "rationale": "Architectural decision.",
+            "title": "Schema update",
+            "summary": "Two new columns added.",
+            "tags": [],
+            "target_path": "decisions/schema_update_flat.md",
+            "reinforces": None,
+            "contradicts": None,
+            # No card-shape fields (no scope, no evidence_quotes)
+            "importance": 0.8,  # this value must NOT flow through for non-card
+        }
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cimp-005")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        # Non-card path: min(0.5 + importance_boost, 1.0); neutral obs → ~0.5
+        assert mem.importance != pytest.approx(0.8), (
+            "Non-card decision should not use card.importance=0.8"
+        )
+        assert 0.0 <= mem.importance <= 1.0
