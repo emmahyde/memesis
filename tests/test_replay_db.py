@@ -9,10 +9,8 @@ variable is set to a tmp_path subdirectory so no test touches the real cache at
 import hashlib
 import json
 import os
-import shutil
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -26,16 +24,13 @@ class TestReplayDBContextManager:
     def test_context_manager_creates_tempdir(self):
         from core.replay_db import ReplayDB
 
-        entered_path = None
         with ReplayDB() as base_dir:
-            entered_path = base_dir
             assert os.path.isdir(base_dir)
             assert os.path.basename(base_dir).startswith("memesis-replay-")
 
     def test_context_manager_cleans_up_on_exit(self):
         from core.replay_db import ReplayDB
 
-        entered_path = None
         with ReplayDB() as base_dir:
             entered_path = base_dir
             assert os.path.isdir(base_dir)
@@ -52,6 +47,7 @@ class TestReplayDBContextManager:
                 entered_path = base_dir
                 raise RuntimeError("deliberate error")
 
+        assert entered_path is not None
         assert not os.path.exists(entered_path)
 
     def test_init_db_called_with_tempdir(self):
@@ -59,7 +55,7 @@ class TestReplayDBContextManager:
 
         with patch("core.replay_db.init_db") as mock_init, \
              patch("core.replay_db.close_db"), \
-             patch("tempfile.mkdtemp", return_value="/tmp/memesis-replay-test") as mock_mkdtemp, \
+             patch("tempfile.mkdtemp", return_value="/tmp/memesis-replay-test"), \
              patch("shutil.rmtree"):
             with ReplayDB() as base_dir:
                 mock_init.assert_called_once_with(base_dir="/tmp/memesis-replay-test")

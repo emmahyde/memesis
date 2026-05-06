@@ -25,7 +25,6 @@ Usage::
 
 import shutil
 import tempfile
-from pathlib import Path
 
 from core.database import close_db, init_db
 
@@ -56,7 +55,7 @@ class ReplayDB:
         init_db(base_dir=self._tempdir)
         return self._tempdir
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, _exc_type, _exc_val, _exc_tb) -> None:
         try:
             close_db()
         except Exception:

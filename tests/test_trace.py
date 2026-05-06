@@ -1,7 +1,6 @@
 """Tests for core/trace.py — JSONL trace writer."""
 
 import json
-import os
 from pathlib import Path
 
 import pytest
