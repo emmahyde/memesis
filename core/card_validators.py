@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 
+from core.trace import get_active_writer
+
 # First-person / second-person pronouns signal the quote captures direct speech
 # or personal instruction, which is load-bearing evidence (not a paraphrase).
 _PRONOUN_RE = re.compile(
@@ -82,10 +84,32 @@ def _card_evidence_indices_valid(card: dict, window_count: int) -> bool:
     """
     indices = card.get("evidence_obs_indices") or []
     if not indices:
+        writer = get_active_writer()
+        if writer is not None:
+            writer.emit(
+                stage="validators",
+                event="indices_invalid_demotion",
+                payload={
+                    "card_title": card.get("title", ""),
+                    "invalid_indices": [],
+                    "window_count": window_count,
+                },
+            )
         return False  # no indices at all = invalid
     for idx in indices:
         if isinstance(idx, int) and 0 <= idx < window_count:
             return True
+    writer = get_active_writer()
+    if writer is not None:
+        writer.emit(
+            stage="validators",
+            event="indices_invalid_demotion",
+            payload={
+                "card_title": card.get("title", ""),
+                "invalid_indices": list(indices),
+                "window_count": window_count,
+            },
+        )
     return False
 
 
@@ -130,4 +154,14 @@ def _card_evidence_load_bearing(card: dict) -> bool:
     if _has_specific_technical_token(quote, card_body_tokens):
         return True
 
+    writer = get_active_writer()
+    if writer is not None:
+        writer.emit(
+            stage="validators",
+            event="load_bearing_demotion",
+            payload={
+                "card_title": card.get("title", ""),
+                "reason": "circular_evidence",
+            },
+        )
     return False

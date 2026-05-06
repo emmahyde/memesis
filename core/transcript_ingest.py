@@ -49,6 +49,7 @@ from core.extraction_affect import aggregate_window_affect, apply_affect_prior, 
 from core.issue_cards import synthesize_issue_cards
 from core.card_validators import _card_evidence_load_bearing
 from core.rule_registry import ParameterOverrides
+from core.trace import get_active_writer
 
 # Module-level prefilter knobs are deprecated — settings now live on
 # `ParameterOverrides` (core.rule_registry) so the closed-loop registry can
@@ -64,7 +65,7 @@ PREFILTER_RESEARCH_NEUTRAL: bool = True
 # reduces cross-window paraphrase re-extraction by giving Stage 1 explicit
 # dedup context. Default: False (opt-in) until validated end-to-end.
 # See .context/PLAN-tier2-audit-fixes.md Task 4.1 and CONTEXT Item 18.
-REFRAME_A_ENABLED: bool = False
+REFRAME_A_ENABLED: bool = True
 PREFILTER_DENSITY_THRESHOLD_CHARS: int = 200
 PREFILTER_TTR_THRESHOLD: float = 0.25
 PREFILTER_OBSERVER_DENSITY_THRESHOLD_CHARS: int = 400
@@ -571,6 +572,14 @@ def extract_observations_hierarchical(
             windows = [w for i, w in enumerate(windows) if i in _keep]
             affect_signals = [a for i, a in enumerate(affect_signals) if i in _keep]
 
+    # stage1_extract_start trace event
+    _tw = get_active_writer()
+    if _tw:
+        _tw.emit("stage1", "stage1_extract_start", {
+            "n_windows": len(windows),
+            "session_id": session_id or "",
+        })
+
     # Reframe A — stateful incremental extraction.
     # When REFRAME_A_ENABLED=True, each window's prompt is built sequentially
     # with top-K similar prior observations injected. This requires a sequential
@@ -638,6 +647,7 @@ def extract_observations_hierarchical(
                 session_type=session_type,
                 affect_hint=format_affect_hint(affect),
                 prior_extractions=prior_block,
+                recurrent_failure_patterns=overrides.recurrent_failure_patterns,
             )
 
             if len(w) > 12000:
@@ -739,6 +749,7 @@ def extract_observations_hierarchical(
                 transcript=w,
                 session_type=session_type,
                 affect_hint=format_affect_hint(a),
+                recurrent_failure_patterns=overrides.recurrent_failure_patterns,
             )
             for w, a in zip(windows, affect_signals)
         ]
@@ -836,6 +847,15 @@ def extract_observations_hierarchical(
 
     deduped, dropped = _dedupe_observations(all_obs)
 
+    # stage1_extract_end trace event (after dedup + drop-gate)
+    _tw = get_active_writer()
+    if _tw:
+        _tw.emit("stage1", "stage1_extract_end", {
+            "n_obs_pre_dedup": len(all_obs),
+            "n_obs_post_dedup": len(deduped),
+            "n_dropped": dropped,
+        })
+
     # Stage 1.5 — Wu-2021 refine pass + issue-card synthesis
     cards: list[dict] = []
     orphans: list[dict] = deduped
@@ -852,12 +872,24 @@ def extract_observations_hierarchical(
                 refine_stats.get("merges", 0),
                 refine_stats.get("rescores", 0),
             )
+        _tw = get_active_writer()
+        if _tw:
+            _tw.emit("stage1.5", "stage15_synthesis_start", {
+                "n_obs_input": len(deduped),
+            })
         cards, orphans, synthesis_stats = synthesize_issue_cards(
             deduped,
             synopsis,
             session_affect_summary=affect_summary,
             synthesis_strict=overrides.synthesis_strict,
         )
+        _tw = get_active_writer()
+        if _tw:
+            _tw.emit("stage1.5", "stage15_synthesis_end", {
+                "n_cards": len(cards),
+                "n_orphans": len(orphans),
+                "n_invalid_indices_demoted": synthesis_stats.get("cards_invalid_indices_demoted", 0),
+            })
         # Circular-evidence demotion: single-quote cards whose lone quote merely
         # restates the card body add no retrieval value — demote them to orphans.
         cards_demoted_circular = 0
