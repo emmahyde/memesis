@@ -6,6 +6,7 @@ import json
 from unittest.mock import patch
 
 from core.issue_cards import synthesize_issue_cards, ISSUE_SYNTHESIS_PROMPT, extract_card_memory_fields
+from core.card_validators import _card_evidence_indices_valid
 
 
 def _make_obs(facts: list[str], importance: float = 0.5) -> dict:
@@ -228,8 +229,8 @@ class TestEvidenceIndicesValidation:
             "scope": "session-local",
         }
 
-    def test_out_of_range_index_dropped_card_survives(self):
-        """Card with evidence_obs_indices: [999] and 5 obs → index dropped, card survives."""
+    def test_out_of_range_index_dropped_card_demoted_to_orphan(self):
+        """Card with evidence_obs_indices: [999] and 5 obs → index stripped, card demoted to orphan."""
         obs = [_make_obs([f"Obs {i}."]) for i in range(5)]
         card = self._card_with_indices([999])
         llm_response = json.dumps({
@@ -244,9 +245,12 @@ class TestEvidenceIndicesValidation:
                 session_affect_summary=None,
             )
         assert stats["outcome"] == "ok"
-        assert len(cards) == 1
-        assert cards[0]["evidence_obs_indices"] == []
+        # card is demoted to orphan — not in valid_cards
+        assert len(cards) == 0
+        assert len(orphans) == 1
+        assert orphans[0].get("demoted_invalid_indices") is True
         assert stats["dropped_invalid_indices"] == 1
+        assert stats["cards_invalid_indices_demoted"] == 1
 
     def test_valid_indices_preserved(self):
         """Valid in-range indices are kept unchanged."""
@@ -335,6 +339,93 @@ class TestDropGateStat:
 # ---------------------------------------------------------------------------
 # TestMixedValenceInstruction — Item 17 acceptance criteria
 # ---------------------------------------------------------------------------
+
+class TestRule3KensingerRemoved:
+    """Rule 3 in prompt must NOT mention Kensinger bump; consolidator owns it."""
+
+    def test_rule3_no_kensinger_bump(self):
+        assert "bump +0.05" not in ISSUE_SYNTHESIS_PROMPT
+        assert "Kensinger 2009" not in ISSUE_SYNTHESIS_PROMPT
+
+    def test_rule3_consolidator_note_present(self):
+        assert "consolidator.py" in ISSUE_SYNTHESIS_PROMPT
+        assert "do not pre-apply it" in ISSUE_SYNTHESIS_PROMPT
+
+
+class TestAllIndicesInvalidDemotion:
+    """tier3 #29 — cards with all-invalid indices are demoted to orphans."""
+
+    def _card_with_indices(self, indices: list) -> dict:
+        return {
+            "title": "Demote me",
+            "problem": "A problem.",
+            "options_considered": [],
+            "decision_or_outcome": "An outcome.",
+            "user_reaction": "neutral",
+            "user_affect_valence": "neutral",
+            "evidence_quotes": ["Emma approved the plan."],
+            "evidence_obs_indices": indices,
+            "kind": "finding",
+            "knowledge_type": "factual",
+            "importance": 0.6,
+            "scope": "session-local",
+        }
+
+    def test_all_invalid_indices_demoted(self):
+        obs = [_make_obs([f"Obs {i}."]) for i in range(3)]
+        card = self._card_with_indices([50, 99])
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "hallucinated indices",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            cards, orphans, stats = synthesize_issue_cards(obs, synopsis="s", session_affect_summary=None)
+        assert len(cards) == 0
+        assert len(orphans) == 1
+        assert orphans[0]["demoted_invalid_indices"] is True
+        assert stats["cards_invalid_indices_demoted"] == 1
+
+    def test_partial_valid_indices_not_demoted(self):
+        """Card with at least one valid index is NOT demoted."""
+        obs = [_make_obs([f"Obs {i}."]) for i in range(5)]
+        card = self._card_with_indices([0, 999])
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "one valid index",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            cards, orphans, stats = synthesize_issue_cards(obs, synopsis="s", session_affect_summary=None)
+        assert len(cards) == 1
+        assert stats["cards_invalid_indices_demoted"] == 0
+
+    def test_empty_indices_demoted(self):
+        """Card with evidence_obs_indices: [] is demoted (no valid indices)."""
+        obs = [_make_obs([f"Obs {i}."]) for i in range(3)]
+        card = self._card_with_indices([])
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "empty indices",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            cards, orphans, stats = synthesize_issue_cards(obs, synopsis="s", session_affect_summary=None)
+        assert len(cards) == 0
+        assert stats["cards_invalid_indices_demoted"] == 1
+
+    def test_demoted_stat_zero_when_all_valid(self):
+        obs = [_make_obs([f"Obs {i}."]) for i in range(5)]
+        card = self._card_with_indices([0, 2])
+        llm_response = json.dumps({
+            "issue_cards": [card],
+            "orphans": [],
+            "synthesis_notes": "all valid",
+        })
+        with patch("core.issue_cards.call_llm", return_value=llm_response):
+            _, _, stats = synthesize_issue_cards(obs, synopsis="s", session_affect_summary=None)
+        assert stats["cards_invalid_indices_demoted"] == 0
+
 
 class TestMixedValenceInstruction:
     """Mixed-valence sentence is present verbatim in ISSUE_SYNTHESIS_PROMPT."""

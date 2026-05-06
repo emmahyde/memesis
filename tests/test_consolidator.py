@@ -1016,3 +1016,113 @@ class TestCardImportance:
             "Non-card decision should not use card.importance=0.8"
         )
         assert 0.0 <= mem.importance <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestCardFieldsNewWiring — #36-A acceptance criteria
+# criterion_weights, rejected_options, affect_valence wiring
+# ---------------------------------------------------------------------------
+
+class TestCardFieldsNewWiring:
+    """Verify criterion_weights, rejected_options, affect_valence wired into Memory.create()."""
+
+    def _decision_card(self, **overrides) -> dict:
+        base = {
+            "observation": "Emma chose 13+Command+Trade extension; full redesign rejected.",
+            "action": "keep",
+            "rationale": "Important architectural decision.",
+            "title": "Skill taxonomy decision",
+            "summary": "13+Command+Trade chosen; full redesign hard-vetoed.",
+            "tags": ["taxonomy"],
+            "target_path": "decisions/taxonomy.md",
+            "reinforces": None,
+            "contradicts": None,
+            # Card-shape fields
+            "scope": "cross-session-durable",
+            "knowledge_type_confidence": "high",
+            "user_affect_valence": "neutral",
+            "evidence_quotes": ["Emma stated test invalidation is a blocker."],
+            "importance": 0.85,
+            "criterion_weights": {
+                "test preservation": "hard_veto",
+                "coverage": "strong",
+                "migration effort": "weak",
+            },
+            "rejected_options": [
+                {"option": "full redesign", "reason": "invalidates existing tests"},
+                {"option": "13-category flat list", "reason": "rejected without recorded reason"},
+            ],
+        }
+        base.update(overrides)
+        return base
+
+    def test_criterion_weights_stored_as_json(self, consolidator, base, ephemeral_file):
+        """criterion_weights from card decision stored as JSON string on Memory."""
+        decision = self._decision_card()
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cfw-001")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.criterion_weights is not None
+        # round-trip: stored JSON must recover original dict
+        parsed = json.loads(mem.criterion_weights)
+        assert parsed == decision["criterion_weights"]
+
+    def test_rejected_options_stored_as_json(self, consolidator, base, ephemeral_file):
+        """rejected_options from card decision stored as JSON string on Memory."""
+        decision = self._decision_card()
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cfw-002")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.rejected_options is not None
+        parsed = json.loads(mem.rejected_options)
+        assert parsed == decision["rejected_options"]
+
+    def test_criterion_weights_round_trip(self, consolidator, base, ephemeral_file):
+        """json.loads(mem.criterion_weights) returns the original dict exactly."""
+        cw = {"latency": "hard_veto", "cost": "strong", "dx": "mentioned"}
+        decision = self._decision_card(criterion_weights=cw)
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cfw-003")
+
+        mem = Memory.get_by_id(result["kept"][0])
+        assert json.loads(mem.criterion_weights) == cw
+
+    def test_affect_valence_neutral_default_for_card(self, consolidator, base, ephemeral_file):
+        """Card decision with no explicit valence (or neutral) stores affect_valence='neutral'."""
+        decision = self._decision_card(user_affect_valence="neutral")
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cfw-004")
+
+        assert len(result["kept"]) == 1
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.affect_valence == "neutral"
+
+    def test_criterion_weights_none_when_absent(self, consolidator, base, ephemeral_file):
+        """Card decision without criterion_weights stores NULL (not empty JSON)."""
+        decision = self._decision_card()
+        del decision["criterion_weights"]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cfw-005")
+
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.criterion_weights is None
+
+    def test_rejected_options_none_when_absent(self, consolidator, base, ephemeral_file):
+        """Card decision without rejected_options stores NULL (not empty JSON)."""
+        decision = self._decision_card()
+        del decision["rejected_options"]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text([decision])
+            result = consolidator.consolidate_session(ephemeral_file, "cfw-006")
+
+        mem = Memory.get_by_id(result["kept"][0])
+        assert mem.rejected_options is None
