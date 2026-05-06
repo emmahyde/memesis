@@ -1,5 +1,7 @@
 # Testing
 
+> Last updated: 2026-05-06. Covers T1/T2/T3 wave test patterns through Wave 4.
+
 ## Framework
 
 - **pytest**: `pytest>=8.0` declared in `[project.optional-dependencies] dev` (`pyproject.toml:27`). Config in `pytest.ini`.
@@ -37,6 +39,7 @@
 - **`side_effect` for multi-call sequences**: retry tests use `side_effect = [bad_response, good_response]` to simulate first-call failure and second-call success (`tests/test_consolidator.py`).
 - **Capture closures**: some tests capture the exact prompt text sent to the LLM by using a closure as `side_effect` to record call arguments (`tests/test_consolidator.py`).
 - **No Bedrock embedding mocks**: tests that would exercise `embed_for_memory` skip or mock at the `get_vec_store()` level since Bedrock calls are not mocked at the boto3 layer.
+- **Transport-level patch for consolidator**: T2/T3 wave tests patch `core.consolidator._call_llm_transport` (not `core.consolidator.call_llm`) because the consolidator imports the transport as `_call_llm_transport` alias. Example: `with patch("core.consolidator._call_llm_transport") as mock_transport:` (`tests/test_consolidator.py:930`).
 
 ### Fixtures
 
@@ -69,7 +72,9 @@
 
 Tests are grouped into `class Test<Feature>:` blocks named after the capability being tested. Examples:
 - `test_retrieval.py`: `TestHybridSearch`, `TestCrystallizedHybrid`, `TestThompsonSampling`, `TestProvenanceSignals`, `TestActiveTensions`, `TestAffectAwareThreadOrdering`
-- `test_consolidator.py`: `TestConsolidateKeep`, `TestConsolidatePrune`, `TestConsolidatePromote`, `TestContradictionResolution`, `TestMalformedJsonHandling`
+- `test_consolidator.py`: `TestConsolidateKeep`, `TestConsolidatePrune`, `TestConsolidatePromote`, `TestContradictionResolution`, `TestMalformedJsonHandling`, `TestCardImportance`, `TestCardFieldsNewWiring`
+- `test_issue_cards.py`: `TestRule0EntityGate`, `TestEvidenceIndicesValidation`, `TestRule3KensingerRemoved`, `TestAllIndicesInvalidDemotion`, `TestMixedValenceInstruction`
+- `test_prompts.py`: `TestOrphanQualityGateBoundary`, `TestCrossPromptConsistency`
 - `test_causal_edges.py`: `TestSchemaMigration`, `TestReconsolidationCausalEdges`, `TestContradictionEdges`, `TestArcAffect`
 - `test_models.py`: `TestDatabaseInit`, `TestMemoryCRUD`, `TestMemorySearch`, `TestFTS`, `TestContentHash`
 
@@ -83,14 +88,74 @@ Every test gets its own SQLite database via `tmp_path`. The standard teardown ca
 
 Tests that need to prove multi-day behavior (e.g., spacing effect, spaced repetition) backdate timestamps via raw SQL or direct field assignment since tests complete in milliseconds. Example: `test_integration.py` backdates `consolidation_log.timestamp` entries.
 
+---
+
+## T1/T2/T3 Wave Test Patterns (added 2026-05-06)
+
+### TestCardImportance (`tests/test_consolidator.py:902`)
+
+Verifies write-site discipline: importance on the `Memory` row flows from `card.importance`, not from a recomputed somatic boost. Key methods:
+
+- `test_card_importance_flows_from_card_dict` — neutral card with `importance=0.8` stores exactly `0.8` on the memory row (`pytest.approx(0.8)`).
+- `test_friction_valence_triggers_kensinger_bump` — `importance=0.8, user_affect_valence="friction"` → stored `importance == 0.85` (the sole +0.05 Kensinger site).
+- `test_non_friction_card_does_not_get_kensinger_bump` — `"delight"` valence does not trigger the bump.
+- `test_malformed_card_importance_falls_back_with_warning` — non-numeric `importance` field falls back to the legacy formula (`0.5 + importance_boost`), and `logging.WARNING` is emitted containing `"malformed"` or `"falling back"`.
+
+Decision fixture shape: card-shaped dict with `"scope"`, `"evidence_quotes"`, `"importance"`, and `"user_affect_valence"` keys.
+
+### TestCardFieldsNewWiring (`tests/test_consolidator.py:1026`)
+
+Verifies that `criterion_weights` and `rejected_options` from the LLM card are stored correctly:
+
+- `test_criterion_weights_stored_as_json` — `json.loads(mem.criterion_weights)` equals the original dict.
+- `test_rejected_options_stored_as_json` — same pattern for the list.
+- `test_criterion_weights_round_trip` — explicit key/value fidelity check with a three-criterion dict.
+- `test_criterion_weights_none_when_absent` — absent key stores `NULL`, not `'{}'`.
+- `test_rejected_options_none_when_absent` — same for `rejected_options`.
+
+Patch target: `core.consolidator._call_llm_transport`.
+
+### TestAllIndicesInvalidDemotion (`tests/test_issue_cards.py:355`)
+
+Verifies tier3 #29: cards with all-invalid `evidence_obs_indices` are demoted to orphans.
+
+- `test_all_invalid_indices_demoted` — indices `[50, 99]` with 3 observations: zero valid cards, one orphan with `demoted_invalid_indices=True`, `stats["cards_invalid_indices_demoted"] == 1`.
+- `test_partial_valid_indices_not_demoted` — indices `[0, 999]` with 5 observations: card survives (index 0 is valid).
+- `test_empty_indices_demoted` — `evidence_obs_indices: []` treated as all-invalid.
+- `test_demoted_stat_zero_when_all_valid` — baseline: stat is 0 when indices are clean.
+
+Patch target: `core.issue_cards.call_llm`.
+
+### TestOrphanQualityGateBoundary (`tests/test_prompts.py:350`)
+
+Enforces vocabulary separation between pipeline stages. The word "orphan" and synthesis-layer vocabulary must not appear in `OBSERVATION_EXTRACT_PROMPT` or `CONSOLIDATION_PROMPT`; orphaning is a quality gate owned by `core/issue_cards.py` (Stage 1.5), not Stage 1 or Stage 2.
+
+- `test_orphan_not_in_extract_prompt` — asserts `"orphan" not in OBSERVATION_EXTRACT_PROMPT.lower()`.
+- `test_orphan_not_in_consolidation_prompt` — same for `CONSOLIDATION_PROMPT`.
+- `test_issue_card_not_in_extract_prompt` — synthesis vocabulary must not leak into Stage 1.
+- `test_quality_gate_in_extract_is_observation_gate` — extraction prompt retains its own quality gate language (`"falsifiable"`, `"durable"`, or `"load-bearing"`).
+- `test_behavioral_gate_in_consolidation` — consolidation prompt retains its behavioral gate language.
+
+### TestRule3KensingerRemoved (`tests/test_issue_cards.py:343`)
+
+Verifies that `ISSUE_SYNTHESIS_PROMPT` does not contain `"bump +0.05"` or `"Kensinger 2009"`, and does contain the note `"consolidator.py"` and `"do not pre-apply it"`. This enforces the write-site discipline contract from the prompt side.
+
+### TestEvidenceIndicesValidation (`tests/test_issue_cards.py:213`)
+
+Verifies per-index filtering before the all-invalid demotion check:
+
+- `test_out_of_range_index_dropped_card_demoted_to_orphan` — `[999]` with 5 obs → demotion to orphan.
+- `test_valid_indices_preserved` — `[0, 2, 4]` pass through unchanged, `stats["dropped_invalid_indices"] == 0`.
+- `test_invalid_type_filtered` — mixed types (`["0", 1, 3.5, 2]`): string and float-non-int entries are filtered; only int `1` and int `2` survive.
+
 ## Running Tests
 
 - **All tests (unit + eval)**: `pytest`
 - **Unit tests only**: `pytest tests/`
 - **Eval suite only**: `pytest eval/`
 - **Single file**: `pytest tests/test_retrieval.py`
-- **Single class**: `pytest tests/test_consolidator.py::TestContradictionResolution`
-- **Single test**: `pytest tests/test_consolidator.py::TestConsolidateKeep::test_keep_calls_store_create`
+- **Single class**: `pytest tests/test_consolidator.py::TestCardImportance`
+- **Single test**: `pytest tests/test_consolidator.py::TestCardImportance::test_friction_valence_triggers_kensinger_bump`
 - **Watch mode**: `watchexec -e py -- pytest tests/`
 - **Verbose output**: `pytest -v`
 - **Stop on first failure**: `pytest -x`
@@ -103,3 +168,4 @@ Tests that need to prove multi-day behavior (e.g., spacing effect, spaced repeti
 - **Embedding/VecStore integration**: vector operations are tested only via `test_models.py::TestVecEnabled` and `test_models.py::TestVecUnavailableFallback`. No tests exercise `VecStore.search_vector` with actual embeddings (Bedrock calls not mocked at boto3 layer).
 - **Thompson sampling non-determinism**: `_thompson_rerank` uses `random.betavariate` without seeding. Tests that depend on retrieval order will produce non-deterministic results. Current tests avoid asserting ranked order.
 - **Concurrent write contention**: no tests exercise dual-connection (peewee + apsw) contention scenarios.
+- **Card-path promote path**: `TestCardFieldsNewWiring` and `TestCardImportance` cover the `keep` path only. The `_execute_promote()` path has no equivalent card-field wiring tests yet.
