@@ -23,10 +23,13 @@ Usage::
     # tempdir is cleaned up on __exit__
 """
 
+import logging
 import shutil
 import tempfile
 
 from core.database import close_db, init_db
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayDB:
@@ -58,8 +61,8 @@ class ReplayDB:
     def __exit__(self, _exc_type, _exc_val, _exc_tb) -> None:
         try:
             close_db()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("ReplayDB close_db() failed during teardown: %s", exc)
         if self._tempdir is not None:
             shutil.rmtree(self._tempdir, ignore_errors=True)
             self._tempdir = None

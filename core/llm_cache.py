@@ -32,12 +32,15 @@ to prevent partial reads if the process is interrupted during a write.
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import tempfile
 from pathlib import Path
 
 from core.llm import call_llm
+
+logger = logging.getLogger(__name__)
 
 # 500 MB eviction threshold (bytes)
 _CACHE_EVICTION_THRESHOLD = 500 * 1024 * 1024
@@ -101,8 +104,9 @@ def _evict_if_needed(directory: Path) -> None:
             size = path.stat().st_size
             path.unlink()
             total -= size
-        except OSError:
-            pass
+            logger.info("llm_cache evicted path=%s size=%d", path.name, size)
+        except OSError as exc:
+            logger.warning("llm_cache eviction failed path=%s err=%s", path, exc)
 
 
 def cached_call_llm(
@@ -146,10 +150,12 @@ def cached_call_llm(
     if not force_live and cache_file.exists():
         try:
             data = json.loads(cache_file.read_text(encoding="utf-8"))
+            logger.debug("llm_cache hit key=%s", key)
             return data["response"]
-        except (OSError, KeyError, json.JSONDecodeError):
-            # Corrupt cache entry — fall through to live call
-            pass
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            logger.warning("llm_cache corrupt entry key=%s err=%s — falling through to live call", key, exc)
+    else:
+        logger.debug("llm_cache miss key=%s force_live=%s", key, force_live)
 
     # Live call
     response = call_llm(
