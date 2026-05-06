@@ -15,11 +15,9 @@ Covers:
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -31,7 +29,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 # Import the modules under test
 import scripts.evolve as evolve_mod
 from scripts.evolve import (
-    _AUTORESEARCH_NOT_WIRED,
     _next_replay_n,
     _patched_llm,
     _slug_from_path,
@@ -118,17 +115,18 @@ class TestSlugDerivation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("tmp_evolve_base")
 class TestReplayCounter:
-    def test_first_call_returns_one(self, tmp_evolve_base):
+    def test_first_call_returns_one(self):
         n = _next_replay_n("sess-001")
         assert n == 1
 
-    def test_second_call_returns_two(self, tmp_evolve_base):
+    def test_second_call_returns_two(self):
         _next_replay_n("sess-002")
         n = _next_replay_n("sess-002")
         assert n == 2
 
-    def test_different_sessions_independent(self, tmp_evolve_base):
+    def test_different_sessions_independent(self):
         n_a = _next_replay_n("sess-a")
         n_b = _next_replay_n("sess-b")
         n_a2 = _next_replay_n("sess-a")
@@ -136,7 +134,7 @@ class TestReplayCounter:
         assert n_b == 1
         assert n_a2 == 2
 
-    def test_count_file_written_atomically(self, tmp_evolve_base):
+    def test_count_file_written_atomically(self):
         _next_replay_n("sess-atomic")
         count_path = evolve_mod._replay_count_path("sess-atomic")
         assert count_path.exists()
@@ -157,7 +155,7 @@ class TestPatchedLLM:
         original = llm_mod.call_llm
         captured_inside = {}
 
-        with patch("core.llm_cache.cached_call_llm", return_value="cached") as mock_cache:
+        with patch("core.llm_cache.cached_call_llm", return_value="cached"):
             with _patched_llm(force_live=False):
                 captured_inside["fn"] = llm_mod.call_llm
                 # Call via the patched function
@@ -224,7 +222,7 @@ class TestPatchedLLM:
 
 
 class TestReplayDBCreatedAndCleanedUp:
-    def test_context_manager_creates_and_cleans_tempdir(self, tmp_path):
+    def test_context_manager_creates_and_cleans_tempdir(self):
         """ReplayDB creates a tempdir, init_db runs, cleanup happens on __exit__."""
         from core.replay_db import ReplayDB
 
@@ -238,7 +236,7 @@ class TestReplayDBCreatedAndCleanedUp:
 
         assert not Path(captured_dir["path"]).exists(), "tempdir should be removed on __exit__"
 
-    def test_cleanup_on_exception(self, tmp_path):
+    def test_cleanup_on_exception(self):
         """ReplayDB cleans up even when an exception is raised inside the context."""
         from core.replay_db import ReplayDB
 
@@ -264,8 +262,9 @@ class TestReplayDBCreatedAndCleanedUp:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("tmp_evolve_base")
 class TestTraceWriterInitWithReplaySessionId:
-    def test_trace_writer_session_id_format(self, tmp_evolve_base, tmp_trace_dir):
+    def test_trace_writer_session_id_format(self, tmp_trace_dir):
         """TraceWriter should be initialised with replay-<orig>-<n> session_id."""
         from core.trace import TraceWriter
 
@@ -285,7 +284,7 @@ class TestTraceWriterInitWithReplaySessionId:
         assert event["event"] == "test_event"
         assert event["payload"] == {"value": 1}
 
-    def test_replay_session_id_regex_matches(self, tmp_evolve_base):
+    def test_replay_session_id_regex_matches(self):
         """The replay session_id must match replay-<orig>-<n> pattern."""
         import re
         orig = "foo-bar-baz"
@@ -323,7 +322,7 @@ class TestEvalFileWrittenToCorrectPath:
 
         with patch("scripts.evolve.extract_spec_from_text", return_value=fake_spec):
             with patch("scripts.evolve.compile_to_pytest", return_value=fake_source):
-                specs, eval_paths = evolve_mod._compile_evals(
+                _, eval_paths = evolve_mod._compile_evals(
                     descriptions=["Should remember oauth token expiry"],
                     replay_store_path=str(tmp_path / "db"),
                     slug="my-session",
@@ -376,12 +375,12 @@ class TestGuardSuiteInvocationCommand:
 
         captured_cmds: list[list[str]] = []
 
-        def mock_run(cmd, **kwargs):
+        def mock_run(cmd, **_):
             captured_cmds.append(cmd)
             return MagicMock(returncode=0)
 
         with patch("subprocess.run", side_effect=mock_run):
-            result = evolve_mod._run_guard_suite("my-session", [eval_path])
+            evolve_mod._run_guard_suite("my-session", [eval_path])
 
         assert len(captured_cmds) == 1
         cmd = captured_cmds[0]
@@ -419,28 +418,6 @@ class TestGuardSuiteInvocationCommand:
 
 
 # ---------------------------------------------------------------------------
-# TestAutoresearchStub
-# ---------------------------------------------------------------------------
-
-
-class TestAutoresearchStub:
-    def test_autoresearch_flag_prints_placeholder_and_exits_0(self, capsys):
-        """--autoresearch should print the stub message and return 0."""
-        rc = main(["--transcript", "/dev/null", "--autoresearch"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert _AUTORESEARCH_NOT_WIRED in out
-
-    def test_autoresearch_flag_does_not_attempt_replay(self, capsys):
-        """--autoresearch should exit before touching ReplayDB."""
-        with patch("scripts.evolve.ReplayDB") as mock_db_cls:
-            rc = main(["--transcript", "/dev/null", "--autoresearch"])
-
-        mock_db_cls.assert_not_called()
-        assert rc == 0
-
-
-# ---------------------------------------------------------------------------
 # TestMainEndToEnd (mocked)
 # ---------------------------------------------------------------------------
 
@@ -451,8 +428,9 @@ class TestMainEndToEnd:
         rc = main(["--transcript", str(tmp_path / "nonexistent.jsonl")])
         assert rc == 1
 
+    @pytest.mark.usefixtures("tmp_evolve_base", "tmp_trace_dir")
     def test_no_descriptions_exits_cleanly(
-        self, sample_transcript, tmp_path, tmp_evolve_base, tmp_trace_dir, monkeypatch
+        self, sample_transcript, tmp_path, monkeypatch
     ):
         """If user provides no expected memories, exit 0 with no evals compiled."""
         monkeypatch.setattr(evolve_mod, "_PROJECT_ROOT", tmp_path)
@@ -464,16 +442,18 @@ class TestMainEndToEnd:
 
         assert rc == 0
 
+    @pytest.mark.usefixtures("tmp_evolve_base", "tmp_trace_dir")
     def test_replay_db_cleaned_up_on_main_exception(
-        self, sample_transcript, tmp_path, tmp_evolve_base, tmp_trace_dir, monkeypatch
+        self, sample_transcript, tmp_path, monkeypatch
     ):
         """ReplayDB tempdir must be cleaned up even if _run_replay raises."""
         monkeypatch.setattr(evolve_mod, "_PROJECT_ROOT", tmp_path)
 
         captured_base_dirs = []
 
-        def fake_run_replay(transcript_path, base_dir, session_id, force_live):
-            captured_base_dirs.append(base_dir)
+        def fake_run_replay(*args, **kwargs):
+            del kwargs
+            captured_base_dirs.append(args[1])
             raise RuntimeError("pipeline failure")
 
         with patch("scripts.evolve._run_replay", side_effect=fake_run_replay), \
