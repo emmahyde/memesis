@@ -36,3 +36,17 @@ memesis-mcp = "core.mcp_server:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "hooks*"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+extraPaths = ["."]
+exclude = ["backfill-output", ".venv", "**/__pycache__"]
+typeCheckingMode = "off"
+reportMissingImports = "none"
+reportAttributeAccessIssue = "none"
+reportArgumentType = "none"
+reportOptionalOperand = "none"
+reportOptionalMemberAccess = "none"
+reportIncompatibleVariableOverride = "none"
+reportUnusedVariable = "none"
+reportUnusedImport = "none"
