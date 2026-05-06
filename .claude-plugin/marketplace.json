@@ -1,0 +1,24 @@
+{
+  "name": "memesis-local",
+  "owner": {
+    "name": "Emma Hyde"
+  },
+  "metadata": {
+    "description": "Project-local marketplace for the memesis memory lifecycle plugin",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "memesis",
+      "source": "./",
+      "description": "Self-driven memory lifecycle plugin for Claude Code — learn, recall, reflect, consolidate",
+      "version": "0.2.0",
+      "author": {
+        "name": "Emma Hyde"
+      },
+      "keywords": ["memory", "lifecycle", "recall", "consolidation", "reflection"],
+      "category": "productivity",
+      "strict": false
+    }
+  ]
+}

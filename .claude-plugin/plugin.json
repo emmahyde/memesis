@@ -1,5 +1,46 @@
 {
   "name": "memesis",
   "version": "0.2.0",
-  "description": "Self-driven memory lifecycle with autonomous curation for Claude Code"
+  "description": "Self-driven memory lifecycle with autonomous curation for Claude Code",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.sh ${CLAUDE_PLUGIN_ROOT} ${CLAUDE_PLUGIN_DATA}",
+            "timeout": 120,
+            "statusMessage": "Installing memesis dependencies..."
+          },
+          {
+            "type": "command",
+            "command": "NLTK_DATA=${CLAUDE_PLUGIN_DATA}/nltk_data ${CLAUDE_PLUGIN_DATA}/venv/bin/python3 ${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "NLTK_DATA=${CLAUDE_PLUGIN_DATA}/nltk_data ${CLAUDE_PLUGIN_DATA}/venv/bin/python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_compact.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "NLTK_DATA=${CLAUDE_PLUGIN_DATA}/nltk_data ${CLAUDE_PLUGIN_DATA}/venv/bin/python3 ${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_inject.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
 }

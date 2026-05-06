@@ -225,6 +225,13 @@ def seed(kept: list[dict], project_context: str = None, dry_run: bool = False):
                 source_session=d.get("_session", ""),
                 content_hash=content_hash,
                 files_modified=files_modified_json,
+                # Defensive nulls — seed is a non-card write path (D3)
+                temporal_scope=None,
+                confidence=None,
+                affect_valence=None,
+                actor=None,
+                criterion_weights=None,
+                rejected_options=None,
             )
             file_path.write_text(full_content, encoding="utf-8")
             seeded += 1

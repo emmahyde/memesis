@@ -450,8 +450,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[evolve] ERROR: transcript not found: {transcript_path}", file=sys.stderr)
         return 1
 
-    # Derive session_id and replay counter
-    orig_session_id = transcript_path.stem
+    # Derive session_id and replay counter (HI-002: sanitize path stem)
+    _raw_stem = transcript_path.stem
+    orig_session_id = re.sub(r"[^A-Za-z0-9_\-]", "-", _raw_stem).lstrip("-.")
+    if not orig_session_id:
+        orig_session_id = "session"
     n = _next_replay_n(orig_session_id)
     replay_session_id = f"replay-{orig_session_id}-{n}"
     slug = _slug_from_path(transcript_path)

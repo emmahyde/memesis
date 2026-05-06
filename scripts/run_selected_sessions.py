@@ -28,11 +28,14 @@ from core.transcript_ingest import (  # noqa: E402
 from core.rule_registry import resolve_overrides_from_root  # noqa: E402
 from core.session_detector import detect_session_type  # noqa: E402
 from core.self_reflection_extraction import (  # noqa: E402
+    CorrectionCard,
     ExtractionRunStats,
-    reflect_on_extraction,
-    self_model_path,
-    select_chunking,
     aggregate_audit,
+    reflect_on_corpus,
+    reflect_on_extraction,
+    select_chunking,
+    self_model_path,
+    stamp_confirmed_observations,
 )
 
 logging.basicConfig(
@@ -82,6 +85,7 @@ def main() -> None:
     )
 
     report: dict[str, dict] = {}
+    correction_corpus: list[CorrectionCard] = []
 
     with CursorStore() as store:
         rows = store._conn.execute(
@@ -173,6 +177,7 @@ def main() -> None:
                     context_before=args.context_before,
                     context_after=args.context_after,
                     overrides=overrides,
+                    cwd=cwd,
                 )
                 obs_list = result["observations"]
                 cards = result.get("issue_cards", [])
@@ -210,6 +215,16 @@ def main() -> None:
                 "  → %d orphan observation(s) appended (cards held in report)",
                 n,
             )
+
+            # Accumulate correction-kind cards for cross-session recurrent_agent_failure rule.
+            for c in cards:
+                if c.get("kind") == "correction":
+                    correction_corpus.append(CorrectionCard(
+                        card_id=c.get("card_id") or c.get("id") or "",
+                        session_id=session_id,
+                        problem=c.get("problem", "") or "",
+                        decision_or_outcome=c.get("decision_or_outcome", "") or "",
+                    ))
 
             # ---- self-reflection on this session's run ----
             if args.mode == "hierarchical":
@@ -257,7 +272,18 @@ def main() -> None:
         args.report.write_text(json.dumps(report, indent=2, default=str))
         logger.info("report written to %s", args.report)
 
+    if args.mode == "hierarchical" and correction_corpus:
+        corpus_obs = reflect_on_corpus(correction_corpus)
+        if corpus_obs:
+            logger.info(
+                "cross-session: %d recurrent_agent_failure cluster(s) fired",
+                len(corpus_obs),
+            )
+
     if args.mode == "hierarchical":
+        stamped = stamp_confirmed_observations()
+        if stamped:
+            logger.info("stamp_confirmed: marked %d observation(s) as confirmed", stamped)
         smp = self_model_path()
         if smp.exists():
             logger.info("self-model refreshed at %s", smp)
