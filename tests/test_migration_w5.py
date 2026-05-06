@@ -185,10 +185,10 @@ class TestRunMigration:
     def _insert_raw(self, memory_id, mode=None, observation_type=None, concept_tags=None):
         """Insert a row with legacy fields via raw SQL (bypasses model field constraints)."""
         db.execute_sql(
-            "INSERT INTO memories (id, stage, title, content, created_at, updated_at, "
+            "INSERT INTO memories (id, stage, title, content, source, created_at, updated_at, "
             "access_count, mode, observation_type, concept_tags) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (memory_id, "ephemeral", "test", "content", _now(), _now(),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (memory_id, "ephemeral", "test", "content", "test", _now(), _now(),
              0, mode, observation_type, concept_tags),
         )
 

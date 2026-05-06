@@ -315,6 +315,35 @@ class TestActiveWriter:
 
 
 # ---------------------------------------------------------------------------
+# TestTraceWriterSessionIdValidation  (HI-002)
+# ---------------------------------------------------------------------------
+
+
+class TestTraceWriterSessionIdValidation:
+    def test_rejects_path_traversal(self, traces_dir):
+        with pytest.raises(ValueError, match="invalid session_id"):
+            TraceWriter("../foo", base_dir=traces_dir)
+
+    def test_rejects_slash(self, traces_dir):
+        with pytest.raises(ValueError, match="invalid session_id"):
+            TraceWriter("foo/bar", base_dir=traces_dir)
+
+    def test_rejects_empty_string(self, traces_dir):
+        with pytest.raises(ValueError, match="invalid session_id"):
+            TraceWriter("", base_dir=traces_dir)
+
+    def test_accepts_dash_and_digits(self, traces_dir):
+        w = TraceWriter("session-abc-123", base_dir=traces_dir)
+        w.emit("x", "y", {})
+        assert (traces_dir / "session-abc-123.jsonl").exists()
+
+    def test_accepts_dot_in_session_id(self, traces_dir):
+        w = TraceWriter("replay-x.1", base_dir=traces_dir)
+        w.emit("x", "y", {})
+        assert (traces_dir / "replay-x.1.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
 # TestNoLoggingChannel
 # ---------------------------------------------------------------------------
 

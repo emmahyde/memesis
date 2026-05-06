@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     from .vec import VecStore
 
 CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens x 4 chars/token
+# Friction memories encode emotionally-salient negative affect (Kensinger 2007);
+# a small additive boost ensures they rank above equal-RRF neutral memories.
+AFFECT_FRICTION_BOOST = 0.02
 THREAD_BUDGET_CHARS = 8_000
 TENSION_BUDGET_CHARS = 2_000
 _THREAD_NARRATIVE_CAP = 1_000
@@ -949,7 +952,19 @@ class RetrievalEngine:
                 boost += CRYSTAL_BOOST
             if project_context is not None and memory.project_context == project_context:
                 boost += PROJECT_BOOST
+            if getattr(memory, "affect_valence", None) == "friction":
+                boost += AFFECT_FRICTION_BOOST
             scored.append((rrf_score + boost, memory))
+
+        # Propagate affect_score into _last_hybrid_candidates for observer logging
+        affect_by_id: dict[str, float] = {
+            memory.id: (AFFECT_FRICTION_BOOST if getattr(memory, "affect_valence", None) == "friction" else 0.0)
+            for _, memory in scored
+        }
+        for candidate in self._last_hybrid_candidates:
+            mid = candidate["memory_id"]
+            if mid in affect_by_id:
+                candidate["affect_score"] = affect_by_id[mid]
 
         scored.sort(key=lambda x: x[0], reverse=True)
 

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -364,13 +365,12 @@ def _rule_parse_errors(stats: ExtractionRunStats) -> SelfObservation | None:
 
 @_rule("dedup_inert")
 def _rule_dedup_inert(stats: ExtractionRunStats) -> SelfObservation | None:
-    """Jaccard dedup never fires despite high observation volume.
+    """Content-hash dedup drops nothing despite high observation volume.
 
-    Added 2026-04-28 (Phase E audit). Across 5 dense sessions / 211 raw
-    observations, only 1 dedup happened — suggesting either the threshold
-    (jaccard >= 0.7) is too tight or the LLM rephrases enough across
-    windows that the bag-of-words overlap stays low. Either way, the
-    dedup pass is paying compute cost for ~zero return.
+    With Reframe A (stateful incremental extraction), in-session dedup
+    should prevent re-extraction of already-seen facts. Zero drops on a
+    dense session may mean windows are genuinely non-overlapping OR that
+    Reframe A is disabled and paraphrase duplicates are passing through.
     """
     if stats.raw_observations < 30:
         return None
@@ -380,17 +380,15 @@ def _rule_dedup_inert(stats: ExtractionRunStats) -> SelfObservation | None:
         facts=[
             f"Session {stats.session_id[:12]} produced "
             f"{stats.raw_observations} raw observations across "
-            f"{stats.windows} windows but the Jaccard dedup pass dropped "
-            f"zero. Either the 0.7 threshold is too tight or LLM rewording "
-            f"across windows defeats bag-of-words overlap."
+            f"{stats.windows} windows; content-hash dedup dropped zero. "
+            f"If Reframe A is disabled, paraphrase duplicates may be "
+            f"passing through to synthesis."
         ],
         kind="open_question",
         importance=0.55,
         proposed_action=(
-            "Sample 5 raw observations from adjacent windows on this "
-            "session and compute pairwise Jaccard manually; consider "
-            "lowering the threshold to 0.55 or switching to embedding "
-            "cosine similarity."
+            "Enable REFRAME_A_ENABLED to prevent in-session re-extraction. "
+            "If already enabled, zero drops indicate genuinely non-overlapping windows."
         ),
         evidence=stats.to_dict(),
         rule_id="dedup_inert",
@@ -740,6 +738,70 @@ def _append_audit(obs: list[SelfObservation], root: Path | None = None) -> None:
                 fh.write(json.dumps(o.to_dict()) + "\n")
     except OSError as exc:
         logger.warning("self-reflection: failed to write audit: %s", exc)
+
+
+def stamp_confirmed_observations(root: Path | None = None) -> int:
+    """Back-propagate confirmed status to JSONL entries.
+
+    Reads self_observations.jsonl, determines which rule_ids have fire_count >= 3
+    (confirmed threshold), rewrites the file atomically with confirmed=True on
+    those entries. Returns the number of entries updated.
+
+    Called after each sweep run so `confirmed` in the JSONL stays consistent
+    with what `aggregate_audit()` computes dynamically.
+    """
+    import tempfile, shutil
+    audit_p = self_model_audit_path(root)
+    if not audit_p.exists():
+        return 0
+
+    # First pass: count fires per rule_id
+    fire_counts: dict[str, int] = {}
+    try:
+        lines = audit_p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    for line in lines:
+        try:
+            rec = json.loads(line)
+            rid = rec.get("rule_id", "unknown")
+            fire_counts[rid] = fire_counts.get(rid, 0) + 1
+        except json.JSONDecodeError:
+            pass
+
+    confirmed_rules = {rid for rid, n in fire_counts.items() if n >= 3}
+    if not confirmed_rules:
+        return 0
+
+    # Second pass: rewrite with confirmed=True for confirmed rules
+    updated = 0
+    new_lines: list[str] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            if rec.get("rule_id") in confirmed_rules and not rec.get("confirmed"):
+                rec["confirmed"] = True
+                updated += 1
+            new_lines.append(json.dumps(rec))
+        except json.JSONDecodeError:
+            new_lines.append(line)
+
+    if updated == 0:
+        return 0
+
+    try:
+        fd, tmp = tempfile.mkstemp(dir=audit_p.parent, suffix=".jsonl.tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(new_lines) + "\n")
+        shutil.move(tmp, audit_p)
+    except OSError as exc:
+        logger.warning("stamp_confirmed_observations: write failed: %s", exc)
+        return 0
+
+    return updated
 
 
 def _refresh_self_model_doc(

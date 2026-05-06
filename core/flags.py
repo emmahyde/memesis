@@ -39,6 +39,12 @@ DEFAULTS = {
     "contradiction_tensors": True,
     "affect_signatures": True,
     "adversarial_surfacing": True,
+    # W5 schema-promoted column weighting (Wave 3a → Wave 3c retrieval).
+    # Kensinger prior on friction/delight; session-local scope penalty;
+    # confidence as multiplicative tie-breaker.
+    "affect_weighted_retrieval": True,
+    "temporal_scope_weighting": True,
+    "confidence_weighting": True,
 }
 
 _cache: dict | None = None

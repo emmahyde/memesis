@@ -503,3 +503,91 @@ class TestSemanticRehydration:
         assert any(m.id == mid for m in matches), (
             "FTS path should work independently of semantic availability"
         )
+
+
+# ---------------------------------------------------------------------------
+# Schema-promoted column weighting (Wave 3a → Wave 3c)
+# ---------------------------------------------------------------------------
+
+class TestSchemaWeighting:
+    """Verify affect_valence, temporal_scope, and confidence factor into relevance."""
+
+    @pytest.fixture
+    def w5_engine(self, base, monkeypatch):
+        # Re-enable schema flags overridden by the autouse fixture.
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "saturation_decay": False,
+            "integration_factor": False,
+            "affect_weighted_retrieval": True,
+            "temporal_scope_weighting": True,
+            "confidence_weighting": True,
+        })
+        return RelevanceEngine()
+
+    def _set_w5(self, mem_id, **fields):
+        if not fields:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values()) + [mem_id]
+        db.execute_sql(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
+
+    def test_friction_valence_boosts_relevance(self, w5_engine, base):
+        """affect_valence=friction → ~20% boost over neutral."""
+        mid_neutral = _create_memory("Neutral mem", importance=0.5, days_ago=1)
+        mid_friction = _create_memory("Friction mem", importance=0.5, days_ago=1)
+        self._set_w5(mid_friction, affect_valence="friction")
+
+        s_neutral = w5_engine.compute_relevance(Memory.get_by_id(mid_neutral))
+        s_friction = w5_engine.compute_relevance(Memory.get_by_id(mid_friction))
+        assert s_friction > s_neutral
+        assert pytest.approx(s_friction / s_neutral, abs=0.02) == 1.20
+
+    def test_session_local_scope_penalizes(self, w5_engine, base):
+        """temporal_scope=session-local → ~40% penalty."""
+        mid_durable = _create_memory("Durable", importance=0.5, days_ago=1)
+        mid_local = _create_memory("Local", importance=0.5, days_ago=1)
+        self._set_w5(mid_durable, temporal_scope="cross-session-durable")
+        self._set_w5(mid_local, temporal_scope="session-local")
+
+        s_durable = w5_engine.compute_relevance(Memory.get_by_id(mid_durable))
+        s_local = w5_engine.compute_relevance(Memory.get_by_id(mid_local))
+        assert s_local < s_durable
+
+    def test_low_confidence_demoted(self, w5_engine, base):
+        """confidence=0.3 → factor 0.79; confidence=1.0 → factor 1.0."""
+        mid_high = _create_memory("High conf", importance=0.5, days_ago=1)
+        mid_low = _create_memory("Low conf", importance=0.5, days_ago=1)
+        self._set_w5(mid_high, confidence=1.0)
+        self._set_w5(mid_low, confidence=0.3)
+
+        s_high = w5_engine.compute_relevance(Memory.get_by_id(mid_high))
+        s_low = w5_engine.compute_relevance(Memory.get_by_id(mid_low))
+        assert s_low < s_high
+
+    def test_null_fields_no_op(self, w5_engine, base):
+        """Memories without W5 cols (legacy rows) score same as with-flags-disabled."""
+        mid = _create_memory("Legacy", importance=0.5, days_ago=1)
+        # All W5 fields NULL by default.
+        score = w5_engine.compute_relevance(Memory.get_by_id(mid))
+        assert 0.0 <= score <= 1.0
+
+    def test_flag_off_disables_weighting(self, base, monkeypatch):
+        """affect_weighted_retrieval=False → friction valence has no effect."""
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {
+            "saturation_decay": False,
+            "integration_factor": False,
+            "affect_weighted_retrieval": False,
+            "temporal_scope_weighting": False,
+            "confidence_weighting": False,
+        })
+        engine = RelevanceEngine()
+
+        mid_neutral = _create_memory("Neutral", importance=0.5, days_ago=1)
+        mid_friction = _create_memory("Friction", importance=0.5, days_ago=1)
+        self._set_w5(mid_friction, affect_valence="friction")
+
+        s_neutral = engine.compute_relevance(Memory.get_by_id(mid_neutral))
+        s_friction = engine.compute_relevance(Memory.get_by_id(mid_friction))
+        assert pytest.approx(s_neutral, abs=0.01) == s_friction

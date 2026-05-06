@@ -401,6 +401,13 @@ class SelfReflector:
             created_at=now,
             updated_at=now,
             content_hash=content_hash,
+            # Defensive nulls — self_reflection is a non-card write path (D3)
+            temporal_scope=None,
+            confidence=None,
+            affect_valence=None,
+            actor=None,
+            criterion_weights=None,
+            rejected_options=None,
         )
 
         # Write file

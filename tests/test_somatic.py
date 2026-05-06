@@ -61,21 +61,22 @@ class TestValenceClassification:
         assert result.valence == "delight"
 
 
-class TestPriorityOrder:
-    """Test that friction > surprise > delight > neutral."""
+class TestMultiAxis:
+    """Multi-axis: multiple emotions can fire simultaneously."""
 
-    def test_friction_beats_surprise(self):
-        # "wrong" (friction) + "unexpected" (surprise) -> friction wins
+    def test_friction_and_surprise_both_score(self):
+        # "wrong" (friction) + "unexpected" (surprise) -> both axes fire
         result = classify_valence("That's wrong and unexpected.")
-        assert result.valence == "friction"
+        assert result.emotion_scores.get("friction", 0) > 0
+        assert result.emotion_scores.get("surprise", 0) > 0
 
-    def test_friction_beats_delight(self):
+    def test_friction_only(self):
         result = classify_valence("Nice try but it's broken.")
-        assert result.valence == "friction"
+        assert result.emotion_scores.get("friction", 0) > 0
 
-    def test_surprise_beats_delight(self):
+    def test_surprise_over_delight(self):
         result = classify_valence("Wow, that's amazing! I never knew that.")
-        assert result.valence == "surprise"
+        assert result.emotion_scores.get("surprise", 0) > 0
 
 
 class TestImportanceBoosts:

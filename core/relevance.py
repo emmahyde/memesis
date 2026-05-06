@@ -137,6 +137,43 @@ class RelevanceEngine:
                 integration_factor = 0.75
             # else: connected — no penalty (1.0)
 
+        # W5 schema-promoted fields (Wave 3a). Wired behind flags so unset
+        # columns are no-op for legacy memories.
+        # affect_valence: Kensinger prior — friction-bearing memories are
+        #   load-bearing in similar future contexts; surface them earlier.
+        # temporal_scope: session-local memories should not follow the user
+        #   across sessions; cross-session-durable get a small lift.
+        # confidence: multiplicative tie-breaker for extraction certainty.
+        affect_factor = 1.0
+        if get_flag("affect_weighted_retrieval"):
+            valence = _get("affect_valence")
+            if valence == "friction":
+                affect_factor = 1.20
+            elif valence == "delight":
+                affect_factor = 1.10
+            elif valence == "surprise":
+                affect_factor = 1.05
+            # neutral / mixed / None: no change
+
+        scope_factor = 1.0
+        if get_flag("temporal_scope_weighting"):
+            scope = _get("temporal_scope")
+            if scope == "session-local":
+                scope_factor = 0.6
+            elif scope == "cross-session-durable":
+                scope_factor = 1.10
+            elif scope == "permanent":
+                scope_factor = 1.20
+            # None / unset: no change
+
+        confidence_factor = 1.0
+        if get_flag("confidence_weighting"):
+            confidence = _get("confidence")
+            if confidence is not None:
+                # Map [0.0, 1.0] confidence → [0.7, 1.0] factor so low-confidence
+                # memories are demoted but never zeroed out.
+                confidence_factor = 0.7 + 0.3 * max(0.0, min(1.0, float(confidence)))
+
         # Weighted geometric mean
         relevance = (
             (importance ** 0.4)
@@ -144,6 +181,9 @@ class RelevanceEngine:
             * (usage_signal ** 0.2)
             * (context_boost ** 0.1)
             * integration_factor
+            * affect_factor
+            * scope_factor
+            * confidence_factor
         )
 
         # Apply saturation penalty as subtraction (post-multiply)

@@ -212,18 +212,13 @@ class TestGuardSuite:
         assert result is False
 
     def test_tier3_failure_returns_false(self, tmp_path):
+        """Tier-3 classes are part of the full unit suite; a unit suite failure
+        (which would include tier-3 failures) causes _run_guard_suite to return False."""
         session = _make_session(tmp_path)
         r = _make_researcher(session)
 
-        call_count = 0
-
         def side_effect(*_args, **_kwargs):
-            nonlocal call_count
-            call_count += 1
-            # First call (unit suite) passes; second (collect-only) passes;
-            # third (first tier-3 class) fails
-            if call_count <= 2:
-                return MagicMock(returncode=0, stdout="passed", stderr="")
+            # Unit suite fails (simulating a tier-3 class failure within it)
             return MagicMock(returncode=1, stdout="FAILED tier-3", stderr="")
 
         with patch("subprocess.run", side_effect=side_effect):
@@ -251,10 +246,10 @@ class TestGuardSuite:
         def side_effect(cmd, **kwargs):
             nonlocal call_count
             call_count += 1
-            # unit suite + collect + all tier-3 classes pass; eval/recall fails
-            # The eval/recall cmd contains the path to eval/recall dir as one of its args
+            # Unit suite (tests/) passes; eval/recall invocation fails.
+            # Distinguish by checking whether the eval/recall dir path appears in cmd.
             cmd_str = " ".join(str(a) for a in cmd)
-            if "eval" in cmd_str and "recall" in cmd_str and "-k" not in cmd_str and "--co" not in cmd_str:
+            if "eval" in cmd_str and "recall" in cmd_str:
                 return MagicMock(returncode=1, stdout="RECALL FAILED", stderr="")
             return MagicMock(returncode=0, stdout="passed", stderr="")
 
