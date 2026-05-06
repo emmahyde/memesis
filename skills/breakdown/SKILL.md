@@ -1,6 +1,6 @@
 ---
-name: usage
-description: This skill should be used when the user asks for "usage stats", "which memories are used", "injection counts", "how often are memories used", "usage patterns", or "which memories get injected". Does NOT overlap with /stats (counts by stage), /health (archival candidates), or /threads (narrative threads).
+name: breakdown
+description: Use when the user explicitly invokes /memesis:breakdown or asks about memory injection counts, which memories get injected most, or which memories are never used after injection.
 ---
 
 # Usage — Track Memory Injection and Usage Patterns
@@ -10,9 +10,9 @@ Analyze how actively your memories are being used: which are injected most frequ
 ## Usage
 
 ```
-/memesis:usage
-/memesis:usage show injected-but-unused
-/memesis:usage trends
+/memesis:breakdown
+/memesis:breakdown show injected-but-unused
+/memesis:breakdown trends
 ```
 
 ## Procedure
@@ -153,7 +153,7 @@ if not rising and not falling:
 
 **Basic usage stats**
 ```
-/memesis:usage
+/memesis:breakdown
 ```
 Shows all four sections: most injected, most used, injected-but-unused, and importance trends.
 

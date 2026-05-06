@@ -71,6 +71,31 @@ def fmt_obs(obs: dict) -> str:
     if not raw_text:
         facts = obs.get("facts") or []
         raw_text = "; ".join(str(f) for f in facts if f)
+    # Extended fallbacks for LLM orphan schemas that use alternate field names.
+    # The synthesis prompt says "keep as-is", but LLMs may rename fields.
+    if not raw_text:
+        raw_text = (
+            obs.get("observation")
+            or obs.get("description")
+            or obs.get("note")
+            or obs.get("quote")
+            or obs.get("excerpt")
+            or ""
+        )
+    # Some orphans carry evidence_quotes but no text field at all — surface the first quote.
+    if not raw_text:
+        eq = obs.get("evidence_quotes") or []
+        if eq:
+            raw_text = str(eq[0])
+    # Last resort: emit a compact key=value dump of whatever fields the dict DOES carry,
+    # excluding the header fields already rendered above, so the auditor sees something useful.
+    if not raw_text:
+        _HEADER_FIELDS = {"kind", "importance", "knowledge_type", "scope"}
+        extra = {k: v for k, v in obs.items() if k not in _HEADER_FIELDS and v not in (None, "", [], {})}
+        if extra:
+            raw_text = "  ".join(f"{k}={repr(v)}" for k, v in extra.items())
+            if len(raw_text) > 100:
+                raw_text = raw_text[:100] + "..."
     body = raw_text.strip()
     if len(body) > 160:
         body = body[:160] + "..."

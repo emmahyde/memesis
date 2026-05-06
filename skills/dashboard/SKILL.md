@@ -10,7 +10,7 @@ Quick combined view of the memory system. For deeper analysis, use the focused s
 - **`/stats`** — Counts by stage, importance distribution, cross-project view
 - **`/health`** — Relevance health: archival candidates, rehydration candidates
 - **`/threads`** — Narrative thread visualization
-- **`/usage`** — Injection counts, usage patterns, importance trends
+- **`/breakdown`** — Injection counts, usage patterns, importance trends
 
 ## Usage
 
