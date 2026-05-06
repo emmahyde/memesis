@@ -98,14 +98,15 @@ QUALITY RULES:
 1. A card MUST have ≥1 evidence_quote. No card without evidence.
 2. Cards SHOULD aggregate related observations: don't make a 1-obs card
    unless the observation truly stands alone.
-3. Importance: take the max() of source observations' importance, then
-   bump +0.05 if user_affect_valence is friction (Kensinger 2009 emotional
-   encoding privilege).
+3. Importance: take the max() of source observations' importance.
+   (Kensinger +0.05 friction bump is applied at persistence in consolidator.py,
+   not here — do not pre-apply it.)
 4. scope = "cross-session-durable" only if the issue would still matter
    in a session three weeks from now. Otherwise "session-local".
 5. orphans[] retains observations in their ORIGINAL schema (kind,
    knowledge_type, knowledge_type_confidence, importance, facts, cwd).
    Do not reformat them.
+Orphaning is a quality gate, not a fallback. Prefer emitting zero cards to forcing a cluster — a weak observation that fits no card MUST become an orphan, not be force-fit.
 6. ENTITY GATE: If an observation does not share at least one named entity
    (person, system, file, concept) with any other observation in the input,
    orphan it rather than forcing it into a card. Prefer zero cards to a card
@@ -125,6 +126,11 @@ QUALITY RULES:
     with any sibling MAY be dropped entirely (omit from both issue_cards[]
     and orphans[]). Use sparingly — preserves orphan signal but reduces
     noise floor. The synthesis_notes should mention how many were dropped.
+
+FRICTION DISCIPLINE: When multiple observations describe the same repeated
+friction pattern (user retried, gave up, reduced scope), treat it as a
+signal — but only emit a card if the pattern reveals a durable workflow
+constraint. A single blocked moment belongs in orphans[], not a card.
 
 ---
 
@@ -300,6 +306,19 @@ def synthesize_issue_cards(
             )
         card["evidence_obs_indices"] = valid_indices
 
+    # tier3 #29: demote cards with all-invalid indices to orphans (preserves evidence_quotes)
+    from core.card_validators import _card_evidence_indices_valid  # noqa: PLC0415
+    cards_invalid_indices_demoted = 0
+    surviving_cards_pre_evidence = []
+    for card in cards:
+        if not _card_evidence_indices_valid(card, n_obs):
+            card["demoted_invalid_indices"] = True
+            orphans.append(card)
+            cards_invalid_indices_demoted += 1
+        else:
+            surviving_cards_pre_evidence.append(card)
+    cards = surviving_cards_pre_evidence
+
     # Sanity: every card must have ≥1 evidence_quote
     valid_cards = [c for c in cards if (c.get("evidence_quotes") or [])]
     dropped_cards = len(cards) - len(valid_cards)
@@ -334,6 +353,7 @@ def synthesize_issue_cards(
         "dropped_evidenceless": dropped_cards,
         "quotes_deduped": total_deduped,
         "dropped_invalid_indices": dropped_invalid_indices,
+        "cards_invalid_indices_demoted": cards_invalid_indices_demoted,
         "dropped_weak_observations": dropped_weak_observations,
         "synthesis_notes": parsed.get("synthesis_notes", ""),
     }

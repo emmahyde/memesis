@@ -7,6 +7,7 @@ Asserts:
 - CONCEPT_TAGS dict is removed from the module
 - Both prompts format without KeyError given mock data
 - Skip protocol is documented in Stage 1
+- SESSION_TYPE_GUIDANCE dict exists with expected keys (Wave B #33)
 """
 
 import sys
@@ -15,7 +16,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import core.prompts as prompts_module
-from core.prompts import CONSOLIDATION_PROMPT, OBSERVATION_EXTRACT_PROMPT
+from core.prompts import (
+    CONSOLIDATION_PROMPT,
+    OBSERVATION_EXTRACT_PROMPT,
+    SESSION_TYPE_GUIDANCE,
+    format_extract_prompt,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +133,16 @@ class TestStage1PromptStructure:
         assert '"subject"' not in OBSERVATION_EXTRACT_PROMPT
 
     def test_format_with_mock_transcript(self):
-        # Smoke test: no KeyError (session_type added in Sprint B WS-G)
-        formatted = OBSERVATION_EXTRACT_PROMPT.format(
+        # #33: smoke test via format_extract_prompt() to exercise per-session-type guidance injection
+        formatted = format_extract_prompt(
             transcript="mock session content",
             session_type="code",
             affect_hint="",
         )
         assert "mock session content" in formatted
+        # Verify code-session guidance was injected (not the "unknown" fallback)
+        from core.prompts import SESSION_TYPE_GUIDANCE
+        assert SESSION_TYPE_GUIDANCE["code"] in formatted
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +271,73 @@ class TestSessionTypeGuidance:
 
     def test_code_session_type_guidance_present(self):
         assert "code" in OBSERVATION_EXTRACT_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Task B3 #33 — SESSION_TYPE_GUIDANCE dict
+# ---------------------------------------------------------------------------
+
+
+class TestSessionTypeGuidanceDict:
+    # #33: verify dict exists with the expected session-type keys
+    EXPECTED_KEYS = {"code", "research", "writing", "agent_driven", "unknown"}
+
+    def test_dict_exists_in_module(self):
+        assert hasattr(prompts_module, "SESSION_TYPE_GUIDANCE"), (
+            "SESSION_TYPE_GUIDANCE dict must be present in core.prompts"
+        )
+
+    def test_expected_keys_present(self):
+        missing = self.EXPECTED_KEYS - set(SESSION_TYPE_GUIDANCE.keys())
+        assert not missing, f"SESSION_TYPE_GUIDANCE missing keys: {missing}"
+
+    def test_all_values_are_strings(self):
+        for key, val in SESSION_TYPE_GUIDANCE.items():
+            assert isinstance(val, str), f"SESSION_TYPE_GUIDANCE['{key}'] must be a string"
+
+    def test_non_empty_guidance_for_named_types(self):
+        # Each named session type (not 'unknown') should have non-empty guidance
+        for key in ("code", "research", "writing", "agent_driven"):
+            assert SESSION_TYPE_GUIDANCE[key].strip(), (
+                f"SESSION_TYPE_GUIDANCE['{key}'] must not be empty"
+            )
+
+    def test_template_var_in_extract_prompt_template(self):
+        # {session_type_guidance} placeholder must appear in the raw template
+        from core.prompts import _OBSERVATION_EXTRACT_PROMPT_TEMPLATE
+        assert "{session_type_guidance}" in _OBSERVATION_EXTRACT_PROMPT_TEMPLATE, (
+            "{session_type_guidance} template var missing from _OBSERVATION_EXTRACT_PROMPT_TEMPLATE"
+        )
+
+    def test_guidance_injected_via_format_extract_prompt(self):
+        # Render with "code" session type; verify code guidance appears in output
+        formatted = format_extract_prompt(
+            transcript="sample content",
+            session_type="code",
+            affect_hint="",
+        )
+        guidance_text = SESSION_TYPE_GUIDANCE["code"]
+        assert guidance_text in formatted, (
+            "format_extract_prompt did not inject SESSION_TYPE_GUIDANCE['code'] into rendered prompt"
+        )
+
+    def test_unknown_fallback_when_session_type_missing(self):
+        # Unrecognised session type should fall back to 'unknown' guidance
+        formatted = format_extract_prompt(
+            transcript="sample content",
+            session_type="nonexistent_type",
+            affect_hint="",
+        )
+        # 'unknown' guidance text should appear instead of raising KeyError
+        assert SESSION_TYPE_GUIDANCE["unknown"] in formatted
+
+    def test_research_guidance_injected(self):
+        formatted = format_extract_prompt(
+            transcript="research session",
+            session_type="research",
+            affect_hint="",
+        )
+        assert SESSION_TYPE_GUIDANCE["research"] in formatted
 
 
 # ---------------------------------------------------------------------------
