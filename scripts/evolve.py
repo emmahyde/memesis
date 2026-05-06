@@ -65,10 +65,8 @@ import core.llm as _llm_module
 import core.transcript_ingest as _ti_module
 
 # ---------------------------------------------------------------------------
-# --autoresearch stub (Task 4.2 wires actual logic)
+# --autoresearch implementation (Task 4.2)
 # ---------------------------------------------------------------------------
-
-_AUTORESEARCH_NOT_WIRED = "autoresearch wiring lands in 4.2"
 
 
 # ---------------------------------------------------------------------------
@@ -436,14 +434,17 @@ def main(argv: list[str] | None = None) -> int:
         "--autoresearch",
         action="store_true",
         default=False,
-        help="(Stub) Trigger the autoresearch mutation loop. Wires in Task 4.2.",
+        help="Trigger the autoresearch mutation loop after eval compilation.",
+    )
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=100000,
+        metavar="N",
+        help="Hard token halt budget for autoresearch (default: 100000).",
     )
 
     args = parser.parse_args(argv)
-
-    if args.autoresearch:
-        print(_AUTORESEARCH_NOT_WIRED)
-        return 0
 
     transcript_path = Path(args.transcript).resolve()
     if not transcript_path.exists():
@@ -509,6 +510,47 @@ def main(argv: list[str] | None = None) -> int:
 
         # Diagnostic delta (after ReplayDB cleanup — eval files still exist on disk)
         _emit_diagnostic_delta(specs, eval_paths, results, replay_session_id)
+
+        # --autoresearch: trigger mutation loop if any evals failed
+        if args.autoresearch:
+            failing_eval_paths = [
+                p for p in eval_paths if not results.get(p.stem, True)
+            ]
+            if not failing_eval_paths:
+                print("[evolve] No failing evals — autoresearch not triggered")
+            else:
+                # Pick the first failing eval slug as the convergence signal
+                compiled_eval_slug = failing_eval_paths[0].stem
+
+                from scripts.autoresearch_config import write_autoresearch_config
+                from core.autoresearch import Autoresearcher
+
+                session_dir = _EVOLVE_BASE / replay_session_id
+                config_path = write_autoresearch_config(
+                    replay_session_id,
+                    max_iterations=10,
+                    token_budget=args.token_budget,
+                )
+                print(f"[evolve] autoresearch config: {config_path}")
+
+                researcher = Autoresearcher(
+                    session_path=session_dir,
+                    eval_slug=compiled_eval_slug,
+                )
+                ar_result = researcher.run()
+
+                print()
+                print("=== AUTORESEARCH RESULT ===")
+                print(f"  iterations_completed: {ar_result.iterations_completed}")
+                print(f"  mutations_kept:       {ar_result.mutations_kept}")
+                print(f"  mutations_discarded:  {ar_result.mutations_discarded}")
+                print(f"  total_token_spend:    {ar_result.total_token_spend}")
+                print(f"  halt_reason:          {ar_result.halt_reason}")
+                if ar_result.kept_files:
+                    print("  kept_files:")
+                    for f in ar_result.kept_files:
+                        print(f"    {f}")
+                print()
 
     except Exception as exc:
         set_active_writer(None)
