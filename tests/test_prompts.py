@@ -341,6 +341,49 @@ class TestSessionTypeGuidanceDict:
 
 
 # ---------------------------------------------------------------------------
+# Task C1 #30 — Orphan quality gate boundary invariant
+# Orphaning is a synthesis-layer concept (core/issue_cards.py); it must NOT
+# leak into extraction (Stage 1) or consolidation (Stage 2) prompts.
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanQualityGateBoundary:
+    # "orphan" and "cluster" are synthesis-only vocabulary; they do not apply
+    # to observation extraction or consolidation and must stay absent.
+
+    def test_orphan_not_in_extract_prompt(self):
+        assert "orphan" not in OBSERVATION_EXTRACT_PROMPT.lower(), (
+            "orphan/synthesis vocabulary must not appear in OBSERVATION_EXTRACT_PROMPT; "
+            "orphaning is a quality gate in issue_cards.py (synthesis stage), not here."
+        )
+
+    def test_orphan_not_in_consolidation_prompt(self):
+        assert "orphan" not in CONSOLIDATION_PROMPT.lower(), (
+            "orphan/synthesis vocabulary must not appear in CONSOLIDATION_PROMPT; "
+            "orphaning is a quality gate in issue_cards.py (synthesis stage), not here."
+        )
+
+    def test_issue_card_not_in_extract_prompt(self):
+        assert "issue card" not in OBSERVATION_EXTRACT_PROMPT.lower(), (
+            "issue card synthesis vocabulary must not leak into Stage 1 extraction prompt."
+        )
+
+    def test_quality_gate_in_extract_is_observation_gate(self):
+        # The extraction quality gate (falsifiable/durable/novel/load-bearing) must remain;
+        # it is the correct gate for this stage and is not equivalent to orphan logic.
+        prompt = OBSERVATION_EXTRACT_PROMPT.lower()
+        assert "falsifiable" in prompt or "durable" in prompt or "load-bearing" in prompt, (
+            "OBSERVATION_EXTRACT_PROMPT must retain its observation-level quality gate language."
+        )
+
+    def test_behavioral_gate_in_consolidation(self):
+        # CONSOLIDATION_PROMPT's behavioral gate is its quality gate for this stage.
+        assert "behavioral gate" in CONSOLIDATION_PROMPT.lower() or "do something wrong" in CONSOLIDATION_PROMPT.lower(), (
+            "CONSOLIDATION_PROMPT must retain its behavioral gate language."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cross-prompt consistency
 # ---------------------------------------------------------------------------
 

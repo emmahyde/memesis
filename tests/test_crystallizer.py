@@ -241,7 +241,7 @@ def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, base):
 # --- Fallback ---
 
 
-@patch("core.llm.call_llm", side_effect=Exception("LLM unavailable"))
+@patch("core.crystallizer.call_llm", side_effect=Exception("LLM unavailable"))
 def test_fallback_on_llm_failure(mock_llm, crystallizer, base):
     mem_id = _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
 
@@ -386,6 +386,17 @@ class TestEmbeddingGrouping:
 
         assert len(groups) == 3
         assert all(len(g) == 1 for g in groups)
+
+    def test_crystallized_memory_has_null_card_fields(self, crystallizer, base):
+        # D3: non-card write path must leave criterion_weights, rejected_options, affect_valence as NULL
+        with patch("core.crystallizer.call_llm") as mock_llm:
+            mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
+            _create_consolidated("Card Fields Test", "Content", tags=["type:correction"], reinforcement_count=3)
+            results = crystallizer.crystallize_candidates()
+        crystal = Memory.get_by_id(results[0]["crystallized_id"])
+        assert crystal.criterion_weights is None
+        assert crystal.rejected_options is None
+        assert crystal.affect_valence is None
 
     def test_embedding_fallback_when_unavailable(self, crystallizer, base):
         ids = [

@@ -69,6 +69,14 @@ class TestSeedSelfModel:
         instinctive = list(Memory.by_stage("instinctive"))
         assert any(m.id == memory_id for m in instinctive)
 
+    def test_seeded_memory_has_null_card_fields(self, reflector, base):
+        # D3: non-card write path must leave criterion_weights, rejected_options, affect_valence as NULL
+        memory_id = reflector.ensure_self_model()
+        mem = Memory.get_by_id(memory_id)
+        assert mem.criterion_weights is None
+        assert mem.rejected_options is None
+        assert mem.affect_valence is None
+
     def test_seed_content_has_actionable_format(self, reflector, base):
         memory_id = reflector.ensure_self_model()
         content = Memory.get_by_id(memory_id).content
