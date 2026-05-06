@@ -38,6 +38,7 @@ from .question_lifecycle import (
     pin_open_question,
 )
 from .relevance import RelevanceEngine
+from .trace import get_active_writer
 
 logger = logging.getLogger(__name__)
 
@@ -532,7 +533,15 @@ class Consolidator:
                     logger.warning("malformed card importance %r — falling back to flat formula", card_importance)
                     base_importance = min(0.5 + importance_boost, 1.0)
                 if card_fields.get("affect_valence") == "friction":
+                    pre_bump = base_importance
                     base_importance = min(1.0, base_importance + 0.05)
+                    _tw = get_active_writer()
+                    if _tw is not None:
+                        _tw.emit("consolidate", "kensinger_bump", {
+                            "memory_id": None,  # not yet created
+                            "pre_bump_importance": pre_bump,
+                            "post_bump_importance": base_importance,
+                        })
                 mem_importance = base_importance
             else:
                 mem_importance = min(0.5 + importance_boost, 1.0)
@@ -573,6 +582,14 @@ class Consolidator:
                 rationale=decision.get("rationale", ""),
                 **self._consolidation_metadata(decision),
             )
+            _tw = get_active_writer()
+            if _tw is not None:
+                _tw.emit("consolidate", "keep", {
+                    "memory_id": str(memory_id),
+                    "importance": mem_importance,
+                    "affect_valence": mem.affect_valence,
+                    "stage": "consolidate",
+                })
             return memory_id
         except ValueError as exc:
             logger.warning("KEEP failed for '%s': %s", title, exc)
@@ -606,6 +623,12 @@ class Consolidator:
             rationale=rationale,
             **self._consolidation_metadata(decision),
         )
+        _tw = get_active_writer()
+        if _tw is not None:
+            _tw.emit("consolidate", "prune", {
+                "content_hash_prefix": hashlib.md5(observation.encode()).hexdigest()[:8],
+                "reason": rationale,
+            })
         logger.debug("PRUNE: %s — %s", observation[:80], rationale)
 
     def _execute_promote(self, decision: dict, session_id: str) -> str | None:
@@ -631,6 +654,7 @@ class Consolidator:
             logger.warning("PROMOTE target memory not found: %s", memory_id)
             return None
 
+        from_stage = memory.stage
         current_count = memory.reinforcement_count or 0
         memory.reinforcement_count = current_count + 1
         memory.save()
@@ -641,11 +665,18 @@ class Consolidator:
             session_id=session_id,
             action="promoted",
             memory_id=memory_id,
-            from_stage=memory.stage,
-            to_stage=memory.stage,
+            from_stage=from_stage,
+            to_stage=from_stage,
             rationale=decision.get("rationale", "Reinforced by new observation"),
             **self._consolidation_metadata(decision),
         )
+        _tw = get_active_writer()
+        if _tw is not None:
+            _tw.emit("consolidate", "promote", {
+                "memory_id": str(memory_id),
+                "from_stage": from_stage,
+                "to_stage": from_stage,
+            })
 
         # Check if memory now qualifies for lifecycle stage advancement
         can_advance, reason = self.lifecycle.can_promote(memory_id)

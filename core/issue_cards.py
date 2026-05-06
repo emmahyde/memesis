@@ -37,6 +37,7 @@ import logging
 import re
 
 from core.llm import call_llm
+from core.trace import get_active_writer
 
 logger = logging.getLogger(__name__)
 
@@ -270,10 +271,24 @@ def synthesize_issue_cards(
         strict_clause=strict_clause,
     )
 
+    _writer = get_active_writer()
+    if _writer is not None:
+        _writer.emit(
+            stage="stage1.5",
+            event="card_synth_start",
+            payload={"n_obs": len(observations)},
+        )
+
     try:
         raw = call_llm(prompt, max_tokens=8192)
     except Exception as exc:
         logger.warning("issue_synthesis: LLM call failed (%s)", exc)
+        if _writer is not None:
+            _writer.emit(
+                stage="stage1.5",
+                event="card_synth_end",
+                payload={"n_cards_raw": 0, "parse_ok": False},
+            )
         return [], observations, {"outcome": "llm_error", "error": str(exc)}
 
     try:
@@ -282,13 +297,32 @@ def synthesize_issue_cards(
         logger.warning(
             "issue_synthesis: failed to parse LLM JSON — keeping flat obs as orphans"
         )
+        if _writer is not None:
+            _writer.emit(
+                stage="stage1.5",
+                event="card_synth_end",
+                payload={"n_cards_raw": 0, "parse_ok": False},
+            )
         return [], observations, {"outcome": "parse_error"}
 
     cards = parsed.get("issue_cards") or []
     orphans = parsed.get("orphans") or []
     if not isinstance(cards, list) or not isinstance(orphans, list):
         logger.warning("issue_synthesis: bad shape — keeping flat obs as orphans")
+        if _writer is not None:
+            _writer.emit(
+                stage="stage1.5",
+                event="card_synth_end",
+                payload={"n_cards_raw": 0, "parse_ok": False},
+            )
         return [], observations, {"outcome": "bad_shape"}
+
+    if _writer is not None:
+        _writer.emit(
+            stage="stage1.5",
+            event="card_synth_end",
+            payload={"n_cards_raw": len(cards), "parse_ok": True},
+        )
 
     # Validate evidence_obs_indices against input observation count
     n_obs = len(observations)

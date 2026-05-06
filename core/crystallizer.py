@@ -29,6 +29,7 @@ from .flags import get_flag
 from .lifecycle import LifecycleManager
 from .llm import call_llm
 from .models import ConsolidationLog, Memory, MemoryEdge
+from .trace import get_active_writer
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +286,14 @@ class Crystallizer:
         For singletons, still transforms the content (strips episodic details,
         generalizes the pattern).
         """
+        _writer = get_active_writer()
+        if _writer is not None:
+            _writer.emit(
+                stage="crystallize",
+                event="crystallize_group_start",
+                payload={"group_size": len(group), "memory_ids": [str(m.id) for m in group]},
+            )
+
         # Format observations for the prompt
         obs_parts = []
         for i, mem in enumerate(group, 1):
@@ -353,6 +362,13 @@ class Crystallizer:
             created_at=now,
             updated_at=now,
             content_hash=content_hash,
+            # Defensive nulls — crystallizer is a non-card write path (D3)
+            temporal_scope=None,
+            confidence=None,
+            affect_valence=None,
+            actor=None,
+            criterion_weights=None,
+            rejected_options=None,
         )
         crystallized_id = crystal_mem.id
 
@@ -379,6 +395,13 @@ class Crystallizer:
 
         if get_flag("causal_edges"):
             self._create_subsumption_edges(group, crystallized_id, result["title"])
+
+        if _writer is not None:
+            _writer.emit(
+                stage="crystallize",
+                event="crystallize_group_end",
+                payload={"crystallized_memory_id": str(crystallized_id), "sources_archived": len(group)},
+            )
 
         return {
             "crystallized_id": crystallized_id,
