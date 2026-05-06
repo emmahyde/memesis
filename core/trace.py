@@ -54,17 +54,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import IO, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE: Optional[Path] = None
 _MAX_SESSIONS = 50
 _INDEX_FILE = ".sessions"
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-\.]+$")
 
 # Module-level active writer context (Wave 2 instrumentation seams).
 _active_writer: Optional["TraceWriter"] = None
@@ -103,9 +105,12 @@ class TraceWriter:
     """
 
     def __init__(self, session_id: str, base_dir: Optional[Path | str] = None) -> None:
+        if not _SESSION_ID_RE.match(session_id):
+            raise ValueError(f"invalid session_id: {session_id!r}")
         self._session_id = session_id
         self._base_dir: Path = Path(base_dir) if base_dir is not None else _default_base_dir()
         self._trace_path: Optional[Path] = None  # created on first emit
+        self._fh: Optional[IO[str]] = None  # opened lazily on first emit
 
     # ------------------------------------------------------------------
     # Public API
@@ -124,9 +129,10 @@ class TraceWriter:
         """Append one structured event to the session JSONL file.
 
         Creates the file (and registers the session) on the first call.
-        Each call performs an immediate flush and fsync for crash safety.
+        Writes are flushed to the OS buffer immediately; fsync is deferred
+        to ``close()`` / context-manager ``__exit__`` for batched durability.
         """
-        if self._trace_path is None:
+        if self._fh is None:
             self._init_file()
 
         line = json.dumps(
@@ -138,14 +144,19 @@ class TraceWriter:
             },
             ensure_ascii=False,
         )
-        with open(self._trace_path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        assert self._fh is not None
+        self._fh.write(line + "\n")
+        self._fh.flush()
 
     def close(self) -> None:
-        """No-op explicit close; present for symmetry with context-manager use."""
-        pass
+        """Fsync and close the underlying file handle (idempotent)."""
+        if self._fh is not None:
+            try:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+            finally:
+                self._fh.close()
+                self._fh = None
 
     # ------------------------------------------------------------------
     # Context-manager support
@@ -156,15 +167,17 @@ class TraceWriter:
 
     def __exit__(self, *_: Any) -> None:
         self.close()
+        set_active_writer(None)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _init_file(self) -> None:
-        """Create the base directory, set the trace path, and register the session."""
+        """Create the base directory, open the file handle, and register the session."""
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._trace_path = self._base_dir / f"{self._session_id}.jsonl"
+        self._fh = open(self._trace_path, "a", encoding="utf-8", buffering=1)
         _register_session(self._session_id, self._base_dir)
 
 
@@ -224,6 +237,9 @@ def _register_session(session_id: str, base_dir: Path) -> None:
 
 def _evict_session(session_id: str, base_dir: Path) -> None:
     """Delete the JSONL file for *session_id* if it exists."""
+    if not _SESSION_ID_RE.match(session_id):
+        logger.warning("trace: skipping eviction of unsafe session_id %r", session_id)
+        return
     target = base_dir / f"{session_id}.jsonl"
     try:
         target.unlink(missing_ok=True)

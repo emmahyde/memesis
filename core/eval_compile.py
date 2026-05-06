@@ -164,6 +164,7 @@ DO NOT EDIT — regenerate via core.eval_compile.compile_to_pytest().
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -176,7 +177,7 @@ from core.database import init_db, close_db
 from core.models import Memory
 
 
-REPLAY_STORE_PATH = {repr(replay_store_path)}
+REPLAY_STORE_PATH = os.environ.get("MEMESIS_REPLAY_STORE", {repr(replay_store_path)})
 EXPECTED_ENTITIES = {entities_repr}
 POLARITY = {polarity_repr}
 STAGE_TARGET = {stage_repr}

@@ -58,6 +58,32 @@ SUBJECT_VALUES = frozenset({
 # Stage 2 only — None is allowed
 WORK_EVENT_VALUES = frozenset({"bugfix", "feature", "refactor", "discovery", "change"})
 
+# Session types that may legitimately carry a non-null work_event.
+# Research and writing sessions have no code actions; assigning a code work_event
+# to them is hallucination and the post-parse layer nulls it out.
+WORK_EVENT_ALLOWED_SESSION_TYPES = frozenset({"code"})
+
+
+def enforce_work_event_session_type(raw: dict, session_type: str | None) -> tuple[dict, str | None]:
+    """Defense-in-depth for the prompt's "work_event MUST be null when session_type != code" rule.
+
+    Mutates a copy of the raw observation dict, nullifying work_event when the session
+    type isn't allowed to carry one. Returns (normalized_dict, violation_or_None).
+    Caller is responsible for logging the violation if non-None.
+    """
+    if session_type is None or session_type in WORK_EVENT_ALLOWED_SESSION_TYPES:
+        return raw, None
+    work_event = raw.get("work_event")
+    if work_event is None:
+        return raw, None
+    normalized = dict(raw)
+    normalized["work_event"] = None
+    violation = (
+        f"work_event={work_event!r} produced under session_type={session_type!r}; "
+        f"nulled per session_type contract"
+    )
+    return normalized, violation
+
 # Forward-compat for Sprint B (LLME-F9) — None is allowed
 SESSION_TYPE_VALUES = frozenset({"code", "writing", "research"})
 
@@ -289,13 +315,18 @@ def validate_stage1(raw: dict) -> Stage1Observation:
         raise ValidationError(str(exc), None, "required field missing") from exc
 
 
-def validate_stage2(raw: dict) -> Stage2Observation:
+def validate_stage2(raw: dict, session_type: str | None = None) -> Stage2Observation:
     """Parse and validate a Stage 2 observation dict.
 
     Raises ValidationError on any violation.
     Traces outcome to validator-trace.jsonl.
     """
     excerpt = _raw_excerpt(raw)
+    # Defense-in-depth: enforce work_event session_type contract before validation.
+    raw, violation = enforce_work_event_session_type(raw, session_type)
+    if violation is not None:
+        import logging as _logging
+        _logging.getLogger(__name__).info("validate_stage2: %s", violation)
     try:
         kind = raw["kind"]
         knowledge_type = raw["knowledge_type"]

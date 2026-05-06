@@ -55,6 +55,7 @@ class ParameterOverrides:
     prefilter_density_threshold_chars: int = 200  # avg chars/entry below = low-density
     prefilter_ttr_threshold: float = 0.25  # type/token ratio below = self-referential
     prefilter_observer_density_threshold_chars: int = 400  # observer-cwd density gate
+    recurrent_failure_patterns: tuple[str, ...] = ()  # keywords injected as Stage 1 warnings
     notes: tuple[str, ...] = ()  # human-readable trace of which rules fired
 
     def with_note(self, note: str) -> ParameterOverrides:
@@ -102,14 +103,14 @@ def _override_affect_blind_spot(rec: dict, base: ParameterOverrides) -> Paramete
 
 
 def _override_dedup_inert(rec: dict, base: ParameterOverrides) -> ParameterOverrides:
-    """`dedup_inert` confirmed → STUB.
+    """`dedup_inert` confirmed → enable Reframe A if not already on.
 
-    Proposed action recommends Jaccard 0.55 or embedding cosine. Current
-    `_dedupe_observations` uses MD5 exact-hash (`transcript_ingest.py:295`),
-    so there's no threshold to lower. This override is a placeholder for
-    when a similarity pass is reintroduced.
+    Zero dedup drops on dense sessions means paraphrase duplicates pass through.
+    Reframe A (stateful incremental extraction) prevents in-session re-extraction
+    without needing a similarity threshold. No parameter to flip here — Reframe A
+    is controlled by `REFRAME_A_ENABLED` in transcript_ingest.py (default True).
     """
-    return base.with_note("dedup_inert confirmed → STUB (no Jaccard knob in current code)")
+    return base.with_note("dedup_inert confirmed → REFRAME_A_ENABLED should be True")
 
 
 def _override_synthesis_overgreedy(rec: dict, base: ParameterOverrides) -> ParameterOverrides:
@@ -153,6 +154,25 @@ def _override_cards_unused_high_importance(rec: dict, base: ParameterOverrides) 
         importance_gate=max(base.importance_gate, 0.45),
         notes=base.notes + ("cards_unused_high_importance confirmed → importance_gate=0.45",),
     )
+
+
+def _override_recurrent_agent_failure(rec: dict, base: ParameterOverrides) -> ParameterOverrides:
+    """`recurrent_agent_failure` confirmed → inject keyword into Stage 1 prompt.
+
+    The rule detects cross-session correction cards sharing a root-cause keyword.
+    Confirmed = the same failure pattern has appeared in ≥2 sessions ≥2 times.
+    Override surfaces the keyword into `recurrent_failure_patterns` so
+    `format_extract_prompt` can warn the LLM not to repeat the same mistake.
+    """
+    evidence = (rec.get("latest") or {}).get("evidence") or {}
+    kw = evidence.get("keyword_matched", "")
+    if kw and kw not in base.recurrent_failure_patterns:
+        return replace(
+            base,
+            recurrent_failure_patterns=base.recurrent_failure_patterns + (kw,),
+            notes=base.notes + (f"recurrent_agent_failure confirmed → warn Stage 1 about '{kw}'",),
+        )
+    return base.with_note("recurrent_agent_failure confirmed → pattern already present")
 
 
 def _override_monotone_knowledge_lens(rec: dict, base: ParameterOverrides) -> ParameterOverrides:
@@ -224,6 +244,7 @@ RULE_OVERRIDES: dict[str, Callable[[dict, ParameterOverrides], ParameterOverride
     "monotone_knowledge_lens": _override_monotone_knowledge_lens,
     "affect_signal_no_extraction": _override_affect_signal_no_extraction,
     "forced_clustering_low_importance": _override_forced_clustering_low_importance,
+    "recurrent_agent_failure": _override_recurrent_agent_failure,
 }
 
 
@@ -269,6 +290,10 @@ RULE_METADATA: dict[str, dict] = {
     "forced_clustering_low_importance": {
         "knobs": ["synthesis_strict"],
         "note": "Sets synthesis_strict=True; synthesis_strict_floor=0.4 pending prompt wiring.",
+    },
+    "recurrent_agent_failure": {
+        "knobs": ["recurrent_failure_patterns"],
+        "note": "Injects confirmed failure keyword into Stage 1 prompt as a warning.",
     },
 }
 

@@ -2141,3 +2141,73 @@ class TestLiveFilter:
             f"Batch UPDATE should produce identical timestamps for all returned memories, "
             f"got: {set(timestamps)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Affect boost tests (Wave D — tier3-audit-fixes)
+# ---------------------------------------------------------------------------
+
+
+class TestAffectFrictionBoost:
+    """Verify AFFECT_FRICTION_BOOST is applied to friction memories in _crystallized_hybrid."""
+
+    def test_friction_memory_gets_affect_boost(self, base, engine):
+        """Friction memory receives AFFECT_FRICTION_BOOST in hybrid scoring."""
+        from core.retrieval import AFFECT_FRICTION_BOOST
+
+        neutral_id = _make_memory(
+            "shared topic content alpha",
+            "crystallized",
+            "Neutral Memory",
+        )
+        friction_id = _make_memory(
+            "shared topic content alpha",
+            "crystallized",
+            "Friction Memory",
+        )
+        Memory.update(affect_valence="friction").where(Memory.id == friction_id).execute()
+
+        result = engine.get_crystallized_for_context(
+            query="shared topic content alpha",
+            query_embedding=None,
+            project_context=None,
+            token_limit=100_000,
+        )
+
+        result_ids = [m.id for m in result]
+        assert friction_id in result_ids, "Friction memory must appear in results"
+        assert neutral_id in result_ids, "Neutral memory must appear in results"
+
+        # Assert the boost was applied to the candidate score — final rank is
+        # non-deterministic post-Thompson sampling, but the boost is deterministic.
+        candidate_by_id = {c["memory_id"]: c for c in engine._last_hybrid_candidates}
+        assert friction_id in candidate_by_id, "Friction memory must appear in hybrid candidates"
+        assert candidate_by_id[friction_id].get("affect_score") == AFFECT_FRICTION_BOOST, (
+            f"affect_score for friction memory should be {AFFECT_FRICTION_BOOST}, "
+            f"got {candidate_by_id[friction_id].get('affect_score')}"
+        )
+        neutral_affect = candidate_by_id.get(neutral_id, {}).get("affect_score", 0.0)
+        assert neutral_affect == 0.0, f"Neutral memory must have 0 affect_score, got {neutral_affect}"
+
+    def test_non_friction_memory_no_boost(self, base, engine):
+        """Neutral memory does not receive an affect boost — affect_score stays 0.0."""
+        neutral_id = _make_memory(
+            "neutral only content beta",
+            "crystallized",
+            "Neutral Only Memory",
+        )
+        Memory.update(affect_valence="neutral").where(Memory.id == neutral_id).execute()
+
+        engine.get_crystallized_for_context(
+            query="neutral only content beta",
+            query_embedding=None,
+            project_context=None,
+            token_limit=100_000,
+        )
+
+        candidate_by_id = {c["memory_id"]: c for c in engine._last_hybrid_candidates}
+        if neutral_id in candidate_by_id:
+            assert candidate_by_id[neutral_id]["affect_score"] == 0.0, (
+                f"Neutral memory affect_score should be 0.0, "
+                f"got {candidate_by_id[neutral_id]['affect_score']}"
+            )

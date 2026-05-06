@@ -343,3 +343,46 @@ class TestStageTargetFiltering:
         spec = _make_spec(match_mode="absence", stage_target="ephemeral")
         src = compile_to_pytest(spec, "/tmp/replay")
         assert "ephemeral" in src
+
+
+# ---------------------------------------------------------------------------
+# MD-003: replay store path env override (D-15)
+# ---------------------------------------------------------------------------
+
+class TestReplayStoreEnvOverride:
+    def test_generated_file_contains_env_override_pattern(self):
+        """Generated source must use os.environ.get('MEMESIS_REPLAY_STORE', ...) pattern."""
+        spec = _make_spec()
+        src = compile_to_pytest(spec, "/tmp/default-replay")
+        assert 'os.environ.get("MEMESIS_REPLAY_STORE"' in src
+        assert "/tmp/default-replay" in src  # fallback still present
+
+    def test_generated_file_imports_os(self):
+        """Generated source must import os (required for env override)."""
+        spec = _make_spec()
+        src = compile_to_pytest(spec, "/tmp/default-replay")
+        assert "import os" in src
+
+    def test_env_override_used_when_set(self, tmp_path, monkeypatch):
+        """
+        When MEMESIS_REPLAY_STORE is set, the generated module should resolve
+        REPLAY_STORE_PATH to the env value rather than the baked default.
+        """
+        override_path = str(tmp_path / "override_replay")
+        spec = _make_spec()
+        src = compile_to_pytest(spec, "/tmp/default-replay")
+
+        monkeypatch.setenv("MEMESIS_REPLAY_STORE", override_path)
+
+        # Extract just the REPLAY_STORE_PATH line and exec it in an isolated
+        # namespace with only `os` available. Avoid touching sys.modules — that
+        # would leak fake modules into the wider test session and break tests
+        # that import core.models or core.database after this one runs.
+        import os as _os
+        line = next(
+            ln for ln in src.splitlines() if ln.startswith("REPLAY_STORE_PATH")
+        )
+        ns: dict = {"os": _os}
+        exec(compile(line, "<test-env-override>", "exec"), ns)  # noqa: S102
+
+        assert ns["REPLAY_STORE_PATH"] == override_path

@@ -217,6 +217,10 @@ class Autoresearcher:
         # Token spend accumulator (used when no token_counter is injected)
         self._token_spend_accumulator: int = 0
 
+        # Offset-based token counting state (HI-004)
+        self._token_offset: int = 0   # byte offset into trace JSONL after last read
+        self._token_total: int = 0    # cumulative token sum across all reads
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -339,14 +343,13 @@ class Autoresearcher:
     def _propose_mutation(self, target_file: Path) -> str:
         """Return the proposed new content for *target_file*.
 
-        This is a stub that returns the current file content unchanged.
-        The orchestrator (Task 4.2) or an LLM call replaces this method.
-        Override or mock in tests/orchestrator.
+        This method has no default implementation.  Subclasses or the
+        orchestrator (Task 4.2) must override it before calling ``.run()``.
         """
-        try:
-            return target_file.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ValueError(f"Cannot read mutation target {target_file}: {exc}") from exc
+        raise NotImplementedError(
+            "_propose_mutation must be overridden by a subclass or replaced via "
+            "monkey-patching before calling .run() — no LLM call is wired in the base class."
+        )
 
     def _apply_mutation(self, target_file: Path, new_content: str) -> None:
         """Write *new_content* to *target_file* in-place (not atomic).
@@ -365,12 +368,18 @@ class Autoresearcher:
     # ------------------------------------------------------------------
 
     def _run_guard_suite(self) -> bool:
-        """Run the D-15 guard set.  Returns True if ALL guards pass."""
+        """Run the D-15 guard set.  Returns True if ALL guards pass.
+
+        Uses a single pytest invocation for the full unit suite (which already
+        covers all tier-3 classes — TestCardImportance, TestAllIndicesInvalidDemotion,
+        TestRule3KensingerRemoved, TestEvidenceIndicesValidation).  A separate
+        invocation runs eval/recall/ only when that directory is populated.
+        """
         cwd = str(self._project_root)
 
-        # 1. Full unit suite
+        # 1. Full unit suite — covers all tier-3 invariant tests as well.
         result = subprocess.run(
-            ["python3", "-m", "pytest", "tests/", "--tb=short", "-q"],
+            ["python3", "-m", "pytest", "tests/", "--exitfirst", "-q"],
             capture_output=True,
             text=True,
             cwd=cwd,
@@ -380,39 +389,7 @@ class Autoresearcher:
             logger.warning("autoresearch: unit suite FAILED\n%s", result.stdout[-2000:])
             return False
 
-        # 2. Explicit tier-3 invariant tests
-        tier3_args = []
-        for test_class in _TIER3_TESTS:
-            tier3_args.extend(["-k", test_class])
-        subprocess.run(
-            ["python3", "-m", "pytest", "tests/", "--tb=short", "-q"]
-            + [f"--co", "-q"]  # collect-only to verify they exist first
-            ,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            check=False,
-        )
-        # Run each tier-3 test class explicitly
-        for test_class in _TIER3_TESTS:
-            t3 = subprocess.run(
-                [
-                    "python3", "-m", "pytest", "tests/",
-                    "-k", test_class,
-                    "--tb=short", "-q",
-                ],
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                check=False,
-            )
-            if t3.returncode != 0:
-                logger.warning(
-                    "autoresearch: tier-3 test %s FAILED\n%s", test_class, t3.stdout[-1000:]
-                )
-                return False
-
-        # 3. eval/recall/ regression suite
+        # 2. eval/recall/ regression suite (only when populated).
         eval_recall_dir = self._project_root / "eval" / "recall"
         if eval_recall_dir.exists() and any(eval_recall_dir.glob("*_recall.py")):
             eval_result = subprocess.run(
@@ -428,8 +405,6 @@ class Autoresearcher:
                 )
                 return False
 
-        # Guard 4 (manifest round-trip) is covered by the full unit suite above
-        # (tests/test_manifest.py if present, or integration tests).
         return True
 
     # ------------------------------------------------------------------
@@ -504,10 +479,15 @@ class Autoresearcher:
     # ------------------------------------------------------------------
 
     def _default_token_counter(self) -> int:
-        """Return accumulated token spend delta from the active TraceWriter.
+        """Return cumulative token spend from the active TraceWriter.
 
-        Reads ``llm_envelope`` events from the active trace JSONL since the
-        last reset. Falls back to 0 if no trace is active or JSONL is unreadable.
+        Reads only new bytes from the trace JSONL since the last call by
+        seeking to ``self._token_offset``.  Accumulates into
+        ``self._token_total`` and advances the offset after each read.
+
+        Falls back to 0 if no trace is active or the JSONL is unreadable.
+        If the file appears truncated (seek beyond EOF), the offset is reset
+        to 0 and the file is re-read in full.
 
         For test injection, pass a ``token_counter`` callable to the constructor.
         """
@@ -517,22 +497,37 @@ class Autoresearcher:
         if writer is None or writer.trace_path is None:
             return self._token_spend_accumulator
 
-        total = 0
-        try:
-            text = writer.trace_path.read_text(encoding="utf-8")
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("event") == "llm_envelope":
-                    payload = event.get("payload", {})
-                    total += int(payload.get("input_tokens") or 0)
-                    total += int(payload.get("output_tokens") or 0)
-        except OSError:
-            pass
+        trace_path = writer.trace_path
+        if not trace_path.exists():
+            return self._token_total
 
-        return total
+        new_tokens = 0
+        try:
+            with open(trace_path, "r", encoding="utf-8") as fh:
+                try:
+                    fh.seek(self._token_offset)
+                except OSError:
+                    # Seek failed (e.g. file was truncated) — reset and re-read
+                    self._token_offset = 0
+                    self._token_total = 0
+                    fh.seek(0)
+
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("event") == "llm_envelope":
+                        payload = event.get("payload", {})
+                        new_tokens += int(payload.get("input_tokens") or 0)
+                        new_tokens += int(payload.get("output_tokens") or 0)
+
+                self._token_offset = fh.tell()
+        except OSError:
+            return self._token_total
+
+        self._token_total += new_tokens
+        return self._token_total

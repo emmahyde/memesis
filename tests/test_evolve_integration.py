@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -42,6 +43,27 @@ def _setup_replay_cache_dir(tmp_path: Path) -> str:
     cache_dir = tmp_path / "evolve_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return str(cache_dir)
+
+
+@pytest.fixture
+def stub_project_root(tmp_path):
+    """Isolated project root with stub D-14 mutation surface files and a git repo.
+
+    Prevents Autoresearcher from touching real source files when mocks fail.
+    """
+    root = tmp_path / "project"
+    (root / "core").mkdir(parents=True)
+    for name in ("prompts", "issue_cards", "rule_registry", "consolidator", "crystallizer"):
+        (root / "core" / f"{name}.py").write_text("# stub\n")
+    # Init git so _discard's `git checkout` doesn't fail in tests that don't mock it
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init"],
+        cwd=root,
+        check=True,
+    )
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +137,6 @@ class TestReplayDeterminism:
         })
 
         def run_one_replay(db_suffix: str) -> list[str]:
-            import hashlib
             db_dir = tmp_path / f"db_{db_suffix}"
             db_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -128,10 +149,13 @@ class TestReplayDeterminism:
                     # Extract observations
                     obs = extract_observations("User prefers dark mode.")
 
-                    # Insert Memory rows directly (simulating what consolidator does)
+                    # Insert Memory rows directly (simulating what consolidator does).
+                    # Hash formula matches Memory.compute_hash (core/models.py:315) — replicated
+                    # directly because earlier tests in the suite monkeypatch the Memory class.
+                    import hashlib
                     for o in obs:
                         content = o.get("observation", "")
-                        content_hash = hashlib.md5(content.encode()).hexdigest()
+                        content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()
                         Mem.create(
                             content=content,
                             content_hash=content_hash,
@@ -285,7 +309,7 @@ class TestMutationGuardRejection:
         _dump_yaml(cfg, session / "autoresearch.yaml")
         return session
 
-    def test_guard_failure_causes_discard_and_loop_continues(self, tmp_path):
+    def test_guard_failure_causes_discard_and_loop_continues(self, tmp_path, stub_project_root):
         """When the guard suite fails, the mutation is discarded and the loop
         advances to the next iteration without halting."""
         from core.autoresearch import Autoresearcher
@@ -304,7 +328,7 @@ class TestMutationGuardRejection:
             session_path=session,
             eval_slug="test-eval",
             token_counter=lambda: 0,
-            project_root=_PROJECT_ROOT,
+            project_root=stub_project_root,
         )
         from unittest.mock import Mock
         researcher._select_mutation_target = lambda: sorted(researcher._mutation_surface)[0]
@@ -331,7 +355,7 @@ class TestMutationGuardRejection:
         assert len(keep_calls) == 0
         assert result.iterations_completed == 3
 
-    def test_guard_failure_does_not_keep_mutation(self, tmp_path):
+    def test_guard_failure_does_not_keep_mutation(self, tmp_path, stub_project_root):
         """A guard failure must not persist the mutation."""
         from core.autoresearch import Autoresearcher
 
@@ -348,7 +372,7 @@ class TestMutationGuardRejection:
             session_path=session,
             eval_slug="test-eval",
             token_counter=lambda: 0,
-            project_root=_PROJECT_ROOT,
+            project_root=stub_project_root,
         )
         from unittest.mock import Mock
         researcher._select_mutation_target = lambda: sorted(researcher._mutation_surface)[0]
@@ -366,7 +390,7 @@ class TestMutationGuardRejection:
 
         assert kept_content == [], "Guard failure must not call _keep"
 
-    def test_after_discard_iteration_count_increments(self, tmp_path):
+    def test_after_discard_iteration_count_increments(self, tmp_path, stub_project_root):
         """iterations_completed increments even on guard failure (discard path)."""
         from core.autoresearch import Autoresearcher
 
@@ -384,7 +408,7 @@ class TestMutationGuardRejection:
             session_path=session,
             eval_slug="test-eval",
             token_counter=lambda: 0,
-            project_root=_PROJECT_ROOT,
+            project_root=stub_project_root,
         )
         from unittest.mock import Mock
         researcher._select_mutation_target = lambda: sorted(researcher._mutation_surface)[0]
@@ -554,7 +578,7 @@ class TestBudgetHalt:
         _dump_yaml(config, session / "autoresearch.yaml")
         return session
 
-    def test_budget_1_halts_immediately(self, tmp_path):
+    def test_budget_1_halts_immediately(self, tmp_path, stub_project_root):
         """With token_budget=1 and a token_counter returning 2 (> budget),
         the loop halts before any iteration body executes."""
         from core.autoresearch import Autoresearcher
@@ -573,7 +597,7 @@ class TestBudgetHalt:
             session_path=session,
             eval_slug="test-eval",
             token_counter=lambda: 2,
-            project_root=_PROJECT_ROOT,
+            project_root=stub_project_root,
         )
         def _apply_mutation_budget1(f, c):
             del c
@@ -596,7 +620,7 @@ class TestBudgetHalt:
         )
         assert apply_calls == [], "No mutation should be applied when budget already exceeded"
 
-    def test_budget_halt_reverts_working_files(self, tmp_path):
+    def test_budget_halt_reverts_working_files(self, tmp_path, stub_project_root):
         """When budget is exceeded mid-iteration (after apply but before keep),
         the discard path is triggered for the current mutation."""
         from core.autoresearch import Autoresearcher
@@ -621,7 +645,7 @@ class TestBudgetHalt:
             session_path=session,
             eval_slug="test-eval",
             token_counter=token_counter,
-            project_root=_PROJECT_ROOT,
+            project_root=stub_project_root,
         )
         def _apply_mutation_revert(f, c):
             del c
@@ -644,7 +668,7 @@ class TestBudgetHalt:
         # Result should be consistent
         assert result.mutations_kept == 0
 
-    def test_budget_zero_means_unlimited(self, tmp_path):
+    def test_budget_zero_means_unlimited(self, tmp_path, stub_project_root):
         """token_budget=0 is treated as no budget limit (runs all iterations)."""
         from core.autoresearch import Autoresearcher
 
@@ -661,7 +685,7 @@ class TestBudgetHalt:
             session_path=session,
             eval_slug="test-eval",
             token_counter=lambda: 999999,  # huge token count, should not halt
-            project_root=_PROJECT_ROOT,
+            project_root=stub_project_root,
         )
         def _keep_unlimited(f, c):
             del c
@@ -680,7 +704,7 @@ class TestBudgetHalt:
         assert result.iterations_completed == 2
         assert result.halt_reason == "iteration_cap"
 
-    def test_working_files_state_on_halt(self, tmp_path):
+    def test_working_files_state_on_halt(self, tmp_path, stub_project_root):
         """When budget halt occurs at iteration boundary (before apply),
         no mutations have been applied and no files need reverting."""
         from core.autoresearch import Autoresearcher
@@ -698,7 +722,7 @@ class TestBudgetHalt:
             session_path=session,
             eval_slug="test-eval",
             token_counter=lambda: 100,  # 100 > budget=1, halts before iteration body
-            project_root=_PROJECT_ROOT,
+            project_root=stub_project_root,
         )
         def _apply_mutation_halt(f, c):
             del f
