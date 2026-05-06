@@ -12,16 +12,12 @@ Coverage:
 
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.autoresearch import Autoresearcher, AutoresearchResult, _load_yaml, _dump_yaml
+from core.autoresearch import Autoresearcher, _load_yaml, _dump_yaml
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +200,7 @@ class TestGuardSuite:
 
         call_count = 0
 
-        def side_effect(cmd, **kwargs):
+        def side_effect(*_args, **_kwargs):
             nonlocal call_count
             call_count += 1
             # First call (full unit suite) fails
@@ -221,7 +217,7 @@ class TestGuardSuite:
 
         call_count = 0
 
-        def side_effect(cmd, **kwargs):
+        def side_effect(*_args, **_kwargs):
             nonlocal call_count
             call_count += 1
             # First call (unit suite) passes; second (collect-only) passes;

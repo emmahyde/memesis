@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-_MUTATION_SURFACE: frozenset[Path] = frozenset(
+MUTATION_SURFACE: frozenset[Path] = frozenset(
     [
         _PROJECT_ROOT / "core" / "prompts.py",
         _PROJECT_ROOT / "core" / "issue_cards.py",
@@ -240,7 +240,7 @@ class Autoresearcher:
             halt_reason="",
         )
 
-        for _i in range(max_iterations):
+        for _ in range(max_iterations):
             # D-16: check token budget BEFORE starting the iteration
             current_tokens = token_spend + self._token_counter()
             if token_budget > 0 and current_tokens >= token_budget:
@@ -384,7 +384,7 @@ class Autoresearcher:
         tier3_args = []
         for test_class in _TIER3_TESTS:
             tier3_args.extend(["-k", test_class])
-        tier3_result = subprocess.run(
+        subprocess.run(
             ["python3", "-m", "pytest", "tests/", "--tb=short", "-q"]
             + [f"--co", "-q"]  # collect-only to verify they exist first
             ,

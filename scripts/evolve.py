@@ -62,7 +62,6 @@ from core.replay_db import ReplayDB
 from core.trace import TraceWriter, set_active_writer
 from core.eval_compile import extract_spec_from_text, compile_to_pytest, EvalSpec
 import core.llm as _llm_module
-import core.transcript_ingest as _ti_module
 
 # ---------------------------------------------------------------------------
 # --autoresearch implementation (Task 4.2)
@@ -159,7 +158,7 @@ def _patched_llm(force_live: bool) -> Iterator[None]:
 
     # Apply patches
     _llm_module.call_llm = _wrapper  # type: ignore[attr-defined]
-    for mod_name, (mod, _orig) in extra_mods.items():
+    for _, (mod, _) in extra_mods.items():
         mod.call_llm = _wrapper  # type: ignore[attr-defined]
 
     try:
@@ -192,14 +191,14 @@ def _slug_from_path(transcript_path: Path) -> str:
 # Replay pipeline
 # ---------------------------------------------------------------------------
 
-def _run_replay(transcript_path: Path, base_dir: str, session_id: str, force_live: bool) -> None:
+def _run_replay(transcript_path: Path, base_dir: str, _session_id: str, _force_live: bool) -> None:
     """Run transcript_ingest against the replay tempfile store."""
     from core.transcript import read_transcript_from, summarize
     from core.session_detector import detect_session_type
     from core.transcript_ingest import extract_observations, append_to_ephemeral
 
     # Read the full transcript (from byte 0 — full replay)
-    entries, _new_offset, _ = read_transcript_from(transcript_path, 0)
+    entries, _, _ = read_transcript_from(transcript_path, 0)
     if not entries:
         print(f"[evolve] Warning: no entries found in transcript {transcript_path}")
         return
@@ -297,7 +296,7 @@ def _compile_evals(
     return specs, eval_paths
 
 
-def _run_guard_suite(slug: str, eval_paths: list[Path]) -> dict[str, bool]:
+def _run_guard_suite(_slug: str, eval_paths: list[Path]) -> dict[str, bool]:
     """Run pytest for tests/ + each compiled eval file. Returns {eval_slug: pass}."""
     results: dict[str, bool] = {}
 
@@ -347,7 +346,7 @@ def _read_trace_events(session_id: str) -> list[dict]:
     return events
 
 
-def _find_loss_stage(events: list[dict], spec: EvalSpec) -> str:
+def _find_loss_stage(events: list[dict], _spec: EvalSpec) -> str:
     """
     Heuristic: find the last stage boundary event before which the expected
     entities were still present (or first where they disappear).
