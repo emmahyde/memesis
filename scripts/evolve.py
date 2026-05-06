@@ -410,6 +410,58 @@ def _emit_diagnostic_delta(
 
 
 # ---------------------------------------------------------------------------
+# Picker
+# ---------------------------------------------------------------------------
+
+def _run_picker(top_n: int = 10, force_live: bool = False) -> Path | None:
+    """Run the LLM-ranked transcript picker. Returns chosen path or None on cancel."""
+    from core.transcript_picker import pick
+
+    print("[evolve] Discovering transcripts and ranking via LLM...")
+    print("[evolve] (deterministic prefilter on recency/length/friction/decisions,")
+    print("[evolve]  then LLM evaluates user-message excerpts for evalability)")
+    print()
+
+    candidates = pick(force_live=force_live)
+    if not candidates:
+        print("[evolve] No transcripts found that match prefilter criteria.", file=sys.stderr)
+        print("[evolve] (looking under ~/.claude/projects/*/*.jsonl)", file=sys.stderr)
+        return None
+
+    top = candidates[:top_n]
+    print(f"=== Top {len(top)} candidates ===\n")
+    for i, c in enumerate(top, start=1):
+        print(f"[{i}] {c.path.name}")
+        print(f"    {c.breakdown()}")
+        if c.themes:
+            print(f"    themes: {', '.join(c.themes)}")
+        if c.rationale:
+            print(f"    why: {c.rationale}")
+        print(f"    capture density: {c.expected_capture_density}")
+        print()
+
+    while True:
+        try:
+            raw = input(f"Pick [1-{len(top)}] or 'q' to cancel: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw.lower() in ("q", "quit", "exit", ""):
+            return None
+        try:
+            idx = int(raw)
+        except ValueError:
+            print(f"  invalid: '{raw}' — enter a number 1..{len(top)} or 'q'")
+            continue
+        if not (1 <= idx <= len(top)):
+            print(f"  out of range: {idx} — enter 1..{len(top)}")
+            continue
+        chosen = top[idx - 1].path
+        print(f"[evolve] Selected: {chosen}")
+        return chosen
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -419,9 +471,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--transcript",
-        required=True,
+        required=False,
         metavar="PATH",
-        help="Path to the .jsonl transcript file to replay.",
+        help="Path to the .jsonl transcript file to replay. Mutually exclusive with --pick.",
+    )
+    parser.add_argument(
+        "--pick",
+        action="store_true",
+        default=False,
+        help="Interactively select a transcript via LLM-ranked picker.",
+    )
+    parser.add_argument(
+        "--pick-top",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of top candidates to display in the picker (default: 10).",
     )
     parser.add_argument(
         "--live",
@@ -444,6 +509,19 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.pick and args.transcript:
+        print("[evolve] ERROR: --pick and --transcript are mutually exclusive", file=sys.stderr)
+        return 2
+    if not args.pick and not args.transcript:
+        print("[evolve] ERROR: provide --transcript PATH or --pick", file=sys.stderr)
+        return 2
+
+    if args.pick:
+        picked = _run_picker(top_n=args.pick_top, force_live=args.live)
+        if picked is None:
+            return 0
+        args.transcript = str(picked)
 
     transcript_path = Path(args.transcript).resolve()
     if not transcript_path.exists():

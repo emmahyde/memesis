@@ -20,11 +20,31 @@ The point is not automation. The point is **closing the loop between "what I wan
 
 You want a session where you have a clear intuition about what *should* have been captured. Recent ones are easier — the memory is fresh.
 
+**Option A — manual** (you already have a session in mind):
+
 ```bash
 ls ~/.claude/projects/-Users-$(whoami)-projects-memesis/*.jsonl | tail -5
 ```
 
-Pick one. Skim it briefly so you can describe expected memories later.
+**Option B — let the skill rank candidates**:
+
+```
+/memesis:evolve --pick
+```
+
+The picker:
+
+1. Discovers all `.jsonl` under `~/.claude/projects/*/`
+2. Deterministic prefilter: recency (≤30d), length (≥20 lines)
+3. Deterministic score: recency + length + friction-density (regex on emotional patterns) + decision-density (regex on `let's`, `decided`, `going with`, `instead of`, `switch to`, `chose`, …) + already-traced penalty (skip transcripts you've already debugged)
+4. Top-K (default 15) sent to LLM for evalability scoring on user-message excerpts
+5. LLM returns `{score, rationale, themes, expected_capture_density}` per candidate
+6. Combined score = `0.4 × deterministic + 0.6 × LLM`
+7. Top-N (default 10) printed as a numbered list with score breakdown, themes, and rationale; you pick by number
+
+Pass `--pick-top N` to widen/narrow the displayed list. LLM calls are cached via `~/.claude/memesis/evolve/cache/` — re-running the picker is cheap.
+
+Skim the chosen transcript briefly so you can describe expected memories later.
 
 ### Step 1.2 — Run the replay
 

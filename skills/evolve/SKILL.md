@@ -11,9 +11,16 @@ Replay a session transcript through the full memesis pipeline, compile expected-
 
 ```
 /memesis:evolve <transcript_path> [--live]
+/memesis:evolve --pick [--pick-top N] [--live]
 /memesis:evolve /path/to/transcript.jsonl
 /memesis:evolve /path/to/transcript.jsonl --live
 ```
+
+`--pick` and `--transcript` are mutually exclusive. `--pick` discovers
+transcripts under `~/.claude/projects/*/`, prefilters by recency/length/
+friction-density/decision-density, then LLM-ranks the top candidates by
+analyzing user-message content. The picker prints ranked options with
+score breakdowns, themes, and rationale; you choose by number.
 
 > `--autoresearch` is accepted as a flag but wires to the mutation loop in Task 4.2. If passed before that ships, a placeholder message is printed and the command exits 0.
 
