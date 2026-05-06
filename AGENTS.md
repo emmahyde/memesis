@@ -2,6 +2,8 @@
 
 AI assistant guidance for working in the `memesis/` subdirectory.
 
+**Design ethos and decision north star:** `.context/DESIGN_ETHOS.md` — read before proposing architecture changes or resolving design disagreements.
+
 ## Directory Structure
 
 ```

@@ -521,13 +521,29 @@ class Consolidator:
                     "actor": None,
                 }
 
+            # tier3 #32: trust LLM card.importance (already incorporates somatic prior from Stage 1)
+            # clamp + log-fallback per CONTEXT-tier3 D4 = "clamp+log+fallback"
+            # Kensinger +0.05 friction bump applied here (sole site per D1=C)
+            card_importance = decision.get("importance") if is_card else None
+            if card_importance is not None:
+                try:
+                    base_importance = max(0.0, min(1.0, float(card_importance)))
+                except (TypeError, ValueError):
+                    logger.warning("malformed card importance %r — falling back to flat formula", card_importance)
+                    base_importance = min(0.5 + importance_boost, 1.0)
+                if card_fields.get("affect_valence") == "friction":
+                    base_importance = min(1.0, base_importance + 0.05)
+                mem_importance = base_importance
+            else:
+                mem_importance = min(0.5 + importance_boost, 1.0)
+
             mem = Memory.create(
                 stage="consolidated",
                 title=title,
                 summary=summary,
                 content=full_content,
                 tags=json.dumps(tags),
-                importance=min(0.5 + importance_boost, 1.0),
+                importance=mem_importance,
                 reinforcement_count=0,
                 created_at=now,
                 updated_at=now,
@@ -535,8 +551,12 @@ class Consolidator:
                 content_hash=content_hash,
                 temporal_scope=card_fields["temporal_scope"],
                 confidence=card_fields["confidence"],
-                affect_valence=card_fields["affect_valence"],
+                # D3: "neutral" default for card-derived; non-card branches leave NULL
+                affect_valence=card_fields.get("affect_valence") or "neutral" if is_card else card_fields["affect_valence"],
                 actor=card_fields["actor"],
+                # #36-A: wire criterion_weights + rejected_options from card fields
+                criterion_weights=json.dumps(card_fields.get("criterion_weights")) if card_fields.get("criterion_weights") else None,
+                rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
             )
             memory_id = mem.id
 

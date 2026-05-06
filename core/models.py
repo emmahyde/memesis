@@ -121,6 +121,10 @@ class Memory(BaseModel):
     confidence = FloatField(null=True)            # 0.0–1.0; default 0.7 at write time; derived from knowledge_type_confidence
     affect_valence = TextField(null=True)         # friction|delight|surprise|neutral|mixed
 
+    # Tier-3 audit (Wave A): fields returned by extract_card_memory_fields() but previously dropped by consolidator
+    criterion_weights = TextField(null=True)  # JSON dict: {criterion: hard_veto|strong|weak|mentioned}
+    rejected_options = TextField(null=True)   # JSON list: [{option, reason}]
+
     class Meta:
         table_name = "memories"
 
