@@ -21,6 +21,8 @@ from core.self_reflection import (
     OBSERVATION_HABIT_TITLE, OBSERVATION_HABIT_CONTENT,
     COMPACTION_GUIDANCE_TITLE, COMPACTION_GUIDANCE_CONTENT,
     _is_opted_in,
+    can_promote_hypothesis,
+    promote_hypothesis,
 )
 from core.self_reflection_extraction import select_chunking, self_model_audit_path
 
@@ -437,3 +439,253 @@ class TestSelectChunkingRule:
         # non-agent-driven: heuristic also returns user_anchored
         result = select_chunking(10, 20, root=tmp_path)
         assert result == "user_anchored"
+
+
+class TestHypothesisPromotion:
+    """RISK-12 Wave 3.2: can_promote_hypothesis gate and promote_hypothesis action."""
+
+    # ---------------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------------
+
+    def _make_hypothesis(self, evidence_count: int, session_ids: list) -> Memory:
+        """Create a hypothesis Memory row with given evidence counts."""
+        now = datetime.now().isoformat()
+        return Memory.create(
+            stage="ephemeral",
+            title="Test tendency",
+            summary="A test hypothesis",
+            content=json.dumps({"tendency": "Test tendency"}),
+            tags=json.dumps(["kind:hypothesis"]),
+            importance=0.5,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+            kind="hypothesis",
+            evidence_count=evidence_count,
+            evidence_session_ids=json.dumps(session_ids),
+            temporal_scope=None,
+            affect_valence=None,
+            actor="assistant",
+            criterion_weights=None,
+            rejected_options=None,
+        )
+
+    # ---------------------------------------------------------------------------
+    # Exemption: non-hypothesis memories bypass the gate
+    # ---------------------------------------------------------------------------
+
+    def test_non_hypothesis_memory_is_exempt(self, base):
+        """kind != 'hypothesis' bypasses gate — returns True regardless of evidence."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="User preference",
+            summary="Explicit user statement",
+            content="Use ruff over flake8",
+            tags="[]",
+            importance=0.7,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+            kind=None,
+            evidence_count=0,
+            evidence_session_ids="[]",
+        )
+        assert can_promote_hypothesis(mem) is True
+
+    def test_finding_kind_is_exempt(self, base):
+        """kind='finding' (user-statement memory) is exempt from the gate."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="consolidated",
+            title="Finding memory",
+            summary="An explicit finding",
+            content="User prefers short function names",
+            tags="[]",
+            importance=0.7,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+            kind="finding",
+            evidence_count=0,
+            evidence_session_ids="[]",
+        )
+        assert can_promote_hypothesis(mem) is True
+
+    # ---------------------------------------------------------------------------
+    # Gate: evidence_count < 3 blocks promotion
+    # ---------------------------------------------------------------------------
+
+    def test_insufficient_evidence_count_blocks(self, base):
+        """evidence_count < 3 returns False."""
+        mem = self._make_hypothesis(evidence_count=2, session_ids=["s1", "s2"])
+        assert can_promote_hypothesis(mem) is False
+
+    def test_zero_evidence_blocks(self, base):
+        """evidence_count == 0 returns False."""
+        mem = self._make_hypothesis(evidence_count=0, session_ids=[])
+        assert can_promote_hypothesis(mem) is False
+
+    def test_exactly_three_evidence_passes(self, base):
+        """evidence_count == 3 with 2+ sessions passes the evidence gate."""
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2", "s3"])
+        assert can_promote_hypothesis(mem) is True
+
+    # ---------------------------------------------------------------------------
+    # Gate: < 2 distinct sessions blocks promotion
+    # ---------------------------------------------------------------------------
+
+    def test_single_session_blocks(self, base):
+        """Only one distinct session_id returns False even with count >= 3."""
+        # evidence_count=3 but all same session
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s1", "s1"])
+        assert can_promote_hypothesis(mem) is False
+
+    def test_two_distinct_sessions_passes(self, base):
+        """Exactly 2 distinct sessions satisfies the multi-session requirement."""
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2"])
+        assert can_promote_hypothesis(mem) is True
+
+    def test_empty_session_ids_blocks(self, base):
+        """Empty evidence_session_ids returns False (0 distinct sessions)."""
+        mem = self._make_hypothesis(evidence_count=3, session_ids=[])
+        assert can_promote_hypothesis(mem) is False
+
+    # ---------------------------------------------------------------------------
+    # Gate: contradiction edge blocks promotion
+    # ---------------------------------------------------------------------------
+
+    def test_contradiction_edge_blocks_as_source(self, base):
+        """A contradicts edge where memory is source blocks promotion."""
+        from core.models import MemoryEdge
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2"])
+        now = datetime.now().isoformat()
+        other = Memory.create(
+            stage="ephemeral",
+            title="Other memory",
+            summary="A different memory",
+            content="other",
+            tags="[]",
+            importance=0.5,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+        MemoryEdge.create(
+            source_id=mem.id,
+            target_id=other.id,
+            edge_type="contradicts",
+            weight=1.0,
+        )
+        assert can_promote_hypothesis(mem) is False
+
+    def test_contradiction_edge_blocks_as_target(self, base):
+        """A contradicts edge where memory is target blocks promotion (bidirectional)."""
+        from core.models import MemoryEdge
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2"])
+        now = datetime.now().isoformat()
+        other = Memory.create(
+            stage="ephemeral",
+            title="Other memory",
+            summary="A different memory",
+            content="other",
+            tags="[]",
+            importance=0.5,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+        MemoryEdge.create(
+            source_id=other.id,
+            target_id=mem.id,
+            edge_type="contradicts",
+            weight=1.0,
+        )
+        assert can_promote_hypothesis(mem) is False
+
+    def test_unrelated_edge_type_does_not_block(self, base):
+        """A non-contradicts edge (e.g. caused_by) does not block promotion."""
+        from core.models import MemoryEdge
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2"])
+        now = datetime.now().isoformat()
+        other = Memory.create(
+            stage="ephemeral",
+            title="Related memory",
+            summary="A related memory",
+            content="related",
+            tags="[]",
+            importance=0.5,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+        MemoryEdge.create(
+            source_id=mem.id,
+            target_id=other.id,
+            edge_type="caused_by",
+            weight=1.0,
+        )
+        assert can_promote_hypothesis(mem) is True
+
+    # ---------------------------------------------------------------------------
+    # Happy path: promote_hypothesis mutates kind and stage
+    # ---------------------------------------------------------------------------
+
+    def test_promote_clears_kind_and_bumps_stage(self, base):
+        """promote_hypothesis sets kind=None and advances stage to consolidated."""
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2"])
+        assert mem.stage == "ephemeral"
+        assert mem.kind == "hypothesis"
+
+        new_stage = promote_hypothesis(mem, rationale="Test promotion")
+
+        assert new_stage == "consolidated"
+        # Reload from DB
+        reloaded = Memory.get_by_id(mem.id)
+        assert reloaded.kind is None
+        assert reloaded.stage == "consolidated"
+
+    def test_promote_logs_consolidation_entry(self, base):
+        """promote_hypothesis writes a ConsolidationLog row."""
+        mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2"])
+        promote_hypothesis(mem, rationale="Test promotion log")
+
+        log = ConsolidationLog.get_or_none(
+            (ConsolidationLog.action == "promoted")
+            & (ConsolidationLog.memory_id == mem.id)
+        )
+        assert log is not None
+        assert log.from_stage == "ephemeral"
+        assert log.to_stage == "consolidated"
+
+    def test_promote_raises_at_highest_stage(self, base):
+        """promote_hypothesis raises ValueError when already at instinctive stage."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="instinctive",
+            title="Instinctive hypothesis",
+            summary="Already at top",
+            content="content",
+            tags="[]",
+            importance=0.9,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+            kind="hypothesis",
+            evidence_count=5,
+            evidence_session_ids=json.dumps(["s1", "s2", "s3"]),
+        )
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="highest stage"):
+            promote_hypothesis(mem)
+
+    def test_gate_then_promote_full_happy_path(self, base):
+        """Full path: gate passes, promote executes, DB reflects changes."""
+        mem = self._make_hypothesis(evidence_count=5, session_ids=["s1", "s2", "s3"])
+        assert can_promote_hypothesis(mem) is True
+        new_stage = promote_hypothesis(mem)
+        assert new_stage == "consolidated"
+        reloaded = Memory.get_by_id(mem.id)
+        assert reloaded.kind is None
+        assert reloaded.stage == "consolidated"

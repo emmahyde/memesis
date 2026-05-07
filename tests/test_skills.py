@@ -16,8 +16,8 @@ SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 SKILL_NAMES = [
     "backfill", "connect", "dashboard", "forget", "health",
-    "ideate", "learn", "recall", "reflect", "run-eval", "stats",
-    "teach", "threads", "usage",
+    "hypotheses", "ideate", "learn", "recall", "reflect", "reindex",
+    "run-eval", "stats", "teach", "threads", "usage",
 ]
 
 INVOCATION_PREFIX = "/memesis:"

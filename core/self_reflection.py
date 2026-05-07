@@ -422,21 +422,6 @@ class SelfReflector:
         logger.info("Created hypothesis memory: %s (%s)", tendency, mem.id)
         return mem.id
 
-    def _find_hypothesis_by_tendency(self, tendency: str):
-        """Find an existing hypothesis Memory row by title. Returns Memory or None."""
-        try:
-            return (
-                Memory.select()
-                .where(
-                    (Memory.kind == "hypothesis")
-                    & (Memory.title == tendency)
-                    & Memory.archived_at.is_null()
-                )
-                .first()
-            )
-        except Exception:
-            return None
-
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -635,3 +620,168 @@ class SelfReflector:
             content = content.rstrip() + "\n" + "\n".join(new_sections)
 
         return content
+
+    def _find_hypothesis_by_tendency(self, tendency: str):
+        """Find an existing hypothesis Memory row by title. Returns Memory or None."""
+        try:
+            return (
+                Memory.select()
+                .where(
+                    (Memory.kind == "hypothesis")
+                    & (Memory.title == tendency)
+                    & Memory.archived_at.is_null()
+                )
+                .first()
+            )
+        except Exception:
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis promotion gate (RISK-12, Wave 3.2)
+# ---------------------------------------------------------------------------
+
+# Stage order mirrors LifecycleManager.STAGE_ORDER without importing the class.
+_STAGE_ORDER = ["ephemeral", "consolidated", "crystallized", "instinctive"]
+
+
+def can_promote_hypothesis(memory: Memory) -> bool:
+    """
+    Hypothesis promotion gate.
+
+    Returns True when the memory is eligible for promotion, False otherwise.
+
+    Exemption marker:
+        Memories with ``kind != "hypothesis"`` are *not* subject to the
+        evidence gate and return True immediately.  This covers explicit
+        user-statement memories (kind=None, kind='finding', kind='preference',
+        kind='correction', etc.) — anything that is not an LLM-inferred
+        hypothesis bypasses the threshold check.
+
+    Gate rules (applied only when kind == "hypothesis"):
+        1. evidence_count >= 3
+        2. evidence_session_ids encodes >= 2 distinct session identifiers
+        3. No ``contradicts`` edge in ``memory_edges`` touching this memory
+           (checked bidirectionally: source_id == id OR target_id == id)
+
+    Consolidation caller note (Wave 4.1):
+        This function is defined here so the consolidator (core/consolidator.py,
+        owned by Task 3.1) can import and call it during its promotion cycle.
+        Do NOT modify core/consolidator.py from this task — the integration
+        is a cross-task concern.  The companion ``promote_hypothesis()`` function
+        performs the actual mutation once this gate returns True.
+
+    Args:
+        memory: A Memory ORM instance.
+
+    Returns:
+        True if the memory may be promoted, False otherwise.
+    """
+    from .models import MemoryEdge
+
+    # Non-hypothesis memories are exempt from the evidence gate.
+    if memory.kind != "hypothesis":
+        return True
+
+    # --- evidence_count check ---
+    evidence_count = memory.evidence_count or 0
+    if evidence_count < 3:
+        return False
+
+    # --- distinct-session check ---
+    try:
+        session_ids: list = json.loads(memory.evidence_session_ids or "[]")
+        if not isinstance(session_ids, list):
+            session_ids = []
+    except (ValueError, TypeError):
+        session_ids = []
+
+    if len(set(session_ids)) < 2:
+        return False
+
+    # --- contradiction check (bidirectional) ---
+    try:
+        contradiction_exists = (
+            MemoryEdge.select()
+            .where(
+                (MemoryEdge.edge_type == "contradicts")
+                & (
+                    (MemoryEdge.source_id == memory.id)
+                    | (MemoryEdge.target_id == memory.id)
+                )
+            )
+            .exists()
+        )
+        if contradiction_exists:
+            return False
+    except Exception:
+        # If the table doesn't exist or query fails, do not block promotion.
+        pass
+
+    return True
+
+
+def promote_hypothesis(memory: Memory, rationale: str | None = None) -> str:
+    """
+    Promote a hypothesis Memory to the next lifecycle stage.
+
+    Called after ``can_promote_hypothesis(memory)`` returns True.
+
+    Mutation performed:
+        - ``memory.kind`` is set to None (clears the 'hypothesis' marker —
+          the memory is now treated as a durable finding).
+        - ``memory.stage`` is advanced by one step in _STAGE_ORDER.
+        - A ConsolidationLog entry is written.
+
+    Wave 4.1 integration note:
+        The consolidation cycle in core/consolidator.py should import
+        ``can_promote_hypothesis`` and ``promote_hypothesis`` from this module
+        and call them on each hypothesis Memory during its promotion pass.
+        This function intentionally does NOT call core.lifecycle.LifecycleManager
+        to avoid importing the full lifecycle machinery; it mirrors the minimal
+        mutation subset needed for hypothesis promotion.
+
+    Args:
+        memory: A Memory ORM instance with kind == 'hypothesis'.
+        rationale: Optional description written to the consolidation log.
+
+    Returns:
+        New stage name after promotion.
+
+    Raises:
+        ValueError: If the memory is already at the highest stage.
+    """
+    current_stage = memory.stage
+    try:
+        current_idx = _STAGE_ORDER.index(current_stage)
+    except ValueError:
+        # Unknown stage — default to ephemeral
+        current_idx = 0
+
+    if current_idx >= len(_STAGE_ORDER) - 1:
+        raise ValueError(f"Memory already at highest stage: {current_stage}")
+
+    next_stage = _STAGE_ORDER[current_idx + 1]
+    from_stage = current_stage
+
+    memory.kind = None
+    memory.stage = next_stage
+    memory.save()
+
+    ConsolidationLog.create(
+        timestamp=datetime.now().isoformat(),
+        action="promoted",
+        memory_id=memory.id,
+        from_stage=from_stage,
+        to_stage=next_stage,
+        rationale=rationale or "Hypothesis promotion gate passed",
+    )
+
+    logger.info(
+        "Promoted hypothesis memory %s: %s -> %s (kind cleared)",
+        memory.id,
+        from_stage,
+        next_stage,
+    )
+
+    return next_stage
