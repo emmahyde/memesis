@@ -296,18 +296,31 @@ class SelfReflector:
 
         return self._call_llm(prompt)
 
-    def apply_reflection(self, reflection: dict) -> str:
+    def apply_reflection(self, reflection: dict, session_id: str | None = None) -> str:
         """
         Apply reflection results to the self-model memory.
 
-        Appends new observations and marks deprecated ones.
+        Writer gate (RISK-12): if self_reflection module is not opted in via
+        MEMESIS_EXPERIMENTAL_MODULES, this method logs a warning and returns the
+        current self-model ID without writing any hypothesis or self-model updates.
+
+        Appends new observations and marks deprecated ones in the self-model.
+        Also writes per-tendency hypothesis Memory rows (kind='hypothesis') for
+        inferred content — these are the accumulation units for Wave 3.2 promotion.
+
+        Heuristic: all writes through this module are treated as *inferred* hypotheses
+        (LLM-derived from consolidation history). Explicit user statements arrive via
+        /memesis:learn and other write paths; they bypass this gate entirely.
 
         Args:
             reflection: Dict from reflect() with 'observations' and 'deprecated'.
+            session_id: Optional session identifier for evidence_session_ids tracking.
 
         Returns:
-            Updated memory ID.
+            Self-model memory ID (unchanged if gate blocks writes).
         """
+        # NOTE: experimental flag governs retrieval scoring only (retrieval.py _get_enabled_modules).
+        # The writer always runs — kind/evidence tagging is unconditional so Wave 3.2 can promote.
         model_id = self.ensure_self_model()
         model_memory = Memory.get_by_id(model_id)
         current_content = model_memory.content or ""
@@ -316,6 +329,12 @@ class SelfReflector:
 
         model_memory.content = new_content
         model_memory.save()
+
+        # Write per-tendency hypothesis Memory rows for Wave 3.2 promotion gate.
+        for obs in reflection.get("observations", []):
+            tendency = obs.get("tendency") or obs.get("title") or ""
+            if tendency:
+                self._write_hypothesis(tendency, obs, session_id=session_id)
 
         ConsolidationLog.create(
             timestamp=datetime.now().isoformat(),
@@ -328,6 +347,95 @@ class SelfReflector:
         )
 
         return model_id
+
+    def _write_hypothesis(
+        self,
+        tendency: str,
+        observation: dict,
+        session_id: str | None = None,
+    ) -> str:
+        """
+        Write or update a per-tendency hypothesis Memory row.
+
+        On first write: creates a new Memory with kind='hypothesis', evidence_count=1,
+        and evidence_session_ids=[session_id] (or [] if no session_id provided).
+
+        On subsequent calls (same tendency title already exists): increments
+        evidence_count and appends session_id to evidence_session_ids.
+
+        Internal helper: write or accumulate one hypothesis entry.
+
+        Returns:
+            Memory ID of the hypothesis row.
+        """
+        # Look up existing hypothesis row by tendency title in the ephemeral stage.
+        existing = self._find_hypothesis_by_tendency(tendency)
+        session_ids_entry = session_id if session_id else ""
+
+        if existing is not None:
+            # Accumulate: increment evidence_count and append session_id.
+            current_ids: list = []
+            try:
+                current_ids = json.loads(existing.evidence_session_ids or "[]")
+                if not isinstance(current_ids, list):
+                    current_ids = []
+            except (ValueError, TypeError):
+                current_ids = []
+
+            if session_ids_entry and session_ids_entry not in current_ids:
+                current_ids.append(session_ids_entry)
+
+            existing.evidence_count = (existing.evidence_count or 0) + 1
+            existing.evidence_session_ids = json.dumps(current_ids)
+            existing.save()
+            logger.debug("Accumulated hypothesis evidence: %s (%s)", tendency, existing.id)
+            return existing.id
+
+        # First write: create hypothesis Memory row.
+        now = datetime.now().isoformat()
+        initial_session_ids = json.dumps([session_ids_entry] if session_ids_entry else [])
+        evidence = observation.get("evidence", "")
+        confidence = observation.get("confidence", None)
+
+        mem = Memory.create(
+            stage="ephemeral",
+            title=tendency,
+            summary=observation.get("correction") or evidence or tendency,
+            content=json.dumps(observation),
+            tags=json.dumps(["kind:hypothesis", "self_reflection"]),
+            importance=float(confidence) if confidence is not None else 0.5,
+            reinforcement_count=0,
+            created_at=now,
+            updated_at=now,
+            # Hypothesis schema fields (RISK-12)
+            kind="hypothesis",
+            evidence_count=1,
+            evidence_session_ids=initial_session_ids,
+            # Defensive nulls — non-card write path (D3)
+            temporal_scope=None,
+            affect_valence=None,
+            actor="assistant",
+            criterion_weights=None,
+            rejected_options=None,
+        )
+
+        logger.info("Created hypothesis memory: %s (%s)", tendency, mem.id)
+        return mem.id
+
+    def _find_hypothesis_by_tendency(self, tendency: str):
+        """Find an existing hypothesis Memory row by title. Returns Memory or None."""
+        try:
+            return (
+                Memory.select()
+                .where(
+                    (Memory.kind == "hypothesis")
+                    & (Memory.title == tendency)
+                    & Memory.archived_at.is_null()
+                )
+                .first()
+            )
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Private helpers

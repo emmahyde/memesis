@@ -34,6 +34,14 @@ logger = logging.getLogger(__name__)
 # Minimum user_version that triggers the seeding path (skip execution, just record).
 SEED_THRESHOLD = 2
 
+# Migrations that were applied inline in the old database.py codepath.
+# Only these are seeded (not executed) on existing DBs (user_version >= SEED_THRESHOLD).
+# Migrations added after the runner was introduced must always execute.
+_LEGACY_MIGRATION_STEMS = frozenset({
+    "20260507_0001_initial_alters",
+    "20260507_0002_consolidation_log_check",
+})
+
 # Directory containing migration files (relative to this package).
 _SQL_DIR = Path(__file__).parent / "sql"
 
@@ -146,8 +154,8 @@ def run_migrations(conn, seed_threshold: int = SEED_THRESHOLD) -> None:
             logger.debug("Migration already applied: %s", version)
             continue
 
-        if seed_mode:
-            # Record as applied without executing
+        if seed_mode and version in _LEGACY_MIGRATION_STEMS:
+            # Legacy migration — was applied inline; record without executing
             with conn.atomic():
                 _record_version(conn, version)
             logger.info("Seeded (not executed): %s", version)

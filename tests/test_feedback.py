@@ -490,3 +490,111 @@ class TestCardsUnusedInSubsequentSessions:
 
         result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# RISK-09: injection_count decoupling from importance / relevance scoring
+# ---------------------------------------------------------------------------
+
+
+class TestInjectionCountDecoupling:
+    """
+    Confirm that varying injection_count has no effect on importance (feedback)
+    or relevance scores (relevance engine).
+
+    These tests exist to guard against regressions that re-couple the two.
+    No LLM calls are made; all data is synthetic fixture data.
+    """
+
+    def _make_memory_dict(self, *, usage_count=0, injection_count=0, importance=0.5, **kwargs) -> dict:
+        """Build a memory-like dict for RelevanceEngine.compute_relevance()."""
+        now = datetime.now().isoformat()
+        return {
+            "id": "test-id",
+            "importance": importance,
+            "usage_count": usage_count,
+            "injection_count": injection_count,
+            "usage_count": usage_count,
+            "last_used_at": now,
+            "last_injected_at": now,
+            "updated_at": now,
+            "created_at": now,
+            "project_context": None,
+            "reinforcement_count": 0,
+            "stage": "consolidated",
+            "archived_at": None,
+            "subsumed_by": None,
+            "tags": "[]",
+            **kwargs,
+        }
+
+    def test_relevance_unchanged_when_injection_count_varies(self, base):
+        """
+        inject_count 1 vs 100 with same usage_count must produce identical
+        relevance scores (RISK-09 decoupling).
+        """
+        from core.relevance import RelevanceEngine
+        engine = RelevanceEngine()
+        now = datetime.now()
+
+        low_inject = self._make_memory_dict(usage_count=2, injection_count=1)
+        high_inject = self._make_memory_dict(usage_count=2, injection_count=100)
+
+        score_low = engine.compute_relevance(low_inject, now=now)
+        score_high = engine.compute_relevance(high_inject, now=now)
+
+        assert abs(score_low - score_high) < 1e-9, (
+            f"relevance changed with injection_count: {score_low} vs {score_high} — "
+            "injection_count is coupled to scoring (RISK-09 regression)"
+        )
+
+    def test_relevance_unchanged_when_injection_count_zero_vs_large(self, base):
+        """Edge case: zero vs large injection_count, zero usage_count."""
+        from core.relevance import RelevanceEngine
+        engine = RelevanceEngine()
+        now = datetime.now()
+
+        zero_inject = self._make_memory_dict(usage_count=0, injection_count=0)
+        large_inject = self._make_memory_dict(usage_count=0, injection_count=500)
+
+        score_zero = engine.compute_relevance(zero_inject, now=now)
+        score_large = engine.compute_relevance(large_inject, now=now)
+
+        assert abs(score_zero - score_large) < 1e-9, (
+            f"relevance changed with injection_count: {score_zero} vs {score_large}"
+        )
+
+    def test_importance_score_unchanged_when_injection_count_varies(self, base, feedback):
+        """
+        FeedbackLoop.update_importance_scores() must not change importance
+        differently based on injection_count value — only was_used matters.
+        """
+        # Two identical memories, different injection_count values.
+        # Neither is used in the session being scored.
+        mem_low = Memory.create(
+            stage="consolidated",
+            title="Low Inject Memory",
+            summary="nothing relevant here at all",
+            content="body",
+            importance=0.5,
+            injection_count=1,
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
+        mem_high = Memory.create(
+            stage="consolidated",
+            title="High Inject Memory",
+            summary="nothing relevant here at all",
+            content="body",
+            importance=0.5,
+            injection_count=999,
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
+
+        # Neither was seen in the session, no RetrievalLog rows → no consecutive
+        # unused trigger. Importance must stay at 0.5 for both.
+        feedback.update_importance_scores("new-session-xyz")
+
+        assert Memory.get_by_id(mem_low.id).importance == 0.5
+        assert Memory.get_by_id(mem_high.id).importance == 0.5

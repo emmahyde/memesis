@@ -125,6 +125,11 @@ class Memory(BaseModel):
     criterion_weights = TextField(null=True)  # JSON dict: {criterion: hard_veto|strong|weak|mentioned}
     rejected_options = TextField(null=True)   # JSON list: [{option, reason}]
 
+    # RISK-12: hypothesis evidence tracking (Wave 2.2)
+    # kind is already defined above (W2 schema); evidence_count and evidence_session_ids are new.
+    evidence_count = IntegerField(default=0, null=True)          # number of sessions that observed this hypothesis
+    evidence_session_ids = TextField(default='[]', null=True)    # JSON array of session IDs that contributed evidence
+
     class Meta:
         table_name = "memories"
 
