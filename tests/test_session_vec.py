@@ -41,9 +41,7 @@ EMBED_B = _make_embedding([0.0, 1.0])   # "topic B" — orthogonal to A
 # ---------------------------------------------------------------------------
 
 try:
-    import apsw
     import sqlite_vec  # noqa: F401
-
     _VEC_AVAILABLE = True
 except ImportError:
     _VEC_AVAILABLE = False
@@ -58,15 +56,18 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def db_path(tmp_path: Path) -> Path:
-    """Return a fresh temp DB path (file does not need to pre-exist)."""
-    return tmp_path / "index.db"
+def db_path(tmp_path: Path):
+    """Initialise a fresh isolated DB and yield its path."""
+    from core.database import init_db, close_db
+    init_db(base_dir=str(tmp_path / "memory"))
+    yield tmp_path / "memory" / "index.db"
+    close_db()
 
 
-def make_store(db_path: Path, session_id: str = "test-session-001"):
+def make_store(session_id: str = "test-session-001"):
     from core.session_vec import SessionVecStore
 
-    return SessionVecStore(db_path, session_id)
+    return SessionVecStore(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ def make_store(db_path: Path, session_id: str = "test-session-001"):
 class TestSessionVecIndex:
     def test_add_and_query_returns_self(self, db_path: Path):
         """Single insert, query with same embedding → returns that obs_idx."""
-        store = make_store(db_path)
+        store = make_store()
         assert store.available
 
         ok = store.add(obs_idx=0, embedding=EMBED_A)
@@ -87,13 +88,13 @@ class TestSessionVecIndex:
 
     def test_query_empty_returns_empty(self, db_path: Path):
         """Querying an empty index returns []."""
-        store = make_store(db_path)
+        store = make_store()
         results = store.query_similar(EMBED_A, k=3)
         assert results == []
 
     def test_query_returns_similar_ordered(self, db_path: Path):
         """Insert A and B; querying with A vector returns A first."""
-        store = make_store(db_path)
+        store = make_store()
         store.add(obs_idx=0, embedding=EMBED_A)
         store.add(obs_idx=1, embedding=EMBED_B)
 
@@ -103,7 +104,7 @@ class TestSessionVecIndex:
 
     def test_top_k_respected(self, db_path: Path):
         """Insert 5 embeddings, query top_k=2 → 2 results."""
-        store = make_store(db_path)
+        store = make_store()
         for i in range(5):
             store.add(obs_idx=i, embedding=EMBED_A)
 
@@ -112,7 +113,7 @@ class TestSessionVecIndex:
 
     def test_clear_removes_entries(self, db_path: Path):
         """After drop(), query returns 0 results (table gone)."""
-        store = make_store(db_path)
+        store = make_store()
         store.add(obs_idx=0, embedding=EMBED_A)
 
         store.drop()
@@ -126,8 +127,8 @@ class TestSessionVecIndex:
 
     def test_session_isolation(self, db_path: Path):
         """Two SessionVecStore instances with different session_ids don't see each other's entries."""
-        store_a = make_store(db_path, session_id="session-alpha")
-        store_b = make_store(db_path, session_id="session-beta")
+        store_a = make_store(session_id="session-alpha")
+        store_b = make_store(session_id="session-beta")
 
         assert store_a._table != store_b._table
 
@@ -143,27 +144,27 @@ class TestSessionVecIndex:
 
     def test_add_wrong_embedding_size_skipped(self, db_path: Path):
         """Embedding with wrong byte length returns False without crash."""
-        store = make_store(db_path)
+        store = make_store()
         bad_embedding = struct.pack("4f", 1.0, 0.0, 0.0, 0.0)  # only 4 floats
         result = store.add(obs_idx=0, embedding=bad_embedding)
         assert result is False
 
     def test_add_none_embedding_skipped(self, db_path: Path):
         """None embedding returns False without crash."""
-        store = make_store(db_path)
+        store = make_store()
         result = store.add(obs_idx=0, embedding=None)
         assert result is False
 
     def test_query_none_embedding_returns_empty(self, db_path: Path):
         """None query embedding returns [] without crash."""
-        store = make_store(db_path)
+        store = make_store()
         store.add(obs_idx=0, embedding=EMBED_A)
         results = store.query_similar(None, k=3)
         assert results == []
 
     def test_drop_idempotent(self, db_path: Path):
         """Calling drop() twice does not raise."""
-        store = make_store(db_path)
+        store = make_store()
         store.add(obs_idx=0, embedding=EMBED_A)
         store.drop()
         store.drop()  # should not raise

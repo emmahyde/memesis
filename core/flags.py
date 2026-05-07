@@ -45,6 +45,7 @@ DEFAULTS = {
     "affect_weighted_retrieval": True,
     "temporal_scope_weighting": True,
     "confidence_weighting": True,
+    "continuous_novelty": True,
 }
 
 _cache: dict | None = None

@@ -20,9 +20,12 @@ PATTERNS.md` for the full architectural framing.
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
+
+from .compression import compress_memory_content, compress_memory_for_stage, compression_ratio, get_stage_depth
 
 from .database import get_base_dir, get_vec_store
 from .issue_cards import extract_card_memory_fields
@@ -302,14 +305,25 @@ class Consolidator:
         refs = []
         if decision is not None:
             refs = decision.get("_observer_refs") or []
+        
+        # Compute compression ratio: output tokens / input tokens
+        # Output = tokens in the kept memory content (decision output)
+        # Input = tokens sent to the LLM (prompt)
+        input_tokens = call.get("input_tokens", 0)
+        output_tokens = call.get("output_tokens", 0)
+        compression_ratio = None
+        if input_tokens and input_tokens > 0:
+            compression_ratio = round(output_tokens / input_tokens, 4)
+        
         return {
             "prompt": call.get("prompt"),
             "llm_response": call.get("response"),
             "model": call.get("model"),
-            "input_tokens": call.get("input_tokens"),
-            "output_tokens": call.get("output_tokens"),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
             "latency_ms": call.get("latency_ms"),
             "input_observation_refs": json.dumps(refs),
+            "compression_ratio": compression_ratio,
         }
 
     def estimate_token_budget(self, memories: list) -> int:
@@ -467,10 +481,14 @@ class Consolidator:
             New memory_id, or None if creation failed.
         """
         target_path = decision.get("target_path") or "general/observation.md"
-        title = decision.get("title") or "Untitled"
-        summary = decision.get("summary") or ""
+        title = decision.get("title") or decision.get("subtitle") or "Untitled"
+        summary = decision.get("summary") or decision.get("subtitle") or ""
         tags = list(decision.get("tags") or [])
-        observation = decision.get("observation") or ""
+        observation = (
+            decision.get("observation")
+            or " ".join(decision.get("facts") or [])
+            or ""
+        )
 
         # Tag observation type if the consolidator classified it
         obs_type = decision.get("observation_type")
@@ -502,6 +520,18 @@ class Consolidator:
                 'type': 'memory',
             }
             full_content = _format_markdown(frontmatter, observation)
+
+            stage = "consolidated"
+            compressed = compress_memory_for_stage(full_content, stage)
+            if compressed != full_content:
+                ratio = compression_ratio(full_content, compressed)
+                depth = get_stage_depth(stage)
+                logger.info(
+                    "Compression: %.1fx at %s depth (%d -> %d chars)",
+                    ratio, depth, len(full_content), len(compressed),
+                )
+                full_content = compressed
+
             content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
 
             # Dedup check
@@ -868,7 +898,15 @@ class Consolidator:
 
 
 def _format_markdown(metadata: dict, content: str) -> str:
-    """Format metadata and content as markdown with YAML frontmatter."""
+    """Format metadata and content as markdown with YAML frontmatter.
+
+    DEFERRED: Extractive key-sentence field — RECOMP's dual extractive+abstractive
+    architecture shows extractive compression outperforms abstractive on QA tasks,
+    but memesis's small corpus (~100-1000 memories) already has sufficient FTS5+semantic
+    coverage. Adding a key_sentence field would require schema migration + prompt change
+    for marginal gain. Revisit if corpus grows to 10K+ memories.
+    See: .context/DEFERRED-COMPRESSION.md #3
+    """
     lines = ['---']
     for key in ['name', 'description', 'type']:
         if key in metadata:

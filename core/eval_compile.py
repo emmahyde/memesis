@@ -50,10 +50,14 @@ Rules:
 - polarity: only set if the description implies a sentiment/valence; else null
 - stage_target: only set if the description mentions a lifecycle stage; else null
 - match_mode: pick the most appropriate:
-    entity_presence — default; memory should contain these entities
-    semantic_similarity — description asks for semantic closeness
-    polarity_match — description is about emotional valence/affect
-    absence — description says the memory should NOT exist
+    semantic_similarity — DEFAULT for free-text preference/intent descriptions where the
+        pipeline is likely to paraphrase (e.g. "user prefers X over Y", "user tends to Z").
+        The pipeline rarely echoes user phrasing verbatim, so literal entity match fails
+        on synonyms. Use this whenever the description is conceptual, not technical-literal.
+    entity_presence — only when the memory MUST contain specific named identifiers verbatim
+        (file paths, error codes, API names, version numbers, exact tool names).
+    polarity_match — description is about emotional valence/affect.
+    absence — description says the memory should NOT exist.
 
 Description:
 {description}
@@ -344,15 +348,28 @@ def test_{_safe_fn(spec.slug)}_semantic_similarity():
 
     results = vec_store.search_vector(query_embedding, k=10)
 
+    if os.environ.get("EVOLVE_VERBOSE"):
+        from core.database import get_db_path
+        from core.models import db as _db
+        try:
+            n_vec = _db.execute_sql("SELECT COUNT(*) FROM vec_memories").fetchone()[0]
+        except Exception as _e:
+            n_vec = f"err:{{_e}}"
+        print(f"\\n[eval-debug] db_path={{get_db_path()}}")
+        print(f"[eval-debug] vec_memories rows: {{n_vec}}")
+        print(f"[eval-debug] Memory rows (active): {{len(memory_ids)}} ids={{memory_ids}}")
+        print(f"[eval-debug] search_vector returned {{len(results)}}: {{results}}")
+
     hits = [r for r in results if r["memory_id"] in memory_ids]
 
     assert hits, (
         f"No memories found via semantic search for query {{QUERY!r}}."
     )
 
-    # sqlite-vec returns distance (lower = more similar); convert to similarity
+    # sqlite-vec returns L2 distance on unit vectors; convert to cosine similarity:
+    #   cosine_sim = 1 - L2_dist² / 2
     best_distance = min(r["distance"] for r in hits)
-    best_similarity = 1.0 - best_distance
+    best_similarity = 1.0 - (best_distance ** 2) / 2.0
 
     assert best_similarity >= SIMILARITY_THRESHOLD, (
         f"Best semantic similarity {{best_similarity:.3f}} < threshold "

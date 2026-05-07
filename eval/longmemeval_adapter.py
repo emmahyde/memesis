@@ -166,12 +166,15 @@ class LongMemEvalAdapter:
         results = adapter.run_fixture()
         print(adapter.aggregate(results))
 
-    Example (wired to Phase 7 retrieval engine)::
+    Example (wired to retrieval engine — Phase 7+)::
 
-        # TODO(Phase 7): Wire to core.retrieval.RetrievalEngine.active_search()
-        # engine = RetrievalEngine(store)
-        # adapter = LongMemEvalAdapter(retrieval_fn=engine.active_search)
-        pass
+        from core.retrieval import RetrievalEngine
+        engine = RetrievalEngine(store)
+        adapter = LongMemEvalAdapter(
+            retrieval_fn=lambda q: [
+                m["content"] for m in engine.active_search(q, session_id="eval")
+            ]
+        )
     """
 
     def __init__(self, retrieval_fn: Callable[[str], list[str]]) -> None:

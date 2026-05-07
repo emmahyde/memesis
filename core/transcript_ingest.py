@@ -213,6 +213,14 @@ def extract_observations(
                     Phase E audit (2026-04-28) added this so the silent
                     importance drop is observable downstream.
     """
+    _tw = get_active_writer()
+    if _tw:
+        _tw.emit("stage1", "stage1_extract_start", {
+            "rendered_chars": len(rendered),
+            "session_type": session_type,
+            "flow": "simple",
+        })
+
     # #33: use format_extract_prompt() to inject per-session-type guidance
     raw = call_llm(format_extract_prompt(
         transcript=rendered, session_type=session_type, affect_hint=""
@@ -221,6 +229,10 @@ def extract_observations(
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning("extract_observations: failed to parse LLM response as JSON")
+        if _tw:
+            _tw.emit("stage1", "stage1_extract_end", {
+                "n_obs": 0, "n_dropped": 0, "outcome": "json_parse_error",
+            })
         return []
 
     if isinstance(parsed, list):
@@ -231,6 +243,14 @@ def extract_observations(
                 drop_stats.get("low_importance_dropped", 0)
                 + (len(parsed) - len(kept))
             )
+        if _tw:
+            _tw.emit("stage1", "stage1_extract_end", {
+                "n_obs_raw": len(parsed),
+                "n_obs_kept": len(kept),
+                "n_dropped_low_importance": len(parsed) - len(kept),
+                "kinds": sorted({str(o.get("kind", "")) for o in kept}),
+                "outcome": "ok",
+            })
         return kept
 
     if isinstance(parsed, dict):
@@ -243,6 +263,11 @@ def extract_observations(
                 failed_gate, reason,
             )
             _write_ingest_trace("skipped", f"[{failed_gate}] {reason}", raw[:80])
+            if _tw:
+                _tw.emit("stage1", "stage1_extract_end", {
+                    "n_obs": 0, "outcome": "skipped",
+                    "failed_gate": failed_gate, "reason": reason,
+                })
             return []
         # Dict without "skipped" key — malformed response.
         logger.warning(
@@ -253,6 +278,10 @@ def extract_observations(
             "dict response without skipped=true",
             raw[:80],
         )
+        if _tw:
+            _tw.emit("stage1", "stage1_extract_end", {
+                "n_obs": 0, "outcome": "malformed_dict",
+            })
         return []
 
     # Unexpected type (shouldn't happen after json.loads, but guard anyway).
@@ -589,14 +618,11 @@ def extract_observations_hierarchical(
     svec = None  # SessionVecStore instance, or None when Reframe A is disabled
 
     if REFRAME_A_ENABLED and session_id is not None:
-        from core.database import get_db_path
         from core.embeddings import embed_text
         from core.session_vec import SessionVecStore
 
-        _db_path = get_db_path()
-        if _db_path is not None:
-            svec = SessionVecStore(_db_path, session_id)
-            if not svec.available:
+        svec = SessionVecStore(session_id)
+        if not svec.available:
                 logger.warning(
                     "hierarchical: SessionVecStore unavailable for session %s — running without Reframe A",
                     session_id,
@@ -1090,6 +1116,14 @@ def append_to_ephemeral(
                 f.write(formatted_text)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+    _tw = get_active_writer()
+    if _tw:
+        _tw.emit("stage1", "stage1_append_ephemeral", {
+            "n_appended": len(observations),
+            "n_lines_emitted": len(lines),
+            "target": str(target),
+        })
 
     return len(observations)
 

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "memesis-channels",
+  "description": "Local development channel plugins for memesis.",
+  "owner": { "name": "emma" },
+  "plugins": [
+    {
+      "name": "review-canvas",
+      "description": "PR-style transcript review canvas — drag-select line ranges, comment, stream comments back into session as channel events.",
+      "category": "development",
+      "source": "./review-canvas"
+    }
+  ]
+}

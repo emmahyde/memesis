@@ -942,32 +942,36 @@ class TestReframeA:
         except ImportError:
             pytest.skip("sqlite-vec not available")
 
-        fake_affect = self._make_fake_affect(max_boost=0.1)
-        obs_response = json.dumps([{"content": "obs", "facts": ["auth JWT"], "importance": 0.6}])
+        from core.database import init_db, close_db
+        init_db(base_dir=str(tmp_path))
+        try:
+            fake_affect = self._make_fake_affect(max_boost=0.1)
+            obs_response = json.dumps([{"content": "obs", "facts": ["auth JWT"], "importance": 0.6}])
 
-        embed_a = self._embed_a()
-        captured_prompts: list[str] = []
+            embed_a = self._embed_a()
+            captured_prompts: list[str] = []
 
-        def fake_batch(prompts, **kwargs):
-            captured_prompts.extend(prompts)
-            return [obs_response]
+            def fake_batch(prompts, **kwargs):
+                captured_prompts.extend(prompts)
+                return [obs_response]
 
-        with patch.object(ti, "REFRAME_A_ENABLED", True), \
-             patch("core.transcript_ingest.iter_windows", return_value=["window text"]), \
-             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
-             patch("core.transcript_ingest.call_llm_batch", side_effect=fake_batch), \
-             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
-             patch("core.transcript_ingest.synthesize_issue_cards",
-                   return_value=([], [{"content": "obs", "facts": ["auth JWT"], "importance": 0.6}],
-                                 {"outcome": "skipped"})), \
-             patch("core.embeddings.embed_text", return_value=embed_a), \
-             patch("core.database.get_db_path", return_value=tmp_path / "index.db"):
-            result = extract_observations_hierarchical(
-                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
-                session_type="code",
-                refine=False,
-                session_id="test-session-first-window",
-            )
+            with patch.object(ti, "REFRAME_A_ENABLED", True), \
+                 patch("core.transcript_ingest.iter_windows", return_value=["window text"]), \
+                 patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+                 patch("core.transcript_ingest.call_llm_batch", side_effect=fake_batch), \
+                 patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+                 patch("core.transcript_ingest.synthesize_issue_cards",
+                       return_value=([], [{"content": "obs", "facts": ["auth JWT"], "importance": 0.6}],
+                                     {"outcome": "skipped"})), \
+                 patch("core.embeddings.embed_text", return_value=embed_a):
+                result = extract_observations_hierarchical(
+                    [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                    session_type="code",
+                    refine=False,
+                    session_id="test-session-first-window",
+                )
+        finally:
+            close_db()
 
         assert len(captured_prompts) == 1
         # First window: no prior extractions yet → PRIOR EXTRACTIONS block absent
@@ -986,38 +990,41 @@ class TestReframeA:
         except ImportError:
             pytest.skip("sqlite-vec not available")
 
-        fake_affect = self._make_fake_affect(max_boost=0.1)
-        obs_w1 = json.dumps([{"content": "auth", "facts": ["auth uses JWT"], "importance": 0.6}])
-        obs_w2 = json.dumps([{"content": "db", "facts": ["db uses postgres"], "importance": 0.6}])
-        captured_prompts: list[str] = []
+        from core.database import init_db, close_db
+        init_db(base_dir=str(tmp_path))
+        try:
+            fake_affect = self._make_fake_affect(max_boost=0.1)
+            obs_w1 = json.dumps([{"content": "auth", "facts": ["auth uses JWT"], "importance": 0.6}])
+            obs_w2 = json.dumps([{"content": "db", "facts": ["db uses postgres"], "importance": 0.6}])
+            captured_prompts: list[str] = []
 
-        responses = [obs_w1, obs_w2]
-        call_idx = [0]
+            responses = [obs_w1, obs_w2]
+            call_idx = [0]
 
-        def fake_batch(prompts, **kwargs):
-            captured_prompts.extend(prompts)
-            resp = responses[call_idx[0]]
-            call_idx[0] += 1
-            return [resp]
+            def fake_batch(prompts, **kwargs):
+                captured_prompts.extend(prompts)
+                resp = responses[call_idx[0]]
+                call_idx[0] += 1
+                return [resp]
 
-        # Same embedding for both windows and observations → high similarity → second window gets priors
-        embed_same = self._embed_a()
+            embed_same = self._embed_a()
 
-        with patch.object(ti, "REFRAME_A_ENABLED", True), \
-             patch("core.transcript_ingest.iter_windows", return_value=["win1", "win2"]), \
-             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
-             patch("core.transcript_ingest.call_llm_batch", side_effect=fake_batch), \
-             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
-             patch("core.transcript_ingest.synthesize_issue_cards",
-                   return_value=([], [], {"outcome": "skipped"})), \
-             patch("core.embeddings.embed_text", return_value=embed_same), \
-             patch("core.database.get_db_path", return_value=tmp_path / "index.db"):
-            result = extract_observations_hierarchical(
-                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
-                session_type="code",
-                refine=False,
-                session_id="test-session-two-windows",
-            )
+            with patch.object(ti, "REFRAME_A_ENABLED", True), \
+                 patch("core.transcript_ingest.iter_windows", return_value=["win1", "win2"]), \
+                 patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+                 patch("core.transcript_ingest.call_llm_batch", side_effect=fake_batch), \
+                 patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+                 patch("core.transcript_ingest.synthesize_issue_cards",
+                       return_value=([], [], {"outcome": "skipped"})), \
+                 patch("core.embeddings.embed_text", return_value=embed_same):
+                result = extract_observations_hierarchical(
+                    [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                    session_type="code",
+                    refine=False,
+                    session_id="test-session-two-windows",
+                )
+        finally:
+            close_db()
 
         assert len(captured_prompts) == 2
         # First window: no priors
@@ -1039,44 +1046,43 @@ class TestReframeA:
         import core.transcript_ingest as ti
 
         try:
-            import apsw
             import sqlite_vec  # noqa: F401
         except ImportError:
             pytest.skip("sqlite-vec not available")
 
-        db_path = tmp_path / "index.db"
-        session_id = "test-clear-session"
-        embed_a = self._embed_a()
-        fake_affect = self._make_fake_affect(max_boost=0.1)
-        obs_response = json.dumps([{"content": "obs", "facts": ["fact"], "importance": 0.5}])
+        from core.database import init_db, close_db
+        init_db(base_dir=str(tmp_path))
+        try:
+            session_id = "test-clear-session"
+            embed_a = self._embed_a()
+            fake_affect = self._make_fake_affect(max_boost=0.1)
+            obs_response = json.dumps([{"content": "obs", "facts": ["fact"], "importance": 0.5}])
 
-        with patch.object(ti, "REFRAME_A_ENABLED", True), \
-             patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
-             patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
-             patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]), \
-             patch("core.transcript_ingest.summarize", return_value="synopsis"), \
-             patch("core.transcript_ingest.synthesize_issue_cards",
-                   return_value=([], [{"content": "obs", "facts": ["fact"], "importance": 0.5}],
-                                 {"outcome": "skipped"})), \
-             patch("core.embeddings.embed_text", return_value=embed_a), \
-             patch("core.database.get_db_path", return_value=db_path):
-            extract_observations_hierarchical(
-                [{"type": "user", "message": {"role": "user", "content": "hi"}}],
-                session_type="code",
-                refine=False,
-                session_id=session_id,
-            )
+            with patch.object(ti, "REFRAME_A_ENABLED", True), \
+                 patch("core.transcript_ingest.iter_windows", return_value=["win1"]), \
+                 patch("core.transcript_ingest.aggregate_window_affect", return_value=fake_affect), \
+                 patch("core.transcript_ingest.call_llm_batch", return_value=[obs_response]), \
+                 patch("core.transcript_ingest.summarize", return_value="synopsis"), \
+                 patch("core.transcript_ingest.synthesize_issue_cards",
+                       return_value=([], [{"content": "obs", "facts": ["fact"], "importance": 0.5}],
+                                     {"outcome": "skipped"})), \
+                 patch("core.embeddings.embed_text", return_value=embed_a):
+                extract_observations_hierarchical(
+                    [{"type": "user", "message": {"role": "user", "content": "hi"}}],
+                    session_type="code",
+                    refine=False,
+                    session_id=session_id,
+                )
 
-        # After extraction, the table should have been dropped.
-        # We verify by creating a new SessionVecStore pointing at the same DB
-        # and checking that the table doesn't exist (query returns empty without error).
-        store = SessionVecStore(db_path, session_id)
-        # The table will be re-created on __init__ (CREATE VIRTUAL TABLE IF NOT EXISTS),
-        # so the store will be available but the entries should be 0.
-        if store.available:
-            results = store.query_similar(embed_a, k=3)
-            assert results == [], "Expected no entries after table was dropped and recreated"
-            store.drop()
+            # After extraction, the table should have been dropped.
+            # SessionVecStore re-creates it (IF NOT EXISTS) but entries are gone.
+            store = SessionVecStore(session_id)
+            if store.available:
+                results = store.query_similar(embed_a, k=3)
+                assert results == [], "Expected no entries after table was dropped and recreated"
+                store.drop()
+        finally:
+            close_db()
 
     def test_enabled_no_session_id_falls_back_to_batch(self, tmp_path):
         """With Reframe A enabled but session_id=None, falls back to standard batch flow."""

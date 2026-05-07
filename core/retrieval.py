@@ -32,6 +32,11 @@ from .models import (
     db,
 )
 from .tiers import stage_to_tier, tier_ttl
+from .codebook import (
+    get_codebook_summary,
+    is_codebook_enabled,
+    contains_codebook_tokens,
+)
 
 if TYPE_CHECKING:
     from .vec import VecStore
@@ -43,6 +48,30 @@ AFFECT_FRICTION_BOOST = 0.02
 THREAD_BUDGET_CHARS = 8_000
 TENSION_BUDGET_CHARS = 2_000
 _THREAD_NARRATIVE_CAP = 1_000
+
+# ---------------------------------------------------------------------------
+# Channel capacity note (linguistic-compression research)
+# ---------------------------------------------------------------------------
+# The 8% token budget (~16K tokens for a 200K context window) is Memesis's
+# analog to the ~39 bits/second universal information rate found across human
+# languages (Coupé et al. 2019).  Natural languages converge on this rate
+# despite enormous variation in syllable-level density (5–8 bits/syllable)
+# because faster-speaking languages use lower-density syllables and vice versa.
+#
+# Similarly, the LLM context window has a finite "channel capacity."  We
+# cannot exceed it by stuffing more tokens — we can only reallocate cognitive
+# labor between the memory system (encoder) and the model (decoder).  The 8%
+# budget was chosen as a conservative fraction that leaves ample room for
+# conversation history, tool outputs, and user prompts while still injecting
+# enough crystallized context to be useful.
+#
+# If this fraction were derived from first principles rather than empirically,
+# it would follow the Uniform Information Density hypothesis (Levy & Jaeger
+# 2007): smooth surprisal across the context window so no section is
+# overwhelmingly dense or sparse.  In practice, 8% appears to hit this balance
+# for code-assistance sessions, but it should be re-evaluated as model context
+# windows grow or session patterns change.
+# ---------------------------------------------------------------------------
 
 
 def _record_injection(memory_id: str, session_id: str, project_context: str = None) -> None:
@@ -194,7 +223,20 @@ class RetrievalEngine:
         sections.append("")
         sections.append("---END MEMORY CONTEXT---")
 
-        return "\n".join(sections)
+        result = "\n".join(sections)
+
+        if is_codebook_enabled():
+            all_content = "\n".join(
+                (m.content or "") for m in tier1 + tier2
+            )
+            if contains_codebook_tokens(all_content):
+                codebook_summary = get_codebook_summary()
+                result = result.replace(
+                    "---MEMORY CONTEXT---\n",
+                    f"---MEMORY CONTEXT---\n\n{codebook_summary}\n",
+                )
+
+        return result
 
     def active_search(
         self,
@@ -716,6 +758,11 @@ class RetrievalEngine:
         records = [m for m in Memory.by_stage("crystallized") if is_injection_eligible(m)]
 
         # Three-pass stable sort
+        # DEFERRED: Interleave injection ordering (primacy/recency slots)
+        # — "Lost in the middle" research shows positional degradation at 20+ doc contexts,
+        #   but memesis injects 5-15 memories (~2K tokens) where positional effects are negligible.
+        #   Revisit if injection block grows to 30+ memories or token budget exceeds 10K tokens.
+        #   See: .context/DEFERRED-COMPRESSION.md #1
         records_sorted = sorted(
             records,
             key=lambda m: m.last_used_at or "",

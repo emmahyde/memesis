@@ -1,0 +1,6 @@
+{
+  "name": "review-canvas",
+  "description": "PR-style transcript review canvas — drag-select line ranges, comment, stream comments back into session as channel events.",
+  "version": "0.0.1",
+  "keywords": ["review", "transcript", "channel", "mcp", "memesis"]
+}

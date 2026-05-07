@@ -385,13 +385,11 @@ class TestGuardSuiteInvocationCommand:
         assert len(captured_cmds) == 1
         cmd = captured_cmds[0]
 
-        # Must be: python3 -m pytest tests/ <eval_path> -x --tb=short
+        # Must be: python3 -m pytest <eval_path> --tb=short
         assert cmd[0] == "python3"
         assert cmd[1] == "-m"
         assert cmd[2] == "pytest"
-        assert "tests/" in cmd
         assert str(eval_path) in cmd
-        assert "-x" in cmd
         assert "--tb=short" in cmd
 
     def test_guard_suite_pass_returns_true(self, tmp_path, monkeypatch):

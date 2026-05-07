@@ -11,12 +11,12 @@
 
 ### Cleanup
 
-- [ ] **CLEAN-01**: Commit Peewee ORM migration (Tasks 1-3) with atomic commits
-- [ ] **CLEAN-02**: Write all 5 research files to disk from agent output transcripts
-- [ ] **CLEAN-03**: Remove `file_path` from Memory model (greenfield, no migration needed)
-- [ ] **CLEAN-04**: Stop creating stale stage directories (consolidated/, crystallized/, instinctive/) in database.py
-- [ ] **CLEAN-05**: Add timestamp defaults to NarrativeThread model
-- [ ] **CLEAN-06**: Remove unused imports (BooleanField, CharField, ForeignKeyField) from models.py
+- [x] **CLEAN-01**: Commit Peewee ORM migration (Tasks 1-3) with atomic commits
+- [x] **CLEAN-02**: Write all 5 research files to disk from agent output transcripts
+- [x] **CLEAN-03**: Remove `file_path` from Memory model (greenfield, no migration needed)
+- [ ] **CLEAN-04**: Stop creating stale stage directories (consolidated/, crystallized/, instinctive/) in database.py — NOTE: stage dirs intentionally retained for hybrid file/DB operation; reconsider whether this should be rescoped
+- [x] **CLEAN-05**: Add timestamp defaults to NarrativeThread model
+- [x] **CLEAN-06**: Remove unused imports (BooleanField, CharField, ForeignKeyField) from models.py
 
 ### Foundation
 
@@ -28,21 +28,21 @@
 ### Observation Quality
 
 - [x] **OBSV-01**: Create OrientingDetector — rule-based patterns catching corrections ("no, that's wrong"), emphasis ("remember this"), error spikes, pacing breaks
-- [ ] **OBSV-02**: Create habituation baseline — per-project event frequency model suppressing routine events (habituation_factor = 1.0 - expected_frequency)
-- [ ] **OBSV-03**: Implement somatic markers — emotional valence classification (neutral/friction/surprise/delight) at observation time with importance bump
-- [ ] **OBSV-04**: Add replay priority — sort observations by salience (correction > pushback > novelty > recency) before presenting to consolidation LLM
+- [x] **OBSV-02**: Create habituation baseline — per-project event frequency model suppressing routine events (habituation_factor = 1.0 - expected_frequency)
+- [x] **OBSV-03**: Implement somatic markers — emotional valence classification (neutral/friction/surprise/delight) at observation time with importance bump
+- [x] **OBSV-04**: Add replay priority — sort observations by salience (correction > pushback > novelty > recency) before presenting to consolidation LLM
 
 ### Memory Lifecycle
 
-- [ ] **LIFE-01**: Implement SM-2 spaced injection — three new fields (next_injection_due, injection_ease_factor, injection_interval_days), hard suppression when not due
-- [ ] **LIFE-02**: Add reconsolidation at PreCompact — when injected memories appear in session, check if session content confirms/contradicts/refines them, update before session ends
-- [ ] **LIFE-03**: Implement saturation decay — penalize memories with high injection_count but low usage_count in relevance formula (saturation_penalty = min(0.3, unused_injections * 0.05))
-- [ ] **LIFE-04**: Add integration factor to relevance — memories with no thread membership, no tag co-occurrence, no reinforcement after 30 days get accelerated decay
+- [x] **LIFE-01**: Implement SM-2 spaced injection — three new fields (next_injection_due, injection_ease_factor, injection_interval_days), hard suppression when not due
+- [x] **LIFE-02**: Add reconsolidation at PreCompact — when injected memories appear in session, check if session content confirms/contradicts/refines them, update before session ends
+- [x] **LIFE-03**: Implement saturation decay — penalize memories with high injection_count but low usage_count in relevance formula (saturation_penalty = min(0.3, unused_injections * 0.05))
+- [x] **LIFE-04**: Add integration factor to relevance — memories with no thread membership, no tag co-occurrence, no reinforcement after 30 days get accelerated decay
 
 ### Advanced Retrieval
 
-- [ ] **RETR-01**: Implement 1-hop graph expansion — after hybrid search seeds, expand to thread neighbors and topical edges (new memory_edges table, pre-computed nightly)
-- [ ] **RETR-02**: Create ghost coherence check — periodic LLM call comparing self-model claims against actual memory evidence, flag divergences as contradictions
+- [x] **RETR-01**: Implement 1-hop graph expansion — after hybrid search seeds, expand to thread neighbors and topical edges (new memory_edges table, pre-computed nightly)
+- [x] **RETR-02**: Create ghost coherence check — periodic LLM call comparing self-model claims against actual memory evidence, flag divergences as contradictions
 
 ## v2 Requirements (Future Phases)
 
@@ -74,26 +74,26 @@
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | EVAL-01 | Phase 0.5 | Complete |
-| CLEAN-01 | Phase 1 | Pending |
-| CLEAN-02 | Phase 2 | Pending |
-| CLEAN-03 | Phase 3 | Pending |
-| CLEAN-04 | Phase 4 | Pending |
-| CLEAN-05 | Phase 5 | Pending |
-| CLEAN-06 | Phase 6 | Pending |
+| CLEAN-01 | Phase 1 | Complete |
+| CLEAN-02 | Phase 2 | Complete |
+| CLEAN-03 | Phase 3 | Complete |
+| CLEAN-04 | Phase 4 | Open (stage dirs retained) |
+| CLEAN-05 | Phase 5 | Complete |
+| CLEAN-06 | Phase 6 | Complete |
 | FOUND-01 | Phase 7 | Complete |
 | FOUND-02 | Phase 8 | Complete |
 | FOUND-03 | Phase 9 | Complete |
 | FOUND-04 | Phase 10 | Complete |
 | OBSV-01 | Phase 11 | Complete |
-| OBSV-02 | Phase 12 | Pending |
-| OBSV-03 | Phase 13 | Pending |
-| OBSV-04 | Phase 14 | Pending |
-| LIFE-01 | Phase 15 | Pending |
-| LIFE-02 | Phase 16 | Pending |
-| LIFE-03 | Phase 17 | Pending |
-| LIFE-04 | Phase 18 | Pending |
-| RETR-01 | Phase 19 | Pending |
-| RETR-02 | Phase 20 | Pending |
+| OBSV-02 | Phase 12 | Complete |
+| OBSV-03 | Phase 13 | Complete |
+| OBSV-04 | Phase 14 | Complete |
+| LIFE-01 | Phase 15 | Complete |
+| LIFE-02 | Phase 16 | Complete |
+| LIFE-03 | Phase 17 | Complete |
+| LIFE-04 | Phase 18 | Complete |
+| RETR-01 | Phase 19 | Complete |
+| RETR-02 | Phase 20 | Complete |
 | PROS-01 | Phase 21 (v2) | Future |
 | PROS-02 | Phase 22 (v2) | Future |
 | SENS-01 | Phase 23 (v2) | Future |

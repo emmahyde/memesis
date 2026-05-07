@@ -54,6 +54,13 @@ def check_coherence(
     from .database import get_base_dir
 
     if not get_flag("ghost_coherence"):
+        # DEFERRED: Coherence → compression feedback loop — when a memory is flagged
+        # as contradictory, reduce compression aggression for that memory in the next
+        # injection cycle. Deferred because the coherence check itself isn't battle-tested
+        # (behind feature flag, rate-limited to once/day). Building a feedback loop on
+        # unverified signal compounds uncertainty. Revisit after 30+ days of verified
+        # accuracy with <5% false-positive rate.
+        # See: .context/DEFERRED-COMPRESSION.md #5
         return {"consistent": [], "divergent": [], "unsupported": [], "checked_at": None}
 
     # Rate limit: once per day

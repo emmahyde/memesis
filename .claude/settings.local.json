@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm /Users/emmahyde/.claude/memesis/cursors.db)",
+      "Bash(rm /Users/emmahyde/.claude/memory/index.db)",
+      "Bash(rtk ls *)",
+      "Bash(rtk git *)",
+      "Bash(rtk grep *)"
+    ]
+  }
+}

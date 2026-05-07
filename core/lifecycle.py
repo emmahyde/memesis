@@ -407,3 +407,86 @@ class LifecycleManager:
             .scalar()
         )
         return result or 0
+
+    def get_instinctive_coverage(self) -> dict:
+        """
+        Compute Zipf-style coverage statistics for instinctive memories.
+
+        Returns a dict showing what fraction of total sessions are covered
+        by the top N instinctive memories.  This implements the "Basic English"
+        insight from linguistic-compression research: a small core vocabulary
+        (memories) should cover the majority of usage.
+
+        Returns:
+            {
+                "total_sessions": int,
+                "instinctive_count": int,
+                "coverage_curve": [
+                    {"top_n": 1, "sessions_covered": int, "pct": float},
+                    {"top_n": 5, "sessions_covered": int, "pct": float},
+                    ...
+                ],
+                "memories": [
+                    {"id": str, "title": str, "sessions": int, "pct": float},
+                    ...
+                ],
+            }
+        """
+        # Total sessions ever recorded
+        total_sessions = (
+            RetrievalLog.select(fn.COUNT(fn.DISTINCT(RetrievalLog.session_id)))
+            .scalar()
+        ) or 0
+
+        if total_sessions == 0:
+            return {
+                "total_sessions": 0,
+                "instinctive_count": 0,
+                "coverage_curve": [],
+                "memories": [],
+            }
+
+        # All instinctive memories with their session counts
+        instinctive = list(Memory.by_stage("instinctive"))
+        memories = []
+        for mem in instinctive:
+            sessions = self._count_unique_sessions(mem.id)
+            memories.append({
+                "id": mem.id,
+                "title": mem.title or "(untitled)",
+                "sessions": sessions,
+                "pct": (sessions / total_sessions) * 100,
+            })
+
+        # Sort by session count descending (Zipf order)
+        memories.sort(key=lambda m: m["sessions"], reverse=True)
+
+        # Build coverage curve for top N = 1, 3, 5, 10, 20
+        coverage_curve = []
+        cumulative_sessions = set()
+        top_n_values = [1, 3, 5, 10, 20]
+        for n in top_n_values:
+            if n > len(memories):
+                break
+            # Count unique sessions covered by top N memories
+            top_n_ids = [m["id"] for m in memories[:n]]
+            sessions_covered = (
+                RetrievalLog.select(fn.COUNT(fn.DISTINCT(RetrievalLog.session_id)))
+                .where(
+                    RetrievalLog.memory_id.in_(top_n_ids),
+                    RetrievalLog.was_used == 1,
+                )
+                .scalar()
+            ) or 0
+            coverage_curve.append({
+                "top_n": n,
+                "sessions_covered": sessions_covered,
+                "pct": (sessions_covered / total_sessions) * 100,
+            })
+
+        return {
+            "total_sessions": total_sessions,
+            "instinctive_count": len(memories),
+            "coverage_curve": coverage_curve,
+            "memories": memories,
+        }

@@ -1,0 +1,3 @@
+display_name: Lightpanda MCP
+short_description: Scrape docs and use Lightpanda's native MCP, fetch, and CDP interfaces.
+default_prompt: Use Lightpanda to extract this page or search the local Lightpanda docs wiki.

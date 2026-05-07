@@ -113,7 +113,7 @@ def init_db(
     # VecStore
     from .vec import VecStore
 
-    _vec_store = VecStore(dp)
+    _vec_store = VecStore()
 
     return bd
 
@@ -316,6 +316,7 @@ def _run_migrations():
         ("output_tokens", "INTEGER"),
         ("latency_ms", "INTEGER"),
         ("input_observation_refs", "TEXT"),
+        ("compression_ratio", "REAL"),
     ]:
         if col not in con_cols:
             try:

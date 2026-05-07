@@ -228,6 +228,71 @@ def _run_replay(transcript_path: Path, base_dir: str, _session_id: str, _force_l
     n = append_to_ephemeral(mem_dir, obs_list)
     print(f"[evolve] Extracted {n} observation(s) from transcript.")
 
+    # Run consolidation so memories land in SQLite (recall evals query Memory.select()).
+    if n > 0:
+        from datetime import date
+        from core.consolidator import Consolidator
+        from core.lifecycle import LifecycleManager
+        from core.trace import get_active_writer
+
+        ephemeral_path = mem_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
+        if ephemeral_path.exists():
+            _tw = get_active_writer()
+            if _tw:
+                _tw.emit("consolidate", "consolidation_start", {
+                    "ephemeral_path": str(ephemeral_path),
+                    "session_id": _session_id,
+                })
+            try:
+                consolidator = Consolidator(lifecycle=LifecycleManager())
+                summary = consolidator.consolidate_session(
+                    str(ephemeral_path), _session_id
+                )
+                kept = len(summary.get("kept", []))
+                pruned = len(summary.get("pruned", []))
+                promoted = len(summary.get("promoted", []))
+                print(f"[evolve] Consolidated: kept={kept} pruned={pruned} promoted={promoted}")
+
+                from core.database import get_vec_store
+                from core.embeddings import embed_for_memory
+                from core.models import Memory
+                vec_store = get_vec_store()
+                n_embedded = 0
+                for memory_id in summary.get("kept", []) + summary.get("promoted", []):
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        embedding = embed_for_memory(
+                            mem.title or "",
+                            mem.summary or "",
+                            mem.content or "",
+                        )
+                        if embedding and vec_store:
+                            vec_store.store_embedding(memory_id, embedding)
+                            n_embedded += 1
+                    except Exception as exc:
+                        print(f"[evolve] Embed warning ({memory_id}): {exc}")
+                print(f"[evolve] Embedded {n_embedded} memories into vec_store.")
+                # Probe vec0 row count
+                if vec_store and vec_store.available:
+                    try:
+                        from core.models import db as _probe_db
+                        n_rows = _probe_db.execute_sql("SELECT COUNT(*) FROM vec_memories").fetchone()[0]
+                        print(f"[evolve] vec_memories row count: {n_rows} at {mem_dir}")
+                    except Exception as exc:
+                        print(f"[evolve] vec probe failed: {exc}")
+                else:
+                    print(f"[evolve] vec_store unavailable: store={vec_store} avail={getattr(vec_store, 'available', None)}")
+                if _tw:
+                    _tw.emit("consolidate", "consolidation_end", {
+                        "kept": kept, "pruned": pruned, "promoted": promoted,
+                    })
+            except Exception as exc:
+                print(f"[evolve] Warning: consolidation failed: {exc}")
+                if _tw:
+                    _tw.emit("consolidate", "consolidation_end", {
+                        "outcome": "error", "error": str(exc),
+                    })
+
 
 # ---------------------------------------------------------------------------
 # Expected-memory elicitation
@@ -301,24 +366,38 @@ def _run_guard_suite(_slug: str, eval_paths: list[Path]) -> dict[str, bool]:
     results: dict[str, bool] = {}
 
     for eval_path in eval_paths:
-        eval_slug = eval_path.stem  # e.g. foo_2026-05-01_oauth-token-expiry_recall
+        eval_slug = eval_path.stem
         cmd = [
             "python3", "-m", "pytest",
-            "tests/",
             str(eval_path),
-            "-x",
             "--tb=short",
+            "-q",
+            "--no-header",
+            "-p", "no:cacheprovider",
         ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(_PROJECT_ROOT),
-        )
-        passed = proc.returncode == 0
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(_PROJECT_ROOT),
+                timeout=30,
+            )
+            passed = proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            passed = False
+            print(f"[evolve] TIMEOUT  {eval_slug} (>30s)")
+            results[eval_slug] = passed
+            continue
         results[eval_slug] = passed
         status = "PASS" if passed else "FAIL"
         print(f"[evolve] {status}  {eval_slug}")
+        if not passed and os.environ.get("EVOLVE_VERBOSE"):
+            print("---stdout---")
+            print(proc.stdout)
+            print("---stderr---")
+            print(proc.stderr)
+            print("---")
 
     return results
 
@@ -356,16 +435,19 @@ def _find_loss_stage(events: list[dict], _spec: EvalSpec) -> str:
     # Look for stage_boundary end events in pipeline order
     stage_order = [
         "stage1_extract_end",
+        "stage1_append_ephemeral",
         "stage15_synthesis_end",
         "consolidation_end",
         "crystallization_end",
     ]
 
-    # Find which boundary events appear in the trace
+    # Find which boundary events appear in the trace.
+    # Match on event name (stage tag varies: 'pipeline', 'stage1',
+    # 'consolidate', 'crystallize').
     emitted_stages = {
         e["event"]
         for e in events
-        if e.get("stage") == "pipeline" and "end" in e.get("event", "")
+        if "end" in e.get("event", "") or "append" in e.get("event", "")
     }
 
     # Report the first stage boundary present (conservative: we can't

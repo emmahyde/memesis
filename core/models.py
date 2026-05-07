@@ -26,8 +26,27 @@ from peewee import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    import sqlite_vec as _sqlite_vec
+    _VEC_AVAILABLE = True
+except ImportError:
+    _VEC_AVAILABLE = False
+
+
+class VecSqliteDatabase(SqliteDatabase):
+    """SqliteDatabase that loads sqlite-vec on every connection."""
+
+    def _connect(self):
+        conn = super()._connect()
+        if _VEC_AVAILABLE:
+            conn.enable_load_extension(True)
+            _sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        return conn
+
+
 # Deferred database — bound by init_db()
-db = SqliteDatabase(None)
+db = VecSqliteDatabase(None)
 
 _FTS_STOP_WORDS = frozenset({
     "a", "an", "the", "is", "are", "was", "were", "be", "been",
@@ -215,14 +234,10 @@ class Memory(BaseModel):
             vec_store = get_vec_store()
             if vec_store is not None and vec_store.available:
                 try:
-                    conn = vec_store._connect()
-                    try:
-                        conn.execute(
-                            "DELETE FROM vec_memories WHERE memory_id = ?",
-                            (memory_id,),
-                        )
-                    finally:
-                        conn.close()
+                    db.execute_sql(
+                        "DELETE FROM vec_memories WHERE memory_id = ?",
+                        (memory_id,),
+                    )
                 except Exception:
                     pass
             # Primary row
@@ -548,6 +563,10 @@ class ConsolidationLog(BaseModel):
     output_tokens = IntegerField(null=True)
     latency_ms = IntegerField(null=True)
     input_observation_refs = TextField(null=True)
+    # Compression audit: ratio of output tokens to input tokens for this
+    # consolidation decision.  >1 means expansion (rare), <1 means compression.
+    # NULL when not computed (legacy rows or non-LLM actions like manual prune).
+    compression_ratio = FloatField(null=True)
 
     class Meta:
         table_name = "consolidation_log"

@@ -186,6 +186,9 @@ class RelevanceEngine:
             * confidence_factor
         )
 
+        novelty_score = self._compute_novelty_score(memory, now)
+        relevance = relevance * novelty_score
+
         # Apply saturation penalty as subtraction (post-multiply)
         relevance = relevance - saturation_penalty
 
@@ -552,3 +555,59 @@ class RelevanceEngine:
         last_activity = max(candidates)
         delta = now - last_activity
         return max(0.0, delta.total_seconds() / 86400)
+
+    def _compute_novelty_score(self, memory, now: datetime = None) -> float:
+        from .flags import get_flag
+
+        if not get_flag("continuous_novelty"):
+            return 1.0
+
+        if now is None:
+            now = datetime.now()
+
+        def _get(field, default=None):
+            if isinstance(memory, dict):
+                return memory.get(field, default)
+            return getattr(memory, field, default)
+
+        next_due_str = _get("next_injection_due")
+        interval = _get("injection_interval_days") or 1.0
+
+        if next_due_str is None:
+            sm2_component = 1.0
+        else:
+            try:
+                due = datetime.fromisoformat(next_due_str)
+                if now < due:
+                    sm2_component = 0.0
+                else:
+                    days_past_due = (now - due).total_seconds() / 86400.0
+                    sm2_component = min(1.0, days_past_due / interval)
+            except (ValueError, TypeError):
+                sm2_component = 1.0
+
+        habituation_component = 1.0
+        try:
+            from .database import get_base_dir
+            from .habituation import HabituationModel
+
+            base_dir = get_base_dir()
+            if base_dir is not None:
+                model = HabituationModel(base_dir)
+                event_key = (_get("title") or "untyped").lower()
+                habituation_component = model.get_factor(event_key)
+        except Exception:
+            habituation_component = 1.0
+
+        last_injected_str = _get("last_injected_at")
+        if last_injected_str is not None:
+            try:
+                last_injected = datetime.fromisoformat(last_injected_str)
+                days_since = (now - last_injected).total_seconds() / 86400.0
+                recency_component = 0.5 ** (days_since / 7.0)
+            except (ValueError, TypeError):
+                recency_component = 1.0
+        else:
+            recency_component = 1.0
+
+        return (sm2_component + habituation_component + recency_component) / 3.0

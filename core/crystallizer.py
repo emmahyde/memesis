@@ -28,6 +28,7 @@ from .database import get_base_dir, get_vec_store
 from .flags import get_flag
 from .lifecycle import LifecycleManager
 from .llm import call_llm
+from .codebook import encode_field_value, is_codebook_enabled
 from .models import ConsolidationLog, Memory, MemoryEdge
 from .trace import get_active_writer
 
@@ -315,6 +316,22 @@ class Crystallizer:
         source_ids = [m.id for m in group]
         source_titles = [m.title or "?" for m in group]
 
+        # NOTE: Disambiguation cost research gap (linguistic-compression).
+        # Crystallized memories strip episodic details to achieve density.
+        # This is analogous to Toki Pona's polysemy — compression shifts cost
+        # to the decoder (the LLM must infer from context).  The source_pattern
+        # field is our disambiguation mechanism, but we have no empirical
+        # measurement of whether stripped context hurts task performance.
+        #
+        # To measure this: A/B test sessions where crystallized memories are
+        # injected with vs without source_pattern provenance.  Compare task
+        # completion rates, clarification requests, and user corrections.
+        # This is deferred until we have automated eval harness support for
+        # session-level outcome metrics.
+        #
+        # See: outputs/linguistic-compression-draft.md §7 (Ithkuil) and
+        # §8 (ambiguity-verbosity trade-off) for theoretical framing.
+
         tags = list(result.get("tags", []))
         obs_type = result.get("observation_type", "")
         if obs_type and f"type:{obs_type}" not in tags:
@@ -344,6 +361,10 @@ class Crystallizer:
             content,
         ]
         full_content = '\n'.join(frontmatter_lines)
+
+        if is_codebook_enabled():
+            full_content = encode_field_value(full_content)
+
         content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
 
         # Dedup check

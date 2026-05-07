@@ -81,23 +81,57 @@ Replace `/path/to/ai-tools` with the absolute path to your `ai-tools` clone.
 
 ## Usage
 
-Three skills are available as slash commands:
+Ten skills are available as slash commands:
 
 | Command                    | Purpose                                                                                 |
 | -------------------------- | --------------------------------------------------------------------------------------- |
-| `/memesis:learn`  | Teach the agent something explicitly. Writes a new memory with the content you provide. |
-| `/memesis:memory` | Search and inspect stored memories. Supports free-text queries via FTS5.                |
+| `/memesis:learn`  | Teach the agent something explicitly. Stores a new memory with the content you provide. |
+| `/memesis:recall` | Surface a specific memory by query. |
 | `/memesis:forget` | Deprecate or delete a memory by ID or title match.                                      |
+| `/memesis:teach`  | Multi-part structured knowledge capture (processes, architectures, workflows).         |
+| `/memesis:reflect` | Trigger a self-model review — analyze behavioral patterns across sessions.             |
+| `/memesis:connect` | Manually group related memories into a named narrative thread.                         |
+| `/memesis:threads` | View narrative thread visualization with member memories and evolution arcs.           |
+| `/memesis:stats`  | High-level memory statistics: counts by stage, importance distribution.                |
+| `/memesis:health` | Memory health diagnostics: archival candidates, relevance decay, stale memories.       |
+| `/memesis:usage`  | Usage analytics: injection counts, retrieval rates, most/least used memories.          |
+| `/memesis:dashboard` | Combined memory system overview pulling from stats, health, and usage data.         |
+| `/memesis:backfill` | Seed memory from historical Claude Code transcripts.                                  |
+| `/memesis:ideate` | Autonomous ideation loop — self-driven development for memesis.                        |
+| `/memesis:run-eval` | Run the memesis eval suite (live or synthetic modes).                              |
 
 Examples:
 
 ```
 /memesis:learn Always use --no-install-recommends in Dockerfiles for this project.
 
-/memesis:memory python async patterns
+/memesis:recall python async patterns
 
 /memesis:forget feedback_ruby_style
+
+/memesis:teach Our deployment pipeline works like this: ...
+
+/memesis:reflect
+
+/memesis:stats
 ```
+
+Memory retrieval uses three-tier progressive disclosure:
+1. **Tier 1 (Instinctive)** — High-importance memories injected automatically at session start.
+2. **Tier 2 (Crystallized)** — Token-budgeted context-matched memories injected via prompt-aware retrieval.
+3. **Tier 3 (Agent-initiated)** — On-demand search via `/memesis:recall` with hybrid RRF (FTS5 + sqlite-vec KNN).
+
+### Advanced Features
+
+- **OrientingDetector** — Rule-based high-signal moment detection (corrections, emphasis, error spikes, pacing breaks)
+- **Habituation Baseline** — Suppresses routine events via per-project frequency model
+- **Somatic Markers** — Emotional valence classification (neutral/friction/surprise/delight) with importance bump
+- **Replay Priority** — Salience-ordered observation batching for consolidation LLM
+- **SM-2 Spaced Injection** — Spaced repetition scheduling prevents memory over-injection
+- **Reconsolidation** — Session evidence updates injected memories (confirmations, contradictions, refinements)
+- **Saturation Decay + Integration Factor** — Prevents stale isolated memories from crowding out fresh ones
+- **1-Hop Graph Expansion** — Retrieval expands to thread neighbors via MemoryEdge table
+- **Ghost Coherence Check** — Periodic LLM check comparing self-model claims against memory evidence
 
 ## Privacy Policy
 
@@ -162,16 +196,3 @@ If using `uv` instead of a virtualenv:
 
 Use `which uv` and `which python` to confirm binary paths — Claude Code does
 not inherit your shell PATH.
-
-## Phase 2 Note
-
-Vector search (semantic similarity retrieval) is available as an opt-in when
-the memory store grows beyond 10,000 entries. Install the `eval` extras for
-the evaluation harness:
-
-```bash
-pip install -e "memesis/[eval]"
-```
-
-FTS5 keyword search (the default) is sufficient for most users and has no
-additional dependencies.
