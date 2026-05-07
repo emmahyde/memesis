@@ -23,6 +23,11 @@ from dataclasses import dataclass
 from .orienting import OrientingDetector
 from .somatic import classify_valence
 
+# RISK-11: experimental flag scaffold.
+# replay is production-validated (orienting+somatic+habituation salience sort confirmed in consolidation pipeline).
+# Opt-in override: include "replay" in MEMESIS_EXPERIMENTAL_MODULES env var to force-exclude from scoring.
+experimental: bool = False
+
 # Split on observation headers while keeping the delimiter
 _OBS_SPLIT_RE = re.compile(r"(?=^##\s+\[)", re.MULTILINE)
 

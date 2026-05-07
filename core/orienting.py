@@ -20,6 +20,11 @@ Usage:
 import re
 from dataclasses import dataclass, field
 
+# RISK-11: experimental flag scaffold.
+# orienting is production-validated (rule-based correction/emphasis detection confirmed stable across sessions).
+# Opt-in override: include "orienting" in MEMESIS_EXPERIMENTAL_MODULES env var to force-exclude from scoring.
+experimental: bool = False
+
 
 @dataclass
 class OrientingSignal:

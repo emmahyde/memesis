@@ -19,6 +19,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# RISK-11: experimental flag scaffold.
+# somatic is production-validated (VADER + NRC + dev-lexicon tri-axis classification confirmed stable).
+# Opt-in override: include "somatic" in MEMESIS_EXPERIMENTAL_MODULES env var to force-exclude from scoring.
+experimental: bool = False
+
 VALENCE_BOOSTS = {
     "neutral": 0.0,
     "friction": 0.25,

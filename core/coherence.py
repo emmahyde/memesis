@@ -16,6 +16,11 @@ from pathlib import Path
 from .llm import call_llm, strip_markdown_fences
 from .models import Memory
 
+# RISK-11: experimental flag scaffold.
+# coherence is production-validated (ghost coherence check confirmed useful for self-model divergence detection).
+# Opt-in override: include "coherence" in MEMESIS_EXPERIMENTAL_MODULES env var to force-exclude from scoring.
+experimental: bool = False
+
 logger = logging.getLogger(__name__)
 
 COHERENCE_PROMPT = """You are checking whether a system's self-model (its beliefs about a user) is consistent with recent evidence from memory.

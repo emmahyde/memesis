@@ -19,6 +19,23 @@ from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, db
 from .prompts import SELF_REFLECTION_PROMPT
 
+# RISK-11 flag scaffold; writer gate added in Wave 2.2 (RISK-12); promotion gate added in Wave 3.2 (RISK-?).
+# self_reflection is EXPERIMENTAL: the writer path (reflect() -> write self-model) has not been validated
+# for production scoring contributions. Excluded from module_scores by default.
+# Opt-in: include "self_reflection" in MEMESIS_EXPERIMENTAL_MODULES env var.
+experimental: bool = True
+
+
+def _is_opted_in() -> bool:
+    """RISK-11: True when 'self_reflection' is in MEMESIS_EXPERIMENTAL_MODULES.
+
+    Wave 2.2 writer gate and Wave 3.2 promotion gate extend this check.
+    Call this in the writer path (reflect()) and promotion gate before performing
+    any self-model writes or instinctive promotions.
+    """
+    raw = os.environ.get("MEMESIS_EXPERIMENTAL_MODULES", "")
+    return "self_reflection" in {s.strip() for s in raw.split(",") if s.strip()}
+
 logger = logging.getLogger(__name__)
 
 # Default self-model content, seeded on first run.
