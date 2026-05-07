@@ -3,6 +3,7 @@ Tests for the SelfReflector — self-model seeding, reflection, and updates.
 """
 
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from core.self_reflection import (
     SelfReflector, SELF_MODEL_TITLE, SELF_MODEL_SEED,
     OBSERVATION_HABIT_TITLE, OBSERVATION_HABIT_CONTENT,
     COMPACTION_GUIDANCE_TITLE, COMPACTION_GUIDANCE_CONTENT,
+    _is_opted_in,
 )
 from core.self_reflection_extraction import select_chunking, self_model_audit_path
 
@@ -243,6 +245,121 @@ class TestInstinctiveLayer:
         injected = engine.inject_for_session("test-session")
         assert "Self-Model" in injected
         assert "Observation Habit" in injected
+
+
+class TestHypothesisSchema:
+    """RISK-12: writer gate, hypothesis Memory rows, evidence accumulation."""
+
+    _OBS = {
+        "tendency": "Over-engineering database choices",
+        "evidence": "Suggested PostgreSQL when SQLite sufficed",
+        "trigger": "Database selection",
+        "correction": "Check scale requirements first",
+        "confidence": 0.75,
+    }
+
+    def test_writer_always_runs_regardless_of_opt_in(self, reflector, base, monkeypatch):
+        """apply_reflection writes unconditionally; experimental flag only gates scoring."""
+        monkeypatch.delenv("MEMESIS_EXPERIMENTAL_MODULES", raising=False)
+        reflector.apply_reflection({"observations": [self._OBS], "deprecated": []})
+        assert Memory.select().where(Memory.kind == "hypothesis").count() == 1
+
+    def test_writer_gate_passes_when_opted_in(self, reflector, base, monkeypatch):
+        """apply_reflection writes hypothesis Memory when opted in."""
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "self_reflection")
+        reflector.apply_reflection({"observations": [self._OBS], "deprecated": []})
+        hyps = list(Memory.select().where(Memory.kind == "hypothesis"))
+        assert len(hyps) == 1
+        assert hyps[0].title == "Over-engineering database choices"
+
+    def test_hypothesis_initial_kind_and_evidence_count(self, reflector, base, monkeypatch):
+        """New hypothesis has kind='hypothesis' and evidence_count=1."""
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "self_reflection")
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-001",
+        )
+        hyp = Memory.select().where(Memory.kind == "hypothesis").first()
+        assert hyp is not None
+        assert hyp.kind == "hypothesis"
+        assert hyp.evidence_count == 1
+
+    def test_hypothesis_initial_evidence_session_ids(self, reflector, base, monkeypatch):
+        """New hypothesis records the session_id in evidence_session_ids."""
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "self_reflection")
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-001",
+        )
+        hyp = Memory.select().where(Memory.kind == "hypothesis").first()
+        ids = json.loads(hyp.evidence_session_ids)
+        assert "sess-001" in ids
+
+    def test_hypothesis_accumulation_across_calls(self, reflector, base, monkeypatch):
+        """Subsequent apply_reflection for same tendency increments evidence_count."""
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "self_reflection")
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-001",
+        )
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-002",
+        )
+        hyps = list(Memory.select().where(Memory.kind == "hypothesis"))
+        # Should be a single deduplicated hypothesis row, not two.
+        assert len(hyps) == 1
+        assert hyps[0].evidence_count == 2
+
+    def test_hypothesis_accumulates_session_ids(self, reflector, base, monkeypatch):
+        """Evidence session IDs append across calls without duplicates."""
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "self_reflection")
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-001",
+        )
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-002",
+        )
+        hyp = Memory.select().where(Memory.kind == "hypothesis").first()
+        ids = json.loads(hyp.evidence_session_ids)
+        assert "sess-001" in ids
+        assert "sess-002" in ids
+
+    def test_duplicate_session_not_added_twice(self, reflector, base, monkeypatch):
+        """Same session_id appearing twice does not duplicate in evidence_session_ids."""
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "self_reflection")
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-001",
+        )
+        reflector.apply_reflection(
+            {"observations": [self._OBS], "deprecated": []},
+            session_id="sess-001",
+        )
+        hyp = Memory.select().where(Memory.kind == "hypothesis").first()
+        ids = json.loads(hyp.evidence_session_ids)
+        assert ids.count("sess-001") == 1
+
+    def test_writer_gate_blocked_returns_self_model_id(self, reflector, base, monkeypatch):
+        """When gate blocks, apply_reflection returns the self-model ID."""
+        monkeypatch.delenv("MEMESIS_EXPERIMENTAL_MODULES", raising=False)
+        model_id = reflector.ensure_self_model()
+        returned = reflector.apply_reflection({"observations": [self._OBS], "deprecated": []})
+        assert returned == model_id
+
+    def test_is_opted_in_false_without_env(self, monkeypatch):
+        monkeypatch.delenv("MEMESIS_EXPERIMENTAL_MODULES", raising=False)
+        assert _is_opted_in() is False
+
+    def test_is_opted_in_true_with_env(self, monkeypatch):
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "self_reflection")
+        assert _is_opted_in() is True
+
+    def test_is_opted_in_handles_multiple_modules(self, monkeypatch):
+        monkeypatch.setenv("MEMESIS_EXPERIMENTAL_MODULES", "other_module, self_reflection, another")
+        assert _is_opted_in() is True
 
 
 class TestSelectChunkingRule:
