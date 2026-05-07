@@ -17,9 +17,11 @@ context-free knowledge (semantic). See `.planning/TAXONOMY-AND-DEFERRED-
 PATTERNS.md` for the full architectural framing.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,7 @@ from .linking import link_memory as _link_memory
 from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, Observation, db
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
+from .schemas import ConsolidationResponse
 from .question_lifecycle import (
     detect_resolution,
     get_unresolved_questions,
@@ -52,6 +55,11 @@ class Consolidator:
     the resulting decisions against the memory store.
     """
 
+    # Default pending-delete TTL in days (overridden by MEMESIS_PENDING_DELETE_TTL_DAYS env var)
+    PENDING_DELETE_TTL_DAYS: int = 7
+    # Max concurrent LLM subprocess calls in consolidate_batch
+    BATCH_CONCURRENCY: int = 3
+
     def __init__(
         self,
         lifecycle: LifecycleManager,
@@ -60,6 +68,9 @@ class Consolidator:
         self.lifecycle = lifecycle
         self.model = model
         self._last_llm_call = {}
+        # Idempotency set: tracks (memory_id, prompt_version, model) hashes
+        # processed in the current run to avoid double-applying decisions.
+        self._processed_keys: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -125,6 +136,9 @@ class Consolidator:
         )
         decisions = self._call_llm(prompt)
 
+        # 4b. Validate referenced memory IDs — drop decisions with dangling refs
+        decisions = self._validate_decision_ids(decisions)
+
         # 5. Execute decisions
         kept = []
         pruned = []
@@ -138,6 +152,22 @@ class Consolidator:
             contradicts = decision.get("contradicts")
             refs = self._refs_for_observation(observation, observation_refs)
             decision["_observer_refs"] = refs
+
+            # Idempotency check: skip if this exact decision was already processed
+            # in this Consolidator instance's lifetime.  Key = hash(session_id +
+            # target_id_or_obs_hash, model) so the same decision sent twice in the
+            # same session (e.g., double-retry) is suppressed, but the same target
+            # memory appearing in different sessions is allowed.
+            _idem_source = (
+                decision.get("reinforces")
+                or decision.get("contradicts")
+                or hashlib.md5(observation.encode()).hexdigest()[:8]
+            ) or observation
+            _idem_key = self._idempotency_key(f"{session_id}:{_idem_source}")
+            if _idem_key in self._processed_keys:
+                logger.debug("Idempotency: skipping already-processed decision key %s", _idem_key)
+                continue
+            self._processed_keys.add(_idem_key)
 
             # Track conflicts regardless of action
             if contradicts:
@@ -174,6 +204,20 @@ class Consolidator:
 
             elif action == "prune":
                 self._execute_prune(observation, rationale, session_id, decision)
+                pruned.append({"observation": observation, "rationale": rationale})
+                self._mark_observations(refs, "pruned")
+
+            elif action == "archive":
+                # Archive action: mark an existing memory as pending_delete (two-phase delete)
+                target_id = decision.get("contradicts") or decision.get("reinforces")
+                if target_id and target_id != "null":
+                    self._execute_archive(target_id, rationale, session_id, decision)
+                else:
+                    logger.warning(
+                        "ARCHIVE decision missing target memory id (contradicts/reinforces); "
+                        "treating as prune of ephemeral observation"
+                    )
+                    self._execute_prune(observation, rationale, session_id, decision)
                 pruned.append({"observation": observation, "rationale": rationale})
                 self._mark_observations(refs, "pruned")
 
@@ -429,17 +473,22 @@ class Consolidator:
 
     def _parse_decisions(self, raw: str) -> list[dict]:
         """
-        Parse JSON from LLM response, handling optional markdown fences.
+        Parse JSON from LLM response via Pydantic ConsolidationResponse.
+
+        Validates the response envelope and each decision using the Pydantic
+        schema (RISK-02).  Returns dicts (not model instances) so downstream
+        code that uses `.get()` remains unchanged.
 
         Args:
             raw: Raw text from the LLM.
 
         Returns:
-            List of decision dicts.
+            List of decision dicts with validated fields.
 
         Raises:
             json.JSONDecodeError: If text is not valid JSON.
             KeyError: If expected keys are missing.
+            pydantic.ValidationError: If a decision has an invalid action.
         """
         # Strip markdown code fences if present
         text = raw.strip()
@@ -453,7 +502,117 @@ class Consolidator:
             text = "\n".join(lines).strip()
 
         data = json.loads(text)
-        return data["decisions"]
+
+        # Pre-process decisions: strip non-numeric importance values before
+        # passing to Pydantic so that downstream _execute_keep can apply the
+        # existing fallback logic (malformed importance → somatic formula + WARNING).
+        # This preserves the "malformed card importance falls back gracefully"
+        # acceptance criterion that predates Pydantic validation.
+        raw_decisions = data.get("decisions", [])
+        cleaned = []
+        for rd in raw_decisions:
+            imp = rd.get("importance")
+            if imp is not None:
+                try:
+                    float(imp)
+                except (TypeError, ValueError):
+                    # Keep the raw dict with the bad value; Pydantic would reject
+                    # it, so pass it through as-is and let _execute_keep handle it.
+                    # We mark it so _execute_keep's fallback warning fires.
+                    cleaned.append(rd)
+                    continue
+            cleaned.append(rd)
+        data = {**data, "decisions": cleaned}
+
+        # Pydantic parse: validates action values, importance range, UUID fields.
+        # Use exclude_unset=True so that fields the LLM didn't send remain absent
+        # from the returned dicts — preserving the is_card check in _execute_keep
+        # which relies on "scope" and "evidence_quotes" being absent for non-card
+        # decisions, not just None.
+        #
+        # Decisions with malformed importance bypass Pydantic (handled above)
+        # and are returned as raw dicts.  All other decisions go through validation.
+        valid_decisions = []
+        invalid_decisions = []
+        for rd in data["decisions"]:
+            imp = rd.get("importance")
+            is_bad_imp = imp is not None and not _is_numeric(imp)
+            if is_bad_imp:
+                invalid_decisions.append((rd.get("action"), rd))
+            else:
+                valid_decisions.append(rd)
+
+        # Parse valid decisions through Pydantic (raises ValidationError on bad action)
+        partial_response = ConsolidationResponse(**{**data, "decisions": valid_decisions})
+        result = [d.model_dump(exclude_unset=True) for d in partial_response.decisions]
+
+        # Re-insert malformed-importance decisions as raw dicts (preserves original keys)
+        # in their original order.
+        if invalid_decisions:
+            # Rebuild in original order
+            all_raw = cleaned
+            ordered = []
+            vi = 0  # index into valid_decisions
+            for rd in all_raw:
+                imp = rd.get("importance")
+                if imp is not None and not _is_numeric(imp):
+                    ordered.append(rd)
+                else:
+                    if vi < len(result):
+                        ordered.append(result[vi])
+                        vi += 1
+            result = ordered
+
+        return result
+
+    def _validate_decision_ids(self, decisions: list[dict]) -> list[dict]:
+        """
+        Check that memory IDs referenced in decisions exist in the DB.
+
+        For `reinforces` on promote decisions: the ID must exist for the action
+        to have meaning. Decision is logged and skipped when the ID is missing.
+
+        For `contradicts`: not validated here — `_resolve_conflicts` already
+        handles Memory.DoesNotExist gracefully and provides proper conflict
+        tracking regardless.
+
+        For `resolves_question_id`: optional context, warned if missing but
+        the decision is not dropped.
+
+        Args:
+            decisions: Parsed decision dicts.
+
+        Returns:
+            Filtered list with invalid-reinforces promote decisions removed.
+        """
+        valid = []
+        for decision in decisions:
+            action = decision.get("action", "")
+            skip = False
+
+            # reinforces is required for promote to do anything useful
+            if action == "promote":
+                mid = decision.get("reinforces")
+                if mid and mid != "null":
+                    if not Memory.select().where(Memory.id == mid).exists():
+                        logger.warning(
+                            "PROMOTE references non-existent reinforces=%s; skipping decision",
+                            mid,
+                        )
+                        skip = True
+
+            # resolves_question_id: log if missing, don't skip
+            rqid = decision.get("resolves_question_id")
+            if rqid and rqid != "null":
+                if not Memory.select().where(Memory.id == rqid).exists():
+                    logger.warning(
+                        "Decision references non-existent resolves_question_id=%s; field ignored",
+                        rqid,
+                    )
+
+            if not skip:
+                valid.append(decision)
+        return valid
 
     def _execute_keep(self, decision: dict, session_id: str) -> str | None:
         """
@@ -631,6 +790,125 @@ class Consolidator:
             })
         logger.debug("PRUNE: %s — %s", observation[:80], rationale)
 
+    def _execute_archive(
+        self,
+        memory_id: str,
+        rationale: str,
+        session_id: str,
+        decision: dict | None = None,
+    ) -> None:
+        """
+        Execute an ARCHIVE decision by moving an existing memory to pending_delete stage.
+
+        Two-phase delete: the memory is not hard-deleted immediately.  It
+        is kept with stage='pending_delete' and will be hard-deleted after
+        MEMESIS_PENDING_DELETE_TTL_DAYS (default 7) days, or immediately via
+        `memesis forget --confirm <id>`.
+
+        Args:
+            memory_id: UUID of the memory to archive.
+            rationale: Why it is being archived.
+            session_id: Current session identifier.
+            decision: Full decision dict for audit metadata.
+        """
+        try:
+            memory = Memory.get_by_id(memory_id)
+        except Memory.DoesNotExist:
+            logger.warning("ARCHIVE target memory not found: %s", memory_id)
+            return
+
+        from_stage = memory.stage
+        memory.stage = "pending_delete"
+        memory.updated_at = datetime.now().isoformat()
+        memory.save()
+
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
+            session_id=session_id,
+            action="archived",
+            memory_id=memory_id,
+            from_stage=from_stage,
+            to_stage="pending_delete",
+            rationale=rationale,
+            **self._consolidation_metadata(decision),
+        )
+        _tw = get_active_writer()
+        if _tw is not None:
+            _tw.emit("consolidate", "archive", {
+                "memory_id": str(memory_id),
+                "from_stage": from_stage,
+                "to_stage": "pending_delete",
+                "reason": rationale,
+            })
+        logger.info(
+            "ARCHIVE: memory %s (%s) → pending_delete — %s",
+            memory_id,
+            from_stage,
+            rationale[:80],
+        )
+
+    def _idempotency_key(self, memory_id: str, prompt_version: str = "v1") -> str:
+        """Compute a hash key for idempotency tracking.
+
+        Hash of (memory_id, prompt_version, model).  Used to skip decisions
+        that have already been applied in this run.
+        """
+        raw = f"{memory_id}:{prompt_version}:{self.model}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def consolidate_batch(
+        self,
+        sessions: list[tuple[str, str]],
+    ) -> list[dict]:
+        """
+        Run consolidation for multiple sessions concurrently.
+
+        Uses asyncio.gather with return_exceptions=True so that a single
+        failing session does not abort the batch.  Concurrency is bounded
+        by asyncio.Semaphore(BATCH_CONCURRENCY) to prevent overwhelming
+        the LLM subprocess layer.
+
+        Args:
+            sessions: List of (ephemeral_path, session_id) tuples.
+
+        Returns:
+            List of result dicts in input order.  Entries that raised an
+            exception are {"error": str, "session_id": session_id}.
+        """
+        sem = asyncio.Semaphore(self.BATCH_CONCURRENCY)
+
+        async def _run_one(ephemeral_path: str, session_id: str) -> dict:
+            async with sem:
+                # consolidate_session is synchronous; run in executor so it
+                # doesn't block the event loop and respects the semaphore.
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None,
+                    self.consolidate_session,
+                    ephemeral_path,
+                    session_id,
+                )
+
+        async def _gather_all() -> list:
+            tasks = [_run_one(ep, sid) for ep, sid in sessions]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        results_raw = asyncio.run(_gather_all())
+
+        results = []
+        for (_, sid), raw in zip(sessions, results_raw):
+            if isinstance(raw, Exception):
+                logger.error(
+                    "consolidate_batch: session %s raised %s: %s",
+                    sid,
+                    type(raw).__name__,
+                    raw,
+                )
+                results.append({"error": str(raw), "session_id": sid})
+            else:
+                results.append(raw)
+        return results
+
     def _execute_promote(self, decision: dict, session_id: str) -> str | None:
         """
         Execute a PROMOTE decision by incrementing reinforcement_count,
@@ -677,6 +955,16 @@ class Consolidator:
                 "from_stage": from_stage,
                 "to_stage": from_stage,
             })
+
+        # RISK-12: hypothesis memories must pass the evidence gate before stage advancement
+        if memory.kind == "hypothesis":
+            from .self_reflection import can_promote_hypothesis, promote_hypothesis
+            if can_promote_hypothesis(memory):
+                promote_hypothesis(memory, rationale=decision.get("rationale", "Evidence gate passed"))
+                logger.info("Hypothesis %s promoted via evidence gate", memory_id)
+            else:
+                logger.info("Hypothesis %s does not yet meet promotion gate", memory_id)
+            return memory_id
 
         # Check if memory now qualifies for lifecycle stage advancement
         can_advance, reason = self.lifecycle.can_promote(memory_id)
@@ -865,6 +1153,15 @@ class Consolidator:
                     logger.warning("Rehydration failed for %s: %s", match_id, e)
 
         return rehydrated
+
+
+def _is_numeric(value) -> bool:
+    """Return True if value can be coerced to float."""
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _format_markdown(metadata: dict, content: str) -> str:

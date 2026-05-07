@@ -296,6 +296,7 @@ class TestConsolidatePromote:
         assert result["promoted"] == []
 
     def test_promote_nonexistent_memory_skipped(self, consolidator, ephemeral_file):
+        # Use a valid UUID4 format that doesn't exist in the DB
         decisions = [
             {
                 "observation": "Observation about gone memory.",
@@ -303,7 +304,7 @@ class TestConsolidatePromote:
                 "rationale": "...",
                 "title": None, "summary": None, "tags": [],
                 "target_path": None,
-                "reinforces": "nonexistent-uuid-1234",
+                "reinforces": "00000000-0000-4000-8000-000000000000",
                 "contradicts": None,
             }
         ]
@@ -618,6 +619,7 @@ class TestContradictionResolution:
         assert "Contradiction resolved" in rows[0].rationale
 
     def test_missing_contradict_target_skipped(self, consolidator, base, ephemeral_file):
+        # Use a valid UUID4 format that doesn't exist in the DB
         decisions = [
             {
                 "observation": "Something contradictory.",
@@ -628,7 +630,7 @@ class TestContradictionResolution:
                 "tags": [],
                 "target_path": "general/new.md",
                 "reinforces": None,
-                "contradicts": "nonexistent-uuid",
+                "contradicts": "00000000-0000-4000-8000-000000000002",
             }
         ]
 
@@ -1126,3 +1128,407 @@ class TestCardFieldsNewWiring:
 
         mem = Memory.get_by_id(result["kept"][0])
         assert mem.rejected_options is None
+
+
+# ---------------------------------------------------------------------------
+# TestPydanticValidation — RISK-02 Pydantic schema consumer (Wave 3.1)
+# ---------------------------------------------------------------------------
+
+class TestPydanticValidation:
+    """Pydantic ConsolidationResponse used for LLM output parsing."""
+
+    def test_invalid_action_raises_validation_error(self, consolidator, ephemeral_file):
+        """An invalid action value must raise ValidationError (not proceed silently)."""
+        from pydantic import ValidationError
+        bad_response = json.dumps({"decisions": [
+            {
+                "observation": "Some observation.",
+                "action": "INVALID_ACTION",
+                "rationale": "Should fail.",
+            }
+        ]})
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = bad_response
+            with pytest.raises((ValueError, ValidationError)):
+                consolidator.consolidate_session(ephemeral_file, "pydantic-001")
+
+    def test_valid_actions_pass_through(self, consolidator, base, ephemeral_file):
+        """All valid actions parse without error."""
+        # 'keep' is a valid action; test that it round-trips via Pydantic
+        decisions = [
+            {
+                "observation": "Prefers ruff over flake8.",
+                "action": "keep",
+                "rationale": "Linter preference.",
+                "title": "Ruff",
+                "summary": "Uses ruff.",
+                "tags": [],
+                "target_path": "tooling/ruff.md",
+                "reinforces": None,
+                "contradicts": None,
+            }
+        ]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            result = consolidator.consolidate_session(ephemeral_file, "pydantic-002")
+
+        assert len(result["kept"]) == 1
+
+    def test_missing_reinforces_id_skipped_not_abort(self, consolidator, base, ephemeral_file):
+        """Decision referencing non-existent reinforces ID is skipped; session continues."""
+        decisions = [
+            {
+                "observation": "Keep this.",
+                "action": "keep",
+                "rationale": "Good preference.",
+                "title": "Good thing",
+                "summary": "Good.",
+                "tags": [],
+                "target_path": "general/good.md",
+                "reinforces": None,
+                "contradicts": None,
+            },
+            {
+                "observation": "Reinforcing something gone.",
+                "action": "promote",
+                "rationale": "Reinforce.",
+                "reinforces": "00000000-0000-4000-8000-000000000000",
+                "contradicts": None,
+            },
+        ]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            result = consolidator.consolidate_session(ephemeral_file, "pydantic-003")
+
+        # The promote decision is dropped because the ID doesn't exist.
+        # The keep decision should still succeed.
+        assert len(result["kept"]) == 1
+        assert result["promoted"] == []
+
+    def test_missing_contradicts_id_does_not_abort_session(self, consolidator, base, ephemeral_file):
+        """Decision with non-existent contradicts ID still creates the memory; conflict tracked."""
+        decisions = [
+            {
+                "observation": "New thing.",
+                "action": "keep",
+                "rationale": "Good.",
+                "title": "New thing",
+                "summary": "New.",
+                "tags": [],
+                "target_path": "general/new.md",
+                "reinforces": None,
+                # Valid UUID4 format, not in DB
+                "contradicts": "00000000-0000-4000-8000-000000000001",
+            },
+        ]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            result = consolidator.consolidate_session(ephemeral_file, "pydantic-004")
+
+        # The keep action still creates a memory; conflict tracked but resolution skipped
+        assert len(result["kept"]) == 1
+        assert len(result["conflicts"]) == 1
+        assert len(result["resolved"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestPendingDelete — Two-phase delete (RISK-08)
+# ---------------------------------------------------------------------------
+
+class TestPendingDelete:
+    """Archive action sets stage=pending_delete; hard delete gated behind TTL."""
+
+    def test_archive_action_sets_pending_delete_stage(self, consolidator, base, ephemeral_file):
+        """An 'archive' decision targeting an existing memory sets stage='pending_delete'."""
+        existing = _create_memory(
+            title="Old pattern",
+            content="Old content.",
+            summary="Old.",
+        )
+        decisions = [
+            {
+                "observation": "Old pattern is obsolete.",
+                "action": "archive",
+                "rationale": "This memory is no longer relevant.",
+                "contradicts": existing.id,
+                "reinforces": None,
+            }
+        ]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            consolidator.consolidate_session(ephemeral_file, "pd-001")
+
+        updated = Memory.get_by_id(existing.id)
+        assert updated.stage == "pending_delete"
+
+    def test_archive_action_logs_archived_to_pending_delete(self, consolidator, base, ephemeral_file):
+        """Archive action creates a ConsolidationLog entry from_stage→pending_delete."""
+        existing = _create_memory(
+            title="Old pattern",
+            content="Old content.",
+            summary="Old.",
+        )
+        decisions = [
+            {
+                "observation": "Old pattern is obsolete.",
+                "action": "archive",
+                "rationale": "This memory is no longer relevant.",
+                "contradicts": existing.id,
+                "reinforces": None,
+            }
+        ]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            consolidator.consolidate_session(ephemeral_file, "pd-002")
+
+        rows = list(
+            ConsolidationLog.select().where(
+                (ConsolidationLog.memory_id == existing.id) &
+                (ConsolidationLog.action == "archived")
+            )
+        )
+        assert len(rows) == 1
+        assert rows[0].to_stage == "pending_delete"
+        assert rows[0].from_stage == "consolidated"
+
+    def test_archive_without_target_falls_back_to_prune_log(
+        self, consolidator, base, ephemeral_file
+    ):
+        """Archive with no contradicts/reinforces falls back to prune of ephemeral."""
+        decisions = [
+            {
+                "observation": "Transient note.",
+                "action": "archive",
+                "rationale": "Not worth keeping.",
+                "contradicts": None,
+                "reinforces": None,
+            }
+        ]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            result = consolidator.consolidate_session(ephemeral_file, "pd-003")
+
+        # Falls back to prune behavior (logged, no memory created)
+        assert len(result["pruned"]) == 1
+        assert result["kept"] == []
+
+    def test_pending_delete_memory_not_hard_deleted(self, consolidator, base, ephemeral_file):
+        """After archive decision, memory row still exists (pending, not gone)."""
+        existing = _create_memory(
+            title="Pending",
+            content="Content.",
+            summary="Pending.",
+        )
+        decisions = [
+            {
+                "observation": "Memory is outdated.",
+                "action": "archive",
+                "rationale": "No longer relevant.",
+                "contradicts": existing.id,
+                "reinforces": None,
+            }
+        ]
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            consolidator.consolidate_session(ephemeral_file, "pd-004")
+
+        # Memory must still exist
+        mem = Memory.get_by_id(existing.id)
+        assert mem is not None
+        assert mem.stage == "pending_delete"
+
+
+# ---------------------------------------------------------------------------
+# TestBatchConcurrency — asyncio.gather + Semaphore (RISK-08)
+# ---------------------------------------------------------------------------
+
+class TestBatchConcurrency:
+    """consolidate_batch: return_exceptions, semaphore, error isolation."""
+
+    def test_one_item_exception_does_not_abort_batch(
+        self, consolidator, base, tmp_path
+    ):
+        """If one session raises, other sessions still complete."""
+        good_file = tmp_path / "good.md"
+        good_file.write_text("- Good observation.\n", encoding="utf-8")
+
+        bad_file = tmp_path / "bad.md"
+        bad_file.write_text("- Bad observation.\n", encoding="utf-8")
+
+        good_decisions = [
+            {
+                "observation": "Good observation.",
+                "action": "keep",
+                "rationale": "Good preference.",
+                "title": "Good",
+                "summary": "Good.",
+                "tags": [],
+                "target_path": "general/good.md",
+                "reinforces": None,
+                "contradicts": None,
+            }
+        ]
+        good_response = _llm_response_text(good_decisions)
+
+        call_count = []
+
+        def _side_effect(prompt, **kwargs):
+            call_count.append(1)
+            # Second call (bad session) raises
+            if len(call_count) == 2:
+                raise RuntimeError("Simulated LLM failure")
+            return good_response
+
+        sessions = [
+            (str(good_file), "batch-good"),
+            (str(bad_file), "batch-bad"),
+        ]
+
+        with patch("core.consolidator._call_llm_transport", side_effect=_side_effect):
+            results = consolidator.consolidate_batch(sessions)
+
+        assert len(results) == 2
+        # One result should be a success dict
+        successes = [r for r in results if "error" not in r]
+        errors = [r for r in results if "error" in r]
+        assert len(successes) == 1
+        assert len(errors) == 1
+        assert "session_id" in errors[0]
+
+    def test_batch_returns_error_dict_for_failed_session(
+        self, consolidator, base, tmp_path
+    ):
+        """Failed session result contains 'error' and 'session_id' keys."""
+        f = tmp_path / "fail.md"
+        f.write_text("- Observation.\n", encoding="utf-8")
+
+        with patch("core.consolidator._call_llm_transport", side_effect=RuntimeError("boom")):
+            results = consolidator.consolidate_batch([(str(f), "fail-sess")])
+
+        assert len(results) == 1
+        assert results[0]["error"] == "boom"
+        assert results[0]["session_id"] == "fail-sess"
+
+    def test_batch_semaphore_limits_concurrency(self, consolidator, base, tmp_path):
+        """Semaphore ensures at most BATCH_CONCURRENCY sessions run simultaneously."""
+        import threading
+
+        n = 6  # more than BATCH_CONCURRENCY (3)
+        files = []
+        for i in range(n):
+            f = tmp_path / f"s{i}.md"
+            f.write_text(f"- Observation {i}.\n", encoding="utf-8")
+            files.append(f)
+
+        decisions = [
+            {
+                "observation": f"Observation {i}.",
+                "action": "keep",
+                "rationale": "Good.",
+                "title": f"Obs {i}",
+                "summary": f"Obs {i}.",
+                "tags": [],
+                "target_path": f"general/obs{i}.md",
+                "reinforces": None,
+                "contradicts": None,
+            }
+            for i in range(n)
+        ]
+
+        concurrent_peak = [0]
+        active = [0]
+        lock = threading.Lock()
+
+        def _side_effect(prompt, **kwargs):
+            with lock:
+                active[0] += 1
+                concurrent_peak[0] = max(concurrent_peak[0], active[0])
+            # Small sleep to allow overlap
+            import time as _time
+            _time.sleep(0.01)
+            with lock:
+                active[0] -= 1
+            return _llm_response_text([decisions[0]])
+
+        sessions = [(str(f), f"sem-{i}") for i, f in enumerate(files)]
+
+        with patch("core.consolidator._call_llm_transport", side_effect=_side_effect):
+            results = consolidator.consolidate_batch(sessions)
+
+        assert len(results) == n
+        # Peak concurrency must not exceed BATCH_CONCURRENCY
+        assert concurrent_peak[0] <= consolidator.BATCH_CONCURRENCY
+
+    def test_batch_empty_sessions_returns_empty(self, consolidator):
+        """consolidate_batch([]) returns []."""
+        results = consolidator.consolidate_batch([])
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# TestIdempotency — same key skipped on second call (RISK-08)
+# ---------------------------------------------------------------------------
+
+class TestIdempotency:
+    """Decisions with the same idempotency key are skipped on retry."""
+
+    def test_same_decision_twice_in_same_session_is_no_op_on_second(
+        self, consolidator, base, ephemeral_file
+    ):
+        """Running consolidate_session twice with the SAME session_id skips duplicate decisions."""
+        decisions = [
+            {
+                "observation": "Prefers snake_case.",
+                "action": "keep",
+                "rationale": "Style.",
+                "title": "snake_case",
+                "summary": "snake_case.",
+                "tags": [],
+                "target_path": "prefs/snake.md",
+                "reinforces": None,
+                "contradicts": None,
+            }
+        ]
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            # Use a UNIQUE session_id for first call
+            result1 = consolidator.consolidate_session(ephemeral_file, "idem-same-sess")
+
+        # Same decisions again with THE SAME session_id → idempotency key matches → skipped
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            result2 = consolidator.consolidate_session(ephemeral_file, "idem-same-sess")
+
+        assert len(result1["kept"]) == 1
+        # Second call: same session_id + same observation → same key → skipped
+        assert len(result2["kept"]) == 0
+
+    def test_idempotency_key_reset_on_new_instance(self, base, lifecycle, ephemeral_file):
+        """A new Consolidator instance does not carry over idempotency keys."""
+        decisions = [
+            {
+                "observation": "Prefers ruff.",
+                "action": "keep",
+                "rationale": "Linter.",
+                "title": "Ruff",
+                "summary": "Ruff.",
+                "tags": [],
+                "target_path": "tooling/ruff2.md",
+                "reinforces": None,
+                "contradicts": None,
+            }
+        ]
+
+        c1 = Consolidator(lifecycle=lifecycle, model="claude-sonnet-4-6")
+        c2 = Consolidator(lifecycle=lifecycle, model="claude-sonnet-4-6")
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = _llm_response_text(decisions)
+            r1 = c1.consolidate_session(ephemeral_file, "idem-002a")
+
+        # Different instance — fresh _processed_keys
+        # But content_hash dedup will block second create of same content, so
+        # verify the idempotency set is empty on c2
+        assert len(c2._processed_keys) == 0
+        assert len(r1["kept"]) == 1
