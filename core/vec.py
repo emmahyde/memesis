@@ -82,8 +82,13 @@ class VecStore:
             logger.warning("sqlite-vec unavailable: %s", e)
 
     def _connect(self):
-        """Open an apsw connection with the sqlite-vec extension loaded."""
+        """Open an apsw connection with the sqlite-vec extension loaded.
+
+        Sets busy_timeout to 5000ms so concurrent writers back off gracefully
+        instead of immediately raising an error (previously defaulted to 0ms).
+        """
         conn = apsw.Connection(self._db_path)
+        conn.setbusytimeout(5000)
         conn.enable_load_extension(True)
         conn.load_extension(sqlite_vec.loadable_path())
         return conn
