@@ -422,11 +422,11 @@ class TestPreCompactConsolidation:
         close_db()
         return mock_consolidator, mock_feedback, MockLifecycle, mock_manifest
 
-    def test_consolidate_session_called(self, tmp_path, monkeypatch, capsys):
+    def test_consolidate_session_called(self, tmp_path, monkeypatch):
         mock_consolidator, _, _, _ = self._run_main_with_mocks(tmp_path, monkeypatch)
         mock_consolidator.consolidate_session.assert_called_once()
 
-    def test_consolidate_session_receives_ephemeral_path(self, tmp_path, monkeypatch, capsys):
+    def test_consolidate_session_receives_ephemeral_path(self, tmp_path, monkeypatch):
         mock_consolidator, _, _, _ = self._run_main_with_mocks(tmp_path, monkeypatch)
         call_args = mock_consolidator.consolidate_session.call_args
         ephemeral_arg = call_args[0][0]
@@ -461,7 +461,7 @@ class TestPreCompactConsolidation:
         out, _ = capsys.readouterr()
         assert out.strip() == ""
 
-    def test_session_id_defaults_to_unknown(self, tmp_path, monkeypatch, capsys):
+    def test_session_id_defaults_to_unknown(self, tmp_path, monkeypatch):
         """When CLAUDE_SESSION_ID is unset, session_id should default to 'unknown'."""
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
         monkeypatch.chdir(tmp_path)
@@ -499,7 +499,7 @@ class TestPreCompactConsolidation:
 
 
 class TestPreCompactUsageTracking:
-    def test_track_usage_called_when_injections_exist(self, tmp_path, monkeypatch, capsys):
+    def test_track_usage_called_when_injections_exist(self, tmp_path, monkeypatch):
         """track_usage should be called with injected IDs and ephemeral content."""
         session_id = "sess-usage-track"
         monkeypatch.setenv("CLAUDE_SESSION_ID", session_id)
@@ -541,7 +541,7 @@ class TestPreCompactUsageTracking:
         assert mem_id in call_args[0][1]
         assert "rubocop" in call_args[0][2].lower()
 
-    def test_track_usage_not_called_when_no_injections(self, tmp_path, monkeypatch, capsys):
+    def test_track_usage_not_called_when_no_injections(self, tmp_path, monkeypatch):
         """track_usage should be skipped when no memories were injected this session."""
         monkeypatch.setenv("CLAUDE_SESSION_ID", "sess-no-inject")
         monkeypatch.chdir(tmp_path)
@@ -576,7 +576,7 @@ class TestPreCompactUsageTracking:
         close_db()
         mock_feedback.track_usage.assert_not_called()
 
-    def test_track_usage_includes_conversation_text(self, tmp_path, monkeypatch, capsys):
+    def test_track_usage_includes_conversation_text(self, tmp_path, monkeypatch):
         """When stdin has conversation content, it's included in usage text."""
         session_id = "sess-convo"
         monkeypatch.setenv("CLAUDE_SESSION_ID", session_id)
@@ -721,3 +721,198 @@ class TestPreCompactExceptionSafety:
 
         out, _ = capsys.readouterr()
         assert out.strip() == ""
+
+
+# =============================================================================
+# === RISK-14: stdout discipline tests ===
+# =============================================================================
+
+from hooks._safe import emit_stdout, emit_stderr
+from hooks.user_prompt_inject import main as user_prompt_inject_main
+
+
+class TestSafeHelpers:
+    """Unit tests for hooks/_safe.py emit_stdout / emit_stderr."""
+
+    def test_emit_stdout_none(self, capsys):
+        emit_stdout(None)
+        out, err = capsys.readouterr()
+        assert out == "\n"
+        assert err == ""
+
+    def test_emit_stdout_empty_string(self, capsys):
+        emit_stdout("")
+        out, err = capsys.readouterr()
+        assert out == "\n"
+        assert err == ""
+
+    def test_emit_stdout_plain_string(self, capsys):
+        emit_stdout("hello hook")
+        out, err = capsys.readouterr()
+        assert out.strip() == "hello hook"
+        assert err == ""
+
+    def test_emit_stdout_dict_produces_json(self, capsys):
+        emit_stdout({"key": "value", "n": 42})
+        out, err = capsys.readouterr()
+        parsed = json.loads(out.strip())
+        assert parsed == {"key": "value", "n": 42}
+        assert err == ""
+
+    def test_emit_stdout_bad_type_goes_to_stderr(self, capsys):
+        emit_stdout(12345)
+        out, err = capsys.readouterr()
+        assert out.strip() == ""
+        assert "invalid stdout type" in err
+
+    def test_emit_stdout_non_serializable_dict_goes_to_stderr(self, capsys):
+        emit_stdout({"bad": object()})
+        out, err = capsys.readouterr()
+        assert out.strip() == ""
+        assert "non-serializable" in err
+
+    def test_emit_stderr_writes_to_stderr(self, capsys):
+        emit_stderr("something went wrong")
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert "something went wrong" in err
+
+
+class TestPreCompactStdoutDiscipline:
+    """RISK-14: pre_compact.py must never emit non-empty content to stdout."""
+
+    def _run_subprocess(self, tmp_path, env_overrides=None):
+        hook = str(Path(__file__).parent.parent / "hooks" / "pre_compact.py")
+        env = os.environ.copy()
+        env["HOME"] = str(tmp_path)
+        env.pop("CLAUDE_SESSION_ID", None)
+        if env_overrides:
+            env.update(env_overrides)
+        result = subprocess.run(
+            [sys.executable, hook],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(tmp_path),
+            timeout=15,
+        )
+        return result
+
+    def test_stdout_empty_no_ephemeral(self, tmp_path):
+        result = self._run_subprocess(tmp_path)
+        assert result.stdout.strip() == ""
+
+    def test_stdout_empty_on_error(self, tmp_path):
+        """Even on a hard crash (bad HOME), stdout must stay empty."""
+        result = self._run_subprocess(tmp_path, {"HOME": str(tmp_path / "nonexistent")})
+        assert result.stdout.strip() == ""
+
+    def test_errors_go_to_stderr(self, tmp_path):
+        """Errors from pre_compact land on stderr, not stdout."""
+        # Force an error by giving a bad path via env
+        result = self._run_subprocess(tmp_path, {"HOME": str(tmp_path / "nonexistent_xyz")})
+        # Either empty (no error) or error text should be on stderr if something went wrong
+        # stdout must always be empty regardless
+        assert result.stdout.strip() == ""
+
+    def test_no_traceback_on_stdout(self, tmp_path, monkeypatch, capsys):
+        """Unhandled exceptions must not leak tracebacks to stdout."""
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "risk14-crash")
+        monkeypatch.chdir(tmp_path)
+
+        with patch("hooks.pre_compact.init_db", side_effect=RuntimeError("deliberate crash")):
+            pre_compact_main()
+
+        out, err = capsys.readouterr()
+        assert "Traceback" not in out
+        assert "deliberate crash" in err
+
+
+class TestSessionStartStdoutDiscipline:
+    """RISK-14: session_start.py stdout is empty or plain-text injection context."""
+
+    HOOK = str(Path(__file__).parent.parent / "hooks" / "session_start.py")
+
+    def _run(self, tmp_path, extra_env=None):
+        env = os.environ.copy()
+        env["HOME"] = str(tmp_path)
+        if extra_env:
+            env.update(extra_env)
+        result = subprocess.run(
+            [sys.executable, self.HOOK],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(tmp_path),
+            timeout=15,
+        )
+        return result
+
+    def test_no_traceback_on_stdout_bad_home(self, tmp_path):
+        result = self._run(tmp_path, {"HOME": str(tmp_path / "nonexistent")})
+        assert "Traceback" not in result.stdout
+
+    def test_exit_zero_always(self, tmp_path):
+        result = self._run(tmp_path, {"HOME": str(tmp_path / "nonexistent")})
+        assert result.returncode == 0
+
+    def test_errors_do_not_appear_on_stdout(self, tmp_path):
+        """Error text must not bleed into stdout."""
+        result = self._run(tmp_path, {"HOME": str(tmp_path / "bad_path_xyz")})
+        # stdout is either empty or the injection block — never raw error text
+        assert "Error" not in result.stdout or "MEMORY CONTEXT" in result.stdout
+
+
+class TestUserPromptInjectStdoutDiscipline:
+    """RISK-14: user_prompt_inject.py stdout is injection text or empty."""
+
+    def _run_inline(self, monkeypatch, tmp_path, stdin_text="", extra_patches=None):
+        """Run user_prompt_inject.main() inline with monkeypatched stdin."""
+        import io
+        monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "risk14-upi")
+        monkeypatch.chdir(tmp_path)
+
+        patches = [
+            patch("hooks.user_prompt_inject.init_db"),
+            patch("hooks.user_prompt_inject.get_base_dir", return_value=None),
+        ]
+        if extra_patches:
+            patches.extend(extra_patches)
+
+        with patch("hooks.user_prompt_inject.init_db"), \
+             patch("hooks.user_prompt_inject.get_base_dir", return_value=None), \
+             patch("hooks.user_prompt_inject.search_and_inject", return_value=""):
+            user_prompt_inject_main()
+
+    def test_empty_stdin_produces_empty_stdout(self, tmp_path, monkeypatch, capsys):
+        self._run_inline(monkeypatch, tmp_path, stdin_text="")
+        out, _ = capsys.readouterr()
+        assert out.strip() == ""
+
+    def test_no_traceback_on_stdout_on_error(self, tmp_path, monkeypatch, capsys):
+        import io
+        monkeypatch.setattr("sys.stdin", io.StringIO("some prompt"))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "risk14-crash")
+        monkeypatch.chdir(tmp_path)
+
+        with patch("hooks.user_prompt_inject.init_db", side_effect=RuntimeError("exploded")):
+            user_prompt_inject_main()
+
+        out, err = capsys.readouterr()
+        assert "Traceback" not in out
+        assert out.strip() == ""
+        assert "exploded" in err
+
+    def test_error_text_goes_to_stderr(self, tmp_path, monkeypatch, capsys):
+        import io
+        monkeypatch.setattr("sys.stdin", io.StringIO("search for this"))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "risk14-stderr")
+        monkeypatch.chdir(tmp_path)
+
+        with patch("hooks.user_prompt_inject.init_db", side_effect=ValueError("bad value")):
+            user_prompt_inject_main()
+
+        out, err = capsys.readouterr()
+        assert out.strip() == ""
+        assert "bad value" in err

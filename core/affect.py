@@ -24,6 +24,11 @@ from pathlib import Path
 
 from .somatic import classify_valence, SomaticResult, _is_typed_user_text
 
+# RISK-11: experimental flag scaffold.
+# affect is production-validated (frustration, satisfaction, degradation signals confirmed across sessions).
+# Opt-in override: include "affect" in MEMESIS_EXPERIMENTAL_MODULES env var to force-exclude from scoring.
+experimental: bool = False
+
 logger = logging.getLogger(__name__)
 
 

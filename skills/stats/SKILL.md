@@ -1,11 +1,11 @@
 ---
 name: stats
-description: Use when the user asks "memory stats", "how many memories", "memory counts", "what have you stored", or wants to see high-level memory statistics. Shows counts by stage, importance distribution, and cross-project view. Does NOT overlap with /health (archival/relevance diagnostics) or /usage (injection/usage tracking).
+description: Use when the user asks "memory stats", "how many memories", "memory counts", "what have you stored", or wants to see high-level memory statistics. Shows counts by stage, importance distribution, cross-project view, and cognitive module scoring breakdown. Does NOT overlap with /health (archival/relevance diagnostics) or /usage (injection/usage tracking).
 ---
 
 # Stats — Memory Counts and Distribution
 
-View high-level statistics about your stored memories: counts by lifecycle stage, importance distribution, and cross-project view showing which memories are project-specific vs globally shared.
+View high-level statistics about your stored memories: counts by lifecycle stage, importance distribution, cross-project view, and cognitive module scoring breakdown (RISK-11).
 
 ## Usage
 
@@ -27,7 +27,12 @@ View high-level statistics about your stored memories: counts by lifecycle stage
 6. For global view (--global flag):
    - Show stats across all project contexts
    - List breakdown by project context (with name/project_id if available)
-7. Render sections in order: (1) counts by stage, (2) importance distribution, (3) cross-project view
+7. Compute cognitive module breakdown (RISK-11):
+   - Import `compute_module_scores` and `_get_enabled_modules` from `core.retrieval`
+   - Load a sample of active memories (up to 50) for module score computation
+   - Call `compute_module_scores(memories, enabled_modules=_get_enabled_modules())`
+   - Report mean contribution per module and experimental status
+8. Render sections in order: (1) counts by stage, (2) importance distribution, (3) cross-project view, (4) cognitive module breakdown
 
 ## Implementation
 
@@ -110,6 +115,32 @@ else:
     print(f"- **Project-specific:** {project_specific}")
     print(f"- **Globally shared:** {global_shared}")
     print(f"\nTip: Use `--global` flag to see all projects' memory counts.\n")
+
+# --- Cognitive Module Breakdown (RISK-11) ---
+from core.retrieval import compute_module_scores, _get_enabled_modules
+import importlib
+
+enabled_modules = _get_enabled_modules()
+sample_memories = list(Memory.active().limit(50))
+module_scores = compute_module_scores(sample_memories, enabled_modules=enabled_modules)
+
+all_modules = ["affect", "coherence", "habituation", "orienting", "replay", "self_reflection", "somatic"]
+
+print("### Cognitive Module Scoring\n")
+print(f"Scored {len(sample_memories)} memories (sample of up to 50).\n")
+for module_name in all_modules:
+    score = module_scores.get(module_name, 0.0)
+    try:
+        mod = importlib.import_module(f"core.{module_name}")
+        is_experimental = getattr(mod, "experimental", False)
+    except Exception:
+        is_experimental = False
+    is_active = module_name in enabled_modules
+    status = "experimental (opt-in)" if is_experimental else "production"
+    active_label = "" if is_active else " [excluded from scoring]"
+    print(f"- **{module_name}:** mean contribution {score:.3f} — {status}{active_label}")
+print()
+print("Opt-in experimental modules: set `MEMESIS_EXPERIMENTAL_MODULES=<comma-list>` env var.\n")
 ```
 
 ## Output Format
@@ -138,6 +169,20 @@ else:
 - **Globally shared:** 16
 
 Tip: Use `--global` flag to see all projects' memory counts.
+
+### Cognitive Module Scoring
+
+Scored 50 memories (sample of up to 50).
+
+- **affect:** mean contribution 0.320 — production
+- **coherence:** mean contribution 0.040 — production
+- **habituation:** mean contribution 0.280 — production
+- **orienting:** mean contribution 0.210 — production
+- **replay:** mean contribution 0.150 — production
+- **self_reflection:** mean contribution 0.000 — experimental (opt-in) [excluded from scoring]
+- **somatic:** mean contribution 0.320 — production
+
+Opt-in experimental modules: set `MEMESIS_EXPERIMENTAL_MODULES=<comma-list>` env var.
 ```
 
 ## Examples
