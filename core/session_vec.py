@@ -7,7 +7,7 @@ into subsequent window prompts, reducing paraphrase re-extraction.
 Design notes:
 - Table is session-scoped: vec_session_{slug} is a sqlite-vec virtual table
   in the same index.db used by VecStore (vec_memories).
-- Single-writer per session — apsw 0ms busy timeout is acceptable here.
+- Single-writer per session — apsw busy_timeout is set to 5000ms for safety.
 - Dropped after extraction completes via drop().
 - Embeddings are raw float32 bytes from core.embeddings.embed_text (Bedrock Titan).
 - Embedding dimension: 512 (matches DEFAULT_DIMENSIONS in embeddings.py).
@@ -82,8 +82,14 @@ class SessionVecStore:
             logger.warning("SessionVecStore: failed to create table %s: %s", self._table, exc)
 
     def _connect(self):
-        """Open apsw connection with sqlite-vec loaded."""
+        """Open apsw connection with sqlite-vec loaded.
+
+        Sets busy_timeout to 5000ms. Although SessionVecStore is typically
+        single-writer within one extraction call, the 0ms default could cause
+        spurious errors if another process touches the same db file concurrently.
+        """
         conn = apsw.Connection(self._db_path)
+        conn.setbusytimeout(5000)
         conn.enable_load_extension(True)
         conn.load_extension(sqlite_vec.loadable_path())
         return conn

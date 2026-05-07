@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from peewee import SqliteDatabase
+
 _SCHEMA_VERSION = 2
 
 from .models import (
@@ -126,6 +128,31 @@ def init_db(
     _vec_store = VecStore(dp)
 
     return bd
+
+
+def make_connection(db_path: str) -> SqliteDatabase:
+    """
+    Factory for creating a Peewee SqliteDatabase with recommended pragmas.
+
+    This is the canonical path for all new Peewee connections outside the
+    main singleton managed by init_db().  It sets busy_timeout=5000ms so
+    that concurrent writers back off gracefully instead of immediately
+    raising OperationalError: database is locked.
+
+    Args:
+        db_path: Absolute path to the SQLite database file.
+
+    Returns:
+        A configured (but not yet opened/init'd) SqliteDatabase instance.
+    """
+    return SqliteDatabase(
+        db_path,
+        pragmas={
+            "journal_mode": "wal",
+            "synchronous": "normal",
+            "busy_timeout": 5000,
+        },
+    )
 
 
 def get_vec_store():
