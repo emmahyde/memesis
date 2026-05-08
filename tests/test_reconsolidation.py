@@ -112,6 +112,44 @@ class TestReconsolidation:
             )
         assert result == {"confirmed": [], "contradicted": [], "refined": []}
 
+    def test_contradicted_hypothesis_decays_evidence_count(self, store):
+        hyp = Memory.create(
+            stage="consolidated",
+            kind="hypothesis",
+            title="User prefers short PRs",
+            content="Based on observations, user slices PRs by abstraction layer.",
+            importance=0.6,
+            evidence_count=2,
+        )
+        llm_response = json.dumps([
+            {"memory_id": hyp.id, "action": "contradicted", "evidence": "User merged a large omnibus PR"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            result = reconsolidate([hyp.id], "User merged a large omnibus PR", "s1")
+        assert hyp.id in result["contradicted"]
+        fresh = Memory.get_by_id(hyp.id)
+        assert fresh.evidence_count == 1  # decremented from 2
+
+    def test_contradicted_hypothesis_demotes_at_zero(self, store):
+        hyp = Memory.create(
+            stage="consolidated",
+            kind="hypothesis",
+            title="User always uses type hints",
+            content="Observed pattern: every function has return type annotations.",
+            importance=0.55,
+            evidence_count=1,
+        )
+        llm_response = json.dumps([
+            {"memory_id": hyp.id, "action": "contradicted", "evidence": "User wrote a function with no type hints"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            result = reconsolidate([hyp.id], "User wrote function with no hints", "s2")
+        assert hyp.id in result["contradicted"]
+        fresh = Memory.get_by_id(hyp.id)
+        assert fresh.evidence_count == 0
+        assert fresh.stage == "ephemeral"
+        assert fresh.kind is None
+
     def test_flag_disabled_returns_empty(self, memories, monkeypatch):
         import core.flags
         monkeypatch.setattr(core.flags, "_cache", {"reconsolidation": False})

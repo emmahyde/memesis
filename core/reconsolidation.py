@@ -133,7 +133,21 @@ def reconsolidate(
             if "contradiction_flagged" not in tags:
                 tags.append("contradiction_flagged")
                 mem.tag_list = tags
-                mem.save()
+
+            # Hypothesis-specific: decay evidence_count on contradiction.
+            # At zero, demote back to ephemeral and strip the hypothesis kind
+            # so the memory re-enters the normal consolidation pipeline.
+            if mem.kind == "hypothesis":
+                mem.evidence_count = max(0, (mem.evidence_count or 1) - 1)
+                if mem.evidence_count == 0:
+                    mem.stage = "ephemeral"
+                    mem.kind = None
+                    logger.info(
+                        "Hypothesis %s demoted to ephemeral (evidence exhausted by contradiction)",
+                        mid[:12],
+                    )
+
+            mem.save()
             result["contradicted"].append(mid)
 
             ConsolidationLog.create(
