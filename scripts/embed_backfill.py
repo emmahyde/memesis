@@ -3,7 +3,8 @@
 Embed all existing memories via Bedrock Titan v2 and store in vec_memories.
 
 Usage:
-    python3 scripts/embed_backfill.py                    # Embed all
+    python3 scripts/embed_backfill.py                    # Embed all missing
+    python3 scripts/embed_backfill.py --stale-only        # Re-embed stale model versions
     python3 scripts/embed_backfill.py --dry-run           # Count only
     python3 scripts/embed_backfill.py --project-context /path  # Project-specific
 """
@@ -14,13 +15,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.database import close_db, get_vec_store, init_db
-from core.embeddings import embed_for_memory
+from core.embeddings import embed_for_memory, DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_VERSION
 from core.models import Memory
+
+
+def _is_stale(vec_store, memory_id: str) -> bool:
+    meta = vec_store.get_embedding_meta(memory_id)
+    if meta is None:
+        return True  # no embedding at all
+    return (
+        meta.get("embedding_model") != DEFAULT_EMBEDDING_MODEL
+        or meta.get("embedding_version") != DEFAULT_EMBEDDING_VERSION
+    )
 
 
 def main():
     project_context = None
     dry_run = False
+    stale_only = False
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -28,6 +40,8 @@ def main():
             project_context = args[i + 1]; i += 2
         elif args[i] == "--dry-run":
             dry_run = True; i += 1
+        elif args[i] == "--stale-only":
+            stale_only = True; i += 1
         else:
             print(f"Unknown: {args[i]}", file=sys.stderr); sys.exit(1)
 
@@ -47,6 +61,8 @@ def main():
             total += 1
             existing = vec_store.get_embedding(mem.id)
             if existing is None:
+                need_embedding.append(mem)
+            elif stale_only and _is_stale(vec_store, mem.id):
                 need_embedding.append(mem)
 
     print(f"Total memories: {total}", file=sys.stderr)
