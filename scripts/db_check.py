@@ -140,6 +140,38 @@ def _check_orphaned_observations(fix: bool) -> int:
     return 1
 
 
+def _check_aged_pending(fix: bool, max_age_days: int = 7) -> int:
+    """Pending observations older than max_age_days are almost certainly stale.
+
+    Either the cron crashed before cycle-12's failed-status fix landed, or
+    the cron hasn't run in over a week (broken hook config). Either way,
+    surface them so backlog math reflects truth.
+    """
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(days=max_age_days)).isoformat()
+    try:
+        rows = db.execute_sql(
+            "SELECT id FROM observations WHERE status='pending' AND created_at < ?",
+            (cutoff,),
+        ).fetchall()
+    except Exception:
+        return 0
+
+    if not rows:
+        return 0
+
+    print(f"  AGED PENDING: {len(rows)} observation(s) older than {max_age_days}d still 'pending'")
+    if fix:
+        ids = [r[0] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        db.execute_sql(
+            f"UPDATE observations SET status='aged' WHERE id IN ({placeholders})",
+            ids,
+        )
+        print(f"    FIXED — marked 'aged'")
+    return 1
+
+
 def _check_consolidation_errors(base_dir: str) -> int:
     """Surface recent consolidation cron failures from meta/consolidation-errors.jsonl.
 
@@ -277,6 +309,12 @@ def main() -> None:
         n = _check_orphaned_observations(args.fix)
         if n == 0:
             print("  ✓ No orphaned observations")
+        total_issues += n
+
+        print("\n=== Aged pending observations (>7d) ===")
+        n = _check_aged_pending(args.fix)
+        if n == 0:
+            print("  ✓ No aged-pending observations")
         total_issues += n
 
         print("\n=== Observation backlog (consolidation health) ===")
