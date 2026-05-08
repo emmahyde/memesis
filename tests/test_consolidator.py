@@ -1534,3 +1534,178 @@ class TestIdempotency:
         # verify the idempotency set is empty on c2
         assert len(c2._processed_keys) == 0
         assert len(r1["kept"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _resolve_conflicts — contradiction resolution path
+# ---------------------------------------------------------------------------
+
+class TestResolveConflicts:
+    """Unit tests for Consolidator._resolve_conflicts().
+
+    All LLM calls are mocked.  We exercise:
+      - scoped resolution (both memories survive with narrowed scope tag)
+      - superseded resolution (old memory is archived)
+      - coexist resolution (content updated, no archival)
+      - low-confidence resolution (< 0.4) is skipped
+      - unknown memory_id is skipped gracefully
+      - null/missing contradicts field is skipped
+    """
+
+    def test_scoped_resolution_updates_memory(self, base, consolidator):
+        """scoped resolution updates title/content and adds scope:narrowed tag."""
+        mem = _create_memory(
+            stage="consolidated",
+            title="Prefers PostgreSQL",
+            content="Always use PostgreSQL.",
+        )
+
+        resolution_response = json.dumps({
+            "resolution_type": "scoped",
+            "refined_title": "Prefers PostgreSQL for production",
+            "refined_content": "PostgreSQL for production; SQLite for prototypes.",
+            "confidence": 0.85,
+        })
+
+        conflicts = [{"observation": "Used SQLite for the CLI prototype.", "contradicts": mem.id}]
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = resolution_response
+            results = consolidator._resolve_conflicts(conflicts, session_id="sess-scope-001")
+
+        assert len(results) == 1
+        assert results[0]["resolution_type"] == "scoped"
+        assert results[0]["memory_id"] == mem.id
+
+        refreshed = Memory.get_by_id(mem.id)
+        assert refreshed.title == "Prefers PostgreSQL for production"
+        assert "SQLite" in refreshed.content
+        assert "scope:narrowed" in (refreshed.tags or "")
+        # Memory should NOT be archived on scoped resolution
+        assert refreshed.archived_at is None
+
+    def test_superseded_resolution_archives_memory(self, base, consolidator):
+        """superseded resolution archives the old memory."""
+        mem = _create_memory(
+            stage="consolidated",
+            title="Uses Python 2 print statements",
+            content="Use print 'hello'.",
+        )
+
+        resolution_response = json.dumps({
+            "resolution_type": "superseded",
+            "refined_title": "Uses Python 3 print function",
+            "refined_content": "Use print('hello') — Python 3 only codebase.",
+            "confidence": 0.92,
+        })
+
+        conflicts = [{"observation": "Codebase is Python 3 only.", "contradicts": mem.id}]
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = resolution_response
+            results = consolidator._resolve_conflicts(conflicts, session_id="sess-super-001")
+
+        assert len(results) == 1
+        assert results[0]["resolution_type"] == "superseded"
+
+        refreshed = Memory.get_by_id(mem.id)
+        assert refreshed.archived_at is not None
+        assert "[Superseded]" in refreshed.title
+
+    def test_coexist_resolution_updates_content(self, base, consolidator):
+        """coexist resolution refines content without archiving."""
+        mem = _create_memory(
+            stage="consolidated",
+            title="Prefers verbose logging",
+            content="Log everything at DEBUG level.",
+        )
+
+        resolution_response = json.dumps({
+            "resolution_type": "coexist",
+            "refined_title": "Logging verbosity depends on env",
+            "refined_content": "DEBUG in development; INFO in production.",
+            "confidence": 0.75,
+        })
+
+        conflicts = [{"observation": "Production logs use INFO level.", "contradicts": mem.id}]
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = resolution_response
+            results = consolidator._resolve_conflicts(conflicts, session_id="sess-coexist-001")
+
+        assert len(results) == 1
+        refreshed = Memory.get_by_id(mem.id)
+        assert refreshed.archived_at is None
+        assert "INFO" in refreshed.content
+
+    def test_low_confidence_resolution_is_skipped(self, base, consolidator):
+        """Resolution with confidence < 0.4 is skipped and memory unchanged."""
+        mem = _create_memory(
+            stage="consolidated",
+            title="Prefers TypeScript",
+            content="Always use TypeScript.",
+        )
+        original_content = mem.content
+
+        resolution_response = json.dumps({
+            "resolution_type": "scoped",
+            "refined_title": "Prefers TypeScript in most cases",
+            "refined_content": "TypeScript preferred but JavaScript allowed.",
+            "confidence": 0.2,
+        })
+
+        conflicts = [{"observation": "Used plain JS for a quick script.", "contradicts": mem.id}]
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = resolution_response
+            results = consolidator._resolve_conflicts(conflicts, session_id="sess-lowconf-001")
+
+        assert results == []
+        refreshed = Memory.get_by_id(mem.id)
+        assert refreshed.content == original_content
+
+    def test_unknown_memory_id_is_skipped(self, base, consolidator):
+        """Conflicts referencing a non-existent memory_id are skipped gracefully."""
+        conflicts = [{"observation": "Something new.", "contradicts": "nonexistent-id-000"}]
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            results = consolidator._resolve_conflicts(conflicts, session_id="sess-unknown-001")
+
+        # LLM should not be called since memory lookup fails first
+        mock_transport.assert_not_called()
+        assert results == []
+
+    def test_null_contradicts_field_is_skipped(self, base, consolidator):
+        """Conflicts with contradicts=None or 'null' are silently skipped."""
+        conflicts = [
+            {"observation": "Observation A.", "contradicts": None},
+            {"observation": "Observation B.", "contradicts": "null"},
+        ]
+
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            results = consolidator._resolve_conflicts(conflicts, session_id="sess-null-001")
+
+        mock_transport.assert_not_called()
+        assert results == []
+
+    def test_consolidation_log_written_on_resolution(self, base, consolidator):
+        """A ConsolidationLog entry is written for each successful resolution."""
+        mem = _create_memory(stage="consolidated", title="Orig", content="Original content.")
+
+        resolution_response = json.dumps({
+            "resolution_type": "scoped",
+            "refined_title": "Refined",
+            "refined_content": "Refined content.",
+            "confidence": 0.8,
+        })
+        conflicts = [{"observation": "New evidence.", "contradicts": mem.id}]
+
+        before = ConsolidationLog.select().count()
+        with patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_transport.return_value = resolution_response
+            consolidator._resolve_conflicts(conflicts, session_id="sess-log-001")
+
+        after = ConsolidationLog.select().count()
+        assert after == before + 1
+        entry = ConsolidationLog.select().order_by(ConsolidationLog.id.desc()).first()
+        assert "Contradiction resolved" in entry.rationale
