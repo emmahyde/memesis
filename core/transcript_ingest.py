@@ -152,14 +152,18 @@ If no refinement is warranted, return {{"refined": <input observations unchanged
 
 
 def discover_transcripts(max_age_hours: int = 25) -> list[Path]:
-    """Glob JSONL transcripts modified within max_age_hours, sorted."""
+    """Glob JSONL transcripts modified within max_age_hours, sorted newest-first.
+
+    Sorted by modification time descending so tick(max_sessions=N) always
+    processes the N most-recently-active sessions, not the first N alphabetically.
+    """
     cutoff = time.time() - max_age_hours * 3600
     base = Path.home() / ".claude" / "projects"
     paths = [
         p for p in base.glob("*/*.jsonl")
         if p.stat().st_mtime >= cutoff
     ]
-    return sorted(paths)
+    return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def project_memory_dir(jsonl_path: Path) -> Path:
