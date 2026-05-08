@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 # 512 is a good tradeoff: half the storage of 1024, minimal quality loss.
 DEFAULT_DIMENSIONS = 512
 
+# Active embedding model identifier (Bedrock model ID).
+DEFAULT_EMBEDDING_MODEL = "amazon.titan-embed-text-v2:0"
+
+# Embedding schema version — bump when model or dimension changes.
+DEFAULT_EMBEDDING_VERSION = "titan-v2-512-v1"
+
 _client = None
 
 

@@ -11,12 +11,20 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from peewee import SqliteDatabase
+
+_SCHEMA_VERSION = 2
+
 from .models import (
+    AffectLog,
     ConsolidationLog,
+    EvalRun,
     Memory,
     MemoryEdge,
     NarrativeThread,
+    Observation,
     RetrievalLog,
+    RetrievalCandidate,
     ThreadMember,
     db,
 )
@@ -28,7 +36,18 @@ _vec_store = None
 _db_path: Optional[Path] = None
 _base_dir: Optional[Path] = None
 
-ALL_TABLES = [Memory, NarrativeThread, ThreadMember, MemoryEdge, RetrievalLog, ConsolidationLog]
+ALL_TABLES = [
+    Memory,
+    NarrativeThread,
+    ThreadMember,
+    MemoryEdge,
+    RetrievalLog,
+    ConsolidationLog,
+    Observation,
+    RetrievalCandidate,
+    AffectLog,
+    EvalRun,
+]
 
 
 def _resolve_db_path(project_context: str = None, base_dir: str = None) -> tuple[Path, Path]:
@@ -89,9 +108,19 @@ def init_db(
     # Create tables (safe_create=True → IF NOT EXISTS)
     db.create_tables(ALL_TABLES, safe=True)
 
-    # FTS5 virtual table and migrations (must run raw SQL)
+    # FTS5 virtual table
     _create_fts_table()
-    _run_migrations()
+
+    # Schema migrations via core.migrations runner (RISK-10).
+    # Fresh DB: user_version is 0 (SQLite default) after create_tables, but all
+    # columns already exist in the model, so we bump to _SCHEMA_VERSION first so
+    # the runner seeds (records without re-executing) all migration files.
+    _cursor = db.execute_sql("PRAGMA user_version")
+    if _cursor.fetchone()[0] == 0:
+        db.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    from .migrations import run_migrations as _run_mig
+    _run_mig(db)
 
     # VecStore
     from .vec import VecStore
@@ -99,6 +128,31 @@ def init_db(
     _vec_store = VecStore(dp)
 
     return bd
+
+
+def make_connection(db_path: str) -> SqliteDatabase:
+    """
+    Factory for creating a Peewee SqliteDatabase with recommended pragmas.
+
+    This is the canonical path for all new Peewee connections outside the
+    main singleton managed by init_db().  It sets busy_timeout=5000ms so
+    that concurrent writers back off gracefully instead of immediately
+    raising OperationalError: database is locked.
+
+    Args:
+        db_path: Absolute path to the SQLite database file.
+
+    Returns:
+        A configured (but not yet opened/init'd) SqliteDatabase instance.
+    """
+    return SqliteDatabase(
+        db_path,
+        pragmas={
+            "journal_mode": "wal",
+            "synchronous": "normal",
+            "busy_timeout": 5000,
+        },
+    )
 
 
 def get_vec_store():
@@ -147,98 +201,12 @@ def _create_fts_table():
 
 
 def _run_migrations():
+    """Backward-compat shim — delegates to core.migrations.run_migrations(db).
+
+    Retained because tests outside the migration task import this name.
+    New code should call core.migrations.run_migrations(db) directly.
     """
-    Run schema migrations for backwards compatibility.
+    from .migrations import run_migrations as _run_mig
+    _run_mig(db)
 
-    - Add 'content' column to memories if missing
-    - Add 'archived_at' column if missing
-    - Add 'subsumed_by' column if missing
-    - Add 'project_context' to retrieval_log if missing
-    - Add 'last_surfaced_at' to narrative_threads if missing
-    - Rebuild consolidation_log CHECK constraint if outdated
-    """
-    # Helper: get column names for a table
-    def _columns(table_name):
-        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
-        return [row[1] for row in cursor.fetchall()]
 
-    # memories migrations
-    mem_cols = _columns("memories")
-    for col, typ in [
-        ("content", "TEXT"),
-        ("archived_at", "TEXT"),
-        ("subsumed_by", "TEXT"),
-        ("echo_count", "INTEGER DEFAULT 0"),
-        ("next_injection_due", "TEXT"),
-        ("injection_ease_factor", "REAL DEFAULT 2.5"),
-        ("injection_interval_days", "REAL DEFAULT 1.0"),
-    ]:
-        if col not in mem_cols:
-            try:
-                db.execute_sql(f"ALTER TABLE memories ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    # retrieval_log migration
-    ret_cols = _columns("retrieval_log")
-    if "project_context" not in ret_cols:
-        try:
-            db.execute_sql("ALTER TABLE retrieval_log ADD COLUMN project_context TEXT")
-        except Exception:
-            pass
-
-    # narrative_threads migration
-    nt_cols = _columns("narrative_threads")
-    for col, typ in [
-        ("last_surfaced_at", "TEXT"),
-        ("arc_affect", "TEXT"),
-    ]:
-        if col not in nt_cols:
-            try:
-                db.execute_sql(f"ALTER TABLE narrative_threads ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    # memory_edges migration
-    edge_cols = _columns("memory_edges")
-    if "metadata" not in edge_cols:
-        try:
-            db.execute_sql("ALTER TABLE memory_edges ADD COLUMN metadata TEXT")
-        except Exception:
-            pass
-
-    # Consolidation log CHECK constraint migration
-    cursor = db.execute_sql(
-        "SELECT sql FROM sqlite_master WHERE name='consolidation_log'"
-    )
-    schema_row = cursor.fetchone()
-    if schema_row and "'subsumed'" not in (schema_row[0] or ""):
-        rows = list(
-            db.execute_sql(
-                "SELECT timestamp, session_id, action, memory_id, "
-                "from_stage, to_stage, rationale FROM consolidation_log"
-            ).fetchall()
-        )
-        db.execute_sql("DROP TABLE consolidation_log")
-        db.execute_sql(
-            """
-            CREATE TABLE consolidation_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                session_id TEXT,
-                action TEXT CHECK(action IN ('kept', 'pruned', 'promoted',
-                    'demoted', 'merged', 'deprecated', 'subsumed', 'archived')),
-                memory_id TEXT,
-                from_stage TEXT,
-                to_stage TEXT,
-                rationale TEXT
-            )
-            """
-        )
-        for r in rows:
-            db.execute_sql(
-                "INSERT INTO consolidation_log "
-                "(timestamp, session_id, action, memory_id, from_stage, to_stage, rationale) "
-                "VALUES (?,?,?,?,?,?,?)",
-                list(r),
-            )

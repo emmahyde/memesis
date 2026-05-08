@@ -4,10 +4,15 @@ Three-tier retrieval engine with context matching and token budget.
 Tier 1 — Instinctive: always injected, zero decision overhead.
 Tier 2 — Crystallized: context-matched, token-budgeted.
 Tier 3 — Active search: agent-initiated FTS with progressive disclosure.
+
+NOTE: Future write-tools MUST set source='agent'; _compute_priors() should
+filter source != 'agent' OR access_count > K once agent-write path ships.
 """
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -18,12 +23,134 @@ import json
 
 from .database import get_base_dir, get_vec_store
 from .flags import get_flag
-from .models import Memory, MemoryEdge, NarrativeThread, RetrievalLog, ThreadMember, db
+from .models import (
+    Memory,
+    MemoryEdge,
+    NarrativeThread,
+    RetrievalCandidate,
+    RetrievalLog,
+    ThreadMember,
+    db,
+)
+from .tiers import stage_to_tier, tier_ttl
 
 if TYPE_CHECKING:
     from .vec import VecStore
 
+
+# ---------------------------------------------------------------------------
+# RISK-11: Cognitive module registry and experimental opt-in
+#
+# Modules listed here contribute scores to retrieval ranking.  Modules marked
+# experimental=True are excluded from scoring by default; opt-in via the env
+# var MEMESIS_EXPERIMENTAL_MODULES (comma-separated module names).
+#
+# Example: MEMESIS_EXPERIMENTAL_MODULES=self_reflection,coherence
+# ---------------------------------------------------------------------------
+
+_COGNITIVE_MODULES = [
+    "affect",
+    "coherence",
+    "habituation",
+    "orienting",
+    "replay",
+    "self_reflection",
+    "somatic",
+]
+
+
+def _get_enabled_modules() -> set[str]:
+    """Return the set of cognitive module names active for scoring.
+
+    Non-experimental modules are always enabled.
+    Experimental modules are enabled only when listed in the
+    MEMESIS_EXPERIMENTAL_MODULES environment variable.
+    """
+    import importlib
+
+    opt_in_raw = os.environ.get("MEMESIS_EXPERIMENTAL_MODULES", "")
+    opted_in = {name.strip() for name in opt_in_raw.split(",") if name.strip()}
+
+    enabled: set[str] = set()
+    for module_name in _COGNITIVE_MODULES:
+        try:
+            mod = importlib.import_module(f"core.{module_name}")
+            is_experimental = getattr(mod, "experimental", False)
+        except Exception:
+            is_experimental = False
+
+        if not is_experimental or module_name in opted_in:
+            enabled.add(module_name)
+
+    return enabled
+
+
+def compute_module_scores(memories: list, enabled_modules: set[str] | None = None) -> dict[str, float]:
+    """Compute per-module mean score contribution across a set of memories.
+
+    For each enabled cognitive module, extracts the relevant signal from
+    each memory's attributes and averages across the set.
+
+    Returns a dict mapping module name -> mean contribution (0.0–1.0).
+    Modules absent from enabled_modules contribute 0.0 and are excluded.
+    """
+    if enabled_modules is None:
+        enabled_modules = _get_enabled_modules()
+
+    if not memories:
+        return {m: 0.0 for m in _COGNITIVE_MODULES}
+
+    scores: dict[str, list[float]] = {m: [] for m in _COGNITIVE_MODULES}
+
+    for memory in memories:
+        # affect: importance-weighted affect_valence presence
+        if "affect" in enabled_modules:
+            affect_val = getattr(memory, "affect_valence", None)
+            scores["affect"].append(1.0 if affect_val and affect_val != "neutral" else 0.0)
+
+        # somatic: same signal as affect (valence presence)
+        if "somatic" in enabled_modules:
+            affect_val = getattr(memory, "affect_valence", None)
+            scores["somatic"].append(1.0 if affect_val and affect_val != "neutral" else 0.0)
+
+        # habituation: modeled as inverse of reinforcement_count (higher = less novel)
+        if "habituation" in enabled_modules:
+            rc = getattr(memory, "reinforcement_count", 0) or 0
+            import math
+            factor = 1.0 / (1.0 + math.log(max(rc, 1)))
+            scores["habituation"].append(factor)
+
+        # orienting: modeled as importance above baseline (higher importance = orienting)
+        if "orienting" in enabled_modules:
+            imp = getattr(memory, "importance", 0.5) or 0.5
+            scores["orienting"].append(max(0.0, (imp - 0.5) * 2.0))
+
+        # replay: injection_count relative to reinforcement (frequently replayed = salient)
+        if "replay" in enabled_modules:
+            ic = getattr(memory, "injection_count", 0) or 0
+            scores["replay"].append(min(1.0, ic / 10.0))
+
+        # coherence: divergence flag presence (tagged memories score higher on coherence need)
+        if "coherence" in enabled_modules:
+            tags = getattr(memory, "tag_list", []) or []
+            scores["coherence"].append(1.0 if "coherence_divergent" in tags else 0.0)
+
+        # self_reflection: only present when explicitly opted in
+        if "self_reflection" in enabled_modules:
+            stage = getattr(memory, "stage", "") or ""
+            scores["self_reflection"].append(1.0 if stage == "instinctive" else 0.0)
+
+    result: dict[str, float] = {}
+    for module_name in _COGNITIVE_MODULES:
+        vals = scores[module_name]
+        result[module_name] = sum(vals) / len(vals) if vals else 0.0
+
+    return result
+
 CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens x 4 chars/token
+# Friction memories encode emotionally-salient negative affect (Kensinger 2007);
+# a small additive boost ensures they rank above equal-RRF neutral memories.
+AFFECT_FRICTION_BOOST = 0.02
 THREAD_BUDGET_CHARS = 8_000
 TENSION_BUDGET_CHARS = 2_000
 _THREAD_NARRATIVE_CAP = 1_000
@@ -68,6 +195,9 @@ class RetrievalEngine:
         self.token_budget_pct = token_budget_pct
         # token_limit is in *characters* (chars/4 is the token estimate)
         self.token_limit = int(token_budget_pct * 200_000) * 4  # chars
+        self._last_hybrid_candidates = []
+        # RISK-11: last computed module_scores (dict[str, float]) populated after each retrieval call.
+        self._last_module_scores: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,9 +226,22 @@ class RetrievalEngine:
             query_embedding=query_embedding,
         )
 
+        if query is not None:
+            self._record_retrieval_run(
+                query=query,
+                session_id=session_id,
+                retrieval_type="injected_query",
+                project_context=project_context,
+                selected_ids=[m.id for m in tier2],
+                limit=len(tier2),
+            )
+
         # Log injections for every memory surfaced
         for memory in tier1 + tier2:
             _record_injection(memory.id, session_id, project_context=project_context)
+
+        # RISK-11: compute per-module scores over all injected memories.
+        self._last_module_scores = compute_module_scores(tier1 + tier2)
 
         if not tier1 and not tier2:
             return ""
@@ -211,10 +354,12 @@ class RetrievalEngine:
 
         # Preserve RRF order when building the output
         disclosed = []
+        selected_memories = []
         for memory_id, rrf_score in ranked:
             memory = memories_by_id.get(memory_id)
             if memory is None:
                 continue
+            selected_memories.append(memory)
             disclosed.append({
                 "id": memory.id,
                 "title": memory.title,
@@ -227,7 +372,74 @@ class RetrievalEngine:
                 "project_context": memory.project_context,
             })
 
+        # RISK-11: compute per-module contribution scores and attach to each result
+        module_scores = compute_module_scores(selected_memories)
+        self._last_module_scores = module_scores
+        for item in disclosed:
+            item["module_scores"] = module_scores
+
+        self._record_retrieval_run(
+            query=query,
+            session_id=session_id,
+            retrieval_type="active_search",
+            project_context=None,
+            selected_ids=[d["id"] for d in disclosed],
+            limit=limit,
+        )
+
         return disclosed
+
+    def _record_retrieval_run(
+        self,
+        query: str,
+        session_id: str,
+        retrieval_type: str,
+        project_context: str | None,
+        selected_ids: list[str],
+        limit: int,
+    ) -> None:
+        """Persist per-candidate retrieval scoring for Observer inspection."""
+        candidates = self._last_hybrid_candidates or []
+        if not candidates:
+            return
+
+        now = datetime.now().isoformat()
+        selected = set(selected_ids)
+        try:
+            log = RetrievalLog.create(
+                timestamp=now,
+                session_id=session_id,
+                memory_id=None,
+                retrieval_type=retrieval_type,
+                was_used=1 if selected_ids else 0,
+                relevance_score=candidates[0]["final_score"] if candidates else None,
+                project_context=project_context,
+                query_text=query,
+                limit_count=limit,
+                selected_count=len(selected_ids),
+                metadata=json.dumps({"candidate_count": len(candidates)}),
+            )
+
+            for candidate in candidates:
+                RetrievalCandidate.create(
+                    retrieval_log_id=log.id,
+                    memory_id=candidate["memory_id"],
+                    rank=candidate["rank"],
+                    fts_rank=candidate.get("fts_rank"),
+                    vector_rank=candidate.get("vector_rank"),
+                    semantic_score=candidate.get("semantic_score", 0.0),
+                    recency_score=candidate.get("recency_score", 0.0),
+                    importance_score=candidate.get("importance_score", 0.0),
+                    affect_score=candidate.get("affect_score", 0.0),
+                    reinforcement_score=candidate.get("reinforcement_score", 0.0),
+                    boost_score=candidate.get("boost_score", 0.0),
+                    final_score=candidate.get("final_score", 0.0),
+                    was_selected=1 if candidate["memory_id"] in selected else 0,
+                    metadata=json.dumps(candidate.get("metadata", {})),
+                )
+        except Exception:
+            # Retrieval must stay available even if observer instrumentation lags a migration.
+            return
 
     def hybrid_search(
         self,
@@ -287,16 +499,102 @@ class RetrievalEngine:
             return []
 
         scores: dict[str, float] = {}
+        component_rows: dict[str, dict] = {}
         for memory_id in all_ids:
             score = 0.0
+            lexical_score = 0.0
+            semantic_score = 0.0
             if memory_id in fts_ranks:
-                score += 1.0 / (rrf_k + fts_ranks[memory_id])
+                lexical_score = 1.0 / (rrf_k + fts_ranks[memory_id])
+                score += lexical_score
             if memory_id in vec_ranks:
-                score += 1.0 / (rrf_k + vec_ranks[memory_id])
+                semantic_score = 1.0 / (rrf_k + vec_ranks[memory_id])
+                score += semantic_score
             scores[memory_id] = score
+            component_rows[memory_id] = {
+                "memory_id": memory_id,
+                "fts_rank": fts_ranks.get(memory_id),
+                "vector_rank": vec_ranks.get(memory_id),
+                "semantic_score": semantic_score,
+                "recency_score": 0.0,
+                "importance_score": 0.0,
+                "affect_score": 0.0,
+                "reinforcement_score": 0.0,
+                "boost_score": lexical_score,
+                "final_score": score,
+                "metadata": {"query": query, "rrf_k": rrf_k},
+            }
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return ranked[:k]
+        self._last_hybrid_candidates = [
+            {**component_rows[memory_id], "rank": rank}
+            for rank, (memory_id, _score) in enumerate(ranked, start=1)
+        ]
+
+        # Filter to live (non-expired, non-archived) memories only.
+        # FTS and vec legs do not know about expires_at, so we post-filter here.
+        top_k = ranked[:k]
+        if not top_k:
+            return top_k
+
+        top_k_ids = [mid for mid, _ in top_k]
+        live_ids = {
+            m.id
+            for m in Memory.live().where(Memory.id.in_(top_k_ids))
+        }
+        top_k = [(mid, score) for mid, score in top_k if mid in live_ids]
+
+        # Consume-bump: single batched UPDATE for all returned memories (B3/B4).
+        # T1 (instinctive, tier_ttl=None) rows keep expires_at=NULL — they are
+        # excluded from the expires_at part of the SET clause via per-row SQL
+        # with CASE.  Choice: single executemany with per-row values is cleaner
+        # than a CASE expression over unknown-length IN lists.
+        if top_k:
+            self._bump_accessed(top_k_ids=[mid for mid, _ in top_k])
+
+        return top_k
+
+    def _bump_accessed(self, top_k_ids: list[str]) -> None:
+        """Issue a single batched UPDATE to record consumption of returned memories.
+
+        Sets last_accessed_at to now (UTC ISO) for all ids.
+        Sets expires_at to now_unix + tier_ttl for non-T1 memories;
+        T1 memories (instinctive, tier_ttl=None) are skipped in the expires_at
+        update — their expires_at remains NULL (never expire).
+
+        Implemented as a single executemany so write contention is one round-trip
+        per query, not one per memory (CONTEXT write-contention concern).
+        """
+        if not top_k_ids:
+            return
+
+        # Load stage for each returned memory to compute per-row expiry.
+        stage_by_id: dict[str, str] = {
+            m.id: m.stage
+            for m in Memory.select(Memory.id, Memory.stage).where(
+                Memory.id.in_(top_k_ids)
+            )
+        }
+
+        now_unix = int(time.time())
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Build per-row (last_accessed_at, expires_at, id) tuples.
+        # For T1 memories tier_ttl returns None; pass None so the column stays NULL.
+        rows = []
+        for mid in top_k_ids:
+            stage = stage_by_id.get(mid, "ephemeral")
+            ttl = tier_ttl(stage_to_tier(stage))
+            new_expiry = (now_unix + ttl) if ttl is not None else None
+            rows.append((now_iso, new_expiry, mid))
+
+        # Single executemany — one round-trip to the DB.
+        # db.execute_sql() only accepts a single params tuple; use the underlying
+        # sqlite3 connection directly for executemany support.
+        db.connection().executemany(
+            "UPDATE memories SET last_accessed_at = ?, expires_at = ? WHERE id = ?",
+            rows,
+        )
 
     def _get_thread_narratives(
         self,
@@ -778,7 +1076,19 @@ class RetrievalEngine:
                 boost += CRYSTAL_BOOST
             if project_context is not None and memory.project_context == project_context:
                 boost += PROJECT_BOOST
+            if getattr(memory, "affect_valence", None) == "friction":
+                boost += AFFECT_FRICTION_BOOST
             scored.append((rrf_score + boost, memory))
+
+        # Propagate affect_score into _last_hybrid_candidates for observer logging
+        affect_by_id: dict[str, float] = {
+            memory.id: (AFFECT_FRICTION_BOOST if getattr(memory, "affect_valence", None) == "friction" else 0.0)
+            for _, memory in scored
+        }
+        for candidate in self._last_hybrid_candidates:
+            mid = candidate["memory_id"]
+            if mid in affect_by_id:
+                candidate["affect_score"] = affect_by_id[mid]
 
         scored.sort(key=lambda x: x[0], reverse=True)
 

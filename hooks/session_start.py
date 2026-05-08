@@ -13,6 +13,8 @@ from pathlib import Path
 # Allow running from any directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from hooks._safe import emit_stdout
+
 from core.database import get_base_dir, init_db
 from core.ingest import NativeMemoryIngestor
 from core.relevance import RelevanceEngine
@@ -54,10 +56,10 @@ def main():
         injected = retriever.inject_for_session(session_id, project_context)
         create_ephemeral_buffer(base_dir)
 
-        print(injected)
+        emit_stdout(injected)
     except Exception:
         # Never crash the session
-        print("")
+        emit_stdout("")
         sys.exit(0)
 
 

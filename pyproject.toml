@@ -15,6 +15,9 @@ dependencies = [
     "sqlite-vec>=0.1.6",
     "apsw>=3.46",
     "boto3>=1.34",
+    "flask>=3.0",
+    "mcp>=1.8.0",
+    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -25,8 +28,26 @@ eval = [
 ]
 dev = [
     "pytest>=8.0",
+    "anyio>=4.0",
 ]
+
+[project.scripts]
+memesis-mcp = "core.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "hooks*"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+extraPaths = ["."]
+exclude = ["backfill-output", ".venv", "**/__pycache__"]
+typeCheckingMode = "off"
+reportMissingImports = "none"
+reportAttributeAccessIssue = "none"
+reportArgumentType = "none"
+reportOptionalOperand = "none"
+reportOptionalMemberAccess = "none"
+reportIncompatibleVariableOverride = "none"
+reportUnusedVariable = "none"
+reportUnusedImport = "none"

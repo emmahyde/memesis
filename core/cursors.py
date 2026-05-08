@@ -19,9 +19,14 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
   transcript_path  TEXT NOT NULL,
   last_byte_offset INTEGER NOT NULL DEFAULT 0,
   first_seen_at    INTEGER NOT NULL,
-  last_run_at      INTEGER NOT NULL
+  last_run_at      INTEGER NOT NULL,
+  cwd              TEXT DEFAULT NULL
 );
 """
+
+_MIGRATE_ADD_CWD = (
+    "ALTER TABLE transcript_cursors ADD COLUMN cwd TEXT DEFAULT NULL"
+)
 
 _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_cursors_last_run ON transcript_cursors(last_run_at);
@@ -35,6 +40,7 @@ class CursorRow:
     last_byte_offset: int
     first_seen_at: int
     last_run_at: int
+    cwd: str | None = None
 
 
 class CursorStore:
@@ -44,6 +50,10 @@ class CursorStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_CREATE_TABLE)
         self._conn.execute(_CREATE_INDEX)
+        try:
+            self._conn.execute(_MIGRATE_ADD_CWD)
+        except sqlite3.OperationalError:
+            pass
         self._conn.commit()
 
     def get(self, session_id: str) -> CursorRow | None:
@@ -59,6 +69,7 @@ class CursorStore:
             last_byte_offset=row["last_byte_offset"],
             first_seen_at=row["first_seen_at"],
             last_run_at=row["last_run_at"],
+            cwd=row["cwd"],
         )
 
     def upsert(
@@ -68,17 +79,25 @@ class CursorStore:
         last_byte_offset: int,
         *,
         first_seen_at: int | None = None,
+        cwd: str | None = None,
     ) -> None:
         now = int(time.time())
         if first_seen_at is None:
             first_seen_at = now
+        # Lazy-populate, never-invalidate: if caller passes cwd=None but a
+        # prior row already has a non-NULL cwd, preserve the existing value.
+        effective_cwd = cwd
+        if effective_cwd is None:
+            prior = self.get(session_id)
+            if prior is not None and prior.cwd is not None:
+                effective_cwd = prior.cwd
         self._conn.execute(
             """
             INSERT OR REPLACE INTO transcript_cursors
-              (session_id, transcript_path, last_byte_offset, first_seen_at, last_run_at)
-            VALUES (?, ?, ?, ?, ?)
+              (session_id, transcript_path, last_byte_offset, first_seen_at, last_run_at, cwd)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (session_id, transcript_path, last_byte_offset, first_seen_at, now),
+            (session_id, transcript_path, last_byte_offset, first_seen_at, now, effective_cwd),
         )
         self._conn.commit()
 

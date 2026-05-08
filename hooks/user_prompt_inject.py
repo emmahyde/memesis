@@ -19,6 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from hooks._safe import emit_stderr, emit_stdout
+
 from core.affect import coherence_probe, load_analyzer, save_analyzer, format_guidance
 from core.database import get_base_dir, get_vec_store, init_db
 from core.models import Memory, RetrievalLog
@@ -232,7 +234,7 @@ def main():
         # Read user prompt from stdin (Claude Code pipes it)
         prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
         if not prompt.strip():
-            print("", flush=True)
+            emit_stdout("")
             return
 
         session_id = os.environ.get("CLAUDE_SESSION_ID", "unknown")
@@ -248,7 +250,12 @@ def main():
         if base_dir:
             try:
                 analyzer = load_analyzer(base_dir, session_id)
-                state = analyzer.update(prompt)
+                # Strip system-reminder / command wrapper blocks before
+                # affect detection. Reuses the same logic as transcript
+                # cleaning so embedded reminders inside a real message do
+                # not poison valence detection.
+                from core.transcript import _clean_text
+                state = analyzer.update(_clean_text(prompt))
                 save_analyzer(analyzer, base_dir, session_id)
 
                 # If degradation looks likely and we haven't probed recently,
@@ -277,11 +284,12 @@ def main():
             except Exception:
                 pass  # affect tracking is best-effort
 
-        print(result, flush=True)
+        emit_stdout(result)
 
-    except Exception:
+    except Exception as exc:
         # Never crash the user's prompt
-        print("", flush=True)
+        emit_stderr(f"UserPromptInject error: {exc}")
+        emit_stdout("")
 
 
 if __name__ == "__main__":

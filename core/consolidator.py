@@ -3,20 +3,45 @@ Consolidation engine for LLM-based memory curation during PreCompact.
 
 Reads ephemeral session observations, calls Claude to decide what to
 keep/prune/promote, and writes decisions back to the memory store.
+
+Terminology note (panel NS-F6): the name "consolidation" is engineering-
+historical; functionally this module performs *elaborative curation*
+(Craik & Lockhart 1972, levels-of-processing) — gating, enrichment, and
+linking of extracted observations. Biological memory consolidation
+(McGaugh 2000) refers to sleep-dependent hippocampal-to-neocortical
+transfer of memory traces, which this module does NOT perform. The
+Stage 1 → Stage 2 pipeline maps more cleanly to Tulving's (1972, 1985)
+episodic-to-semantic transition: Stage 1 captures temporally-tagged
+session-bound observations (episodic); Stage 2 elaborates them toward
+context-free knowledge (semantic). See `.planning/TAXONOMY-AND-DEFERRED-
+PATTERNS.md` for the full architectural framing.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
+import time
 from datetime import datetime
 from pathlib import Path
 
 from .database import get_base_dir, get_vec_store
+from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
+from .linking import link_memory as _link_memory
 from .llm import call_llm as _call_llm_transport
-from .models import ConsolidationLog, Memory, db
+from .models import ConsolidationLog, Memory, Observation, db
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
+from .schemas import ConsolidationResponse
+from .question_lifecycle import (
+    detect_resolution,
+    get_unresolved_questions,
+    mark_resolved,
+    pin_open_question,
+)
 from .relevance import RelevanceEngine
+from .trace import get_active_writer
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +55,11 @@ class Consolidator:
     the resulting decisions against the memory store.
     """
 
+    # Default pending-delete TTL in days (overridden by MEMESIS_PENDING_DELETE_TTL_DAYS env var)
+    PENDING_DELETE_TTL_DAYS: int = 7
+    # Max concurrent LLM subprocess calls in consolidate_batch
+    BATCH_CONCURRENCY: int = 3
+
     def __init__(
         self,
         lifecycle: LifecycleManager,
@@ -37,6 +67,10 @@ class Consolidator:
     ):
         self.lifecycle = lifecycle
         self.model = model
+        self._last_llm_call = {}
+        # Idempotency set: tracks (memory_id, prompt_version, model) hashes
+        # processed in the current run to avoid double-applying decisions.
+        self._processed_keys: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -81,16 +115,29 @@ class Consolidator:
         # 2c. Replay priority — sort observations by salience before LLM sees them
         from .replay import sort_by_salience
         filtered_content = sort_by_salience(filtered_content)
+        observation_refs = self._record_observations(
+            raw_content=ephemeral_content,
+            filtered_content=filtered_content,
+            source_path=ephemeral_path,
+            session_id=session_id,
+        )
 
         # 3. Build manifest summary
         manifest_summary = self._build_manifest_summary()
+
+        # 3b. Build open_questions context block (WS-H)
+        open_questions_block = self._build_open_questions_block()
 
         # 4. Build and send prompt to Claude
         prompt = CONSOLIDATION_PROMPT.format(
             ephemeral_content=filtered_content,
             manifest_summary=manifest_summary,
+            open_questions_block=open_questions_block,
         )
         decisions = self._call_llm(prompt)
+
+        # 4b. Validate referenced memory IDs — drop decisions with dangling refs
+        decisions = self._validate_decision_ids(decisions)
 
         # 5. Execute decisions
         kept = []
@@ -103,6 +150,24 @@ class Consolidator:
             observation = decision.get("observation", "")
             rationale = decision.get("rationale", "")
             contradicts = decision.get("contradicts")
+            refs = self._refs_for_observation(observation, observation_refs)
+            decision["_observer_refs"] = refs
+
+            # Idempotency check: skip if this exact decision was already processed
+            # in this Consolidator instance's lifetime.  Key = hash(session_id +
+            # target_id_or_obs_hash, model) so the same decision sent twice in the
+            # same session (e.g., double-retry) is suppressed, but the same target
+            # memory appearing in different sessions is allowed.
+            _idem_source = (
+                decision.get("reinforces")
+                or decision.get("contradicts")
+                or hashlib.md5(observation.encode()).hexdigest()[:8]
+            ) or observation
+            _idem_key = self._idempotency_key(f"{session_id}:{_idem_source}")
+            if _idem_key in self._processed_keys:
+                logger.debug("Idempotency: skipping already-processed decision key %s", _idem_key)
+                continue
+            self._processed_keys.add(_idem_key)
 
             # Track conflicts regardless of action
             if contradicts:
@@ -112,15 +177,76 @@ class Consolidator:
                 memory_id = self._execute_keep(decision, session_id)
                 if memory_id:
                     kept.append(memory_id)
+                    self._mark_observations(refs, "kept", memory_id)
+                    # WS-F: cosine-based linking post-processing (C3/OD-D)
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        _link_memory(mem)
+                    except Exception as _link_exc:
+                        logger.debug("Linking skipped for %s: %s", memory_id, _link_exc)
+                    # WS-H: open_question lifecycle hook
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        if mem.kind == "open_question":
+                            pin_open_question(mem)
+                        elif mem.kind in ("correction", "finding"):
+                            question_id = detect_resolution(mem)
+                            if question_id:
+                                question = Memory.get_by_id(question_id)
+                                mark_resolved(question, mem)
+                                logger.info(
+                                    "WS-H: memory %s resolves open_question %s",
+                                    memory_id,
+                                    question_id,
+                                )
+                    except Exception as _q_exc:
+                        logger.debug("Question lifecycle hook skipped for %s: %s", memory_id, _q_exc)
 
             elif action == "prune":
-                self._execute_prune(observation, rationale, session_id)
+                self._execute_prune(observation, rationale, session_id, decision)
                 pruned.append({"observation": observation, "rationale": rationale})
+                self._mark_observations(refs, "pruned")
+
+            elif action == "archive":
+                # Archive action: mark an existing memory as pending_delete (two-phase delete)
+                target_id = decision.get("contradicts") or decision.get("reinforces")
+                if target_id and target_id != "null":
+                    self._execute_archive(target_id, rationale, session_id, decision)
+                else:
+                    logger.warning(
+                        "ARCHIVE decision missing target memory id (contradicts/reinforces); "
+                        "treating as prune of ephemeral observation"
+                    )
+                    self._execute_prune(observation, rationale, session_id, decision)
+                pruned.append({"observation": observation, "rationale": rationale})
+                self._mark_observations(refs, "pruned")
 
             elif action == "promote":
                 memory_id = self._execute_promote(decision, session_id)
                 if memory_id:
                     promoted.append(memory_id)
+                    self._mark_observations(refs, "promoted", memory_id)
+                    # WS-F: cosine-based linking post-processing (C3/OD-D)
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        _link_memory(mem)
+                    except Exception as _link_exc:
+                        logger.debug("Linking skipped for %s: %s", memory_id, _link_exc)
+                    # WS-H: open_question lifecycle hook
+                    try:
+                        mem = Memory.get_by_id(memory_id)
+                        if mem.kind in ("correction", "finding"):
+                            question_id = detect_resolution(mem)
+                            if question_id:
+                                question = Memory.get_by_id(question_id)
+                                mark_resolved(question, mem)
+                                logger.info(
+                                    "WS-H: promoted memory %s resolves open_question %s",
+                                    memory_id,
+                                    question_id,
+                                )
+                    except Exception as _q_exc:
+                        logger.debug("Question lifecycle hook skipped for %s: %s", memory_id, _q_exc)
             else:
                 logger.warning("Unknown action '%s' in LLM response; skipping", action)
 
@@ -145,6 +271,91 @@ class Consolidator:
             "rehydrated": rehydrated,
         }
 
+    def _record_observations(
+        self,
+        raw_content: str,
+        filtered_content: str,
+        source_path: str,
+        session_id: str,
+    ) -> list[dict]:
+        """Persist raw observations before the consolidation LLM decision."""
+        raw_parts = _split_observation_blocks(raw_content)
+        filtered_parts = _split_observation_blocks(filtered_content)
+        parts = filtered_parts or raw_parts
+        refs = []
+
+        for index, content in enumerate(parts):
+            raw = raw_parts[index] if index < len(raw_parts) else content
+            content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()
+            try:
+                observation = Observation.create(
+                    session_id=session_id,
+                    source_path=source_path,
+                    ordinal=index,
+                    content=raw,
+                    filtered_content=content,
+                    content_hash=content_hash,
+                    status="pending",
+                    metadata=json.dumps({"source": "consolidator"}),
+                )
+                refs.append({
+                    "id": observation.id,
+                    "content": content,
+                    "hash": content_hash,
+                })
+            except Exception as exc:
+                logger.debug("Observation instrumentation skipped: %s", exc)
+
+        return refs
+
+    def _refs_for_observation(self, observation: str, refs: list[dict]) -> list[int]:
+        """Best-effort map from an LLM decision observation back to captured rows."""
+        if not observation or not refs:
+            return []
+
+        normalized = observation.strip()
+        exact = [r["id"] for r in refs if r["content"].strip() == normalized]
+        if exact:
+            return exact
+
+        partial = [
+            r["id"] for r in refs
+            if normalized in r["content"] or r["content"] in normalized
+        ]
+        return partial[:3]
+
+    def _mark_observations(
+        self,
+        observation_ids: list[int],
+        status: str,
+        memory_id: str | None = None,
+    ) -> None:
+        """Update observation audit rows after the decision has been applied."""
+        if not observation_ids:
+            return
+        try:
+            Observation.update(status=status, memory_id=memory_id).where(
+                Observation.id.in_(observation_ids)
+            ).execute()
+        except Exception as exc:
+            logger.debug("Observation status instrumentation skipped: %s", exc)
+
+    def _consolidation_metadata(self, decision: dict | None = None) -> dict:
+        """Return shared LLM instrumentation fields for consolidation log rows."""
+        call = self._last_llm_call or {}
+        refs = []
+        if decision is not None:
+            refs = decision.get("_observer_refs") or []
+        return {
+            "prompt": call.get("prompt"),
+            "llm_response": call.get("response"),
+            "model": call.get("model"),
+            "input_tokens": call.get("input_tokens"),
+            "output_tokens": call.get("output_tokens"),
+            "latency_ms": call.get("latency_ms"),
+            "input_observation_refs": json.dumps(refs),
+        }
+
     def estimate_token_budget(self, memories: list) -> int:
         """
         Rough token estimate for a list of memory objects.
@@ -163,6 +374,16 @@ class Consolidator:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _build_open_questions_block(self) -> str:
+        """Build a text block of unresolved open_questions for Stage 2 prompt injection (WS-H)."""
+        questions = get_unresolved_questions(limit=10)
+        if not questions:
+            return "(none)"
+        lines = []
+        for q in questions:
+            lines.append(f"- [{q.id}] {q.title or '(untitled)'}: {q.summary or ''}")
+        return "\n".join(lines)
 
     def _build_manifest_summary(self) -> str:
         """
@@ -198,7 +419,21 @@ class Consolidator:
         Returns:
             List of decision dicts from the LLM.
         """
-        raw = _call_llm_transport(prompt, max_tokens=2048, temperature=0)
+        started_at = time.perf_counter()
+        raw = _call_llm_transport(
+            prompt,
+            max_tokens=2048,
+            temperature=0,
+            model=self.model,
+        )
+        self._last_llm_call = {
+            "prompt": prompt,
+            "response": raw,
+            "model": self.model,
+            "input_tokens": max(1, len(prompt) // 4),
+            "output_tokens": max(1, len(raw) // 4),
+            "latency_ms": int((time.perf_counter() - started_at) * 1000),
+        }
 
         try:
             return self._parse_decisions(raw)
@@ -211,7 +446,21 @@ class Consolidator:
                 "Respond ONLY with a valid JSON object starting with { and ending with }. "
                 "No markdown fences, no explanation, no preamble."
             )
-            retry_raw = _call_llm_transport(retry_prompt, max_tokens=2048, temperature=0)
+            started_at = time.perf_counter()
+            retry_raw = _call_llm_transport(
+                retry_prompt,
+                max_tokens=2048,
+                temperature=0,
+                model=self.model,
+            )
+            self._last_llm_call = {
+                "prompt": retry_prompt,
+                "response": retry_raw,
+                "model": self.model,
+                "input_tokens": max(1, len(retry_prompt) // 4),
+                "output_tokens": max(1, len(retry_raw) // 4),
+                "latency_ms": int((time.perf_counter() - started_at) * 1000),
+            }
 
             try:
                 return self._parse_decisions(retry_raw)
@@ -224,17 +473,22 @@ class Consolidator:
 
     def _parse_decisions(self, raw: str) -> list[dict]:
         """
-        Parse JSON from LLM response, handling optional markdown fences.
+        Parse JSON from LLM response via Pydantic ConsolidationResponse.
+
+        Validates the response envelope and each decision using the Pydantic
+        schema (RISK-02).  Returns dicts (not model instances) so downstream
+        code that uses `.get()` remains unchanged.
 
         Args:
             raw: Raw text from the LLM.
 
         Returns:
-            List of decision dicts.
+            List of decision dicts with validated fields.
 
         Raises:
             json.JSONDecodeError: If text is not valid JSON.
             KeyError: If expected keys are missing.
+            pydantic.ValidationError: If a decision has an invalid action.
         """
         # Strip markdown code fences if present
         text = raw.strip()
@@ -248,7 +502,117 @@ class Consolidator:
             text = "\n".join(lines).strip()
 
         data = json.loads(text)
-        return data["decisions"]
+
+        # Pre-process decisions: strip non-numeric importance values before
+        # passing to Pydantic so that downstream _execute_keep can apply the
+        # existing fallback logic (malformed importance → somatic formula + WARNING).
+        # This preserves the "malformed card importance falls back gracefully"
+        # acceptance criterion that predates Pydantic validation.
+        raw_decisions = data.get("decisions", [])
+        cleaned = []
+        for rd in raw_decisions:
+            imp = rd.get("importance")
+            if imp is not None:
+                try:
+                    float(imp)
+                except (TypeError, ValueError):
+                    # Keep the raw dict with the bad value; Pydantic would reject
+                    # it, so pass it through as-is and let _execute_keep handle it.
+                    # We mark it so _execute_keep's fallback warning fires.
+                    cleaned.append(rd)
+                    continue
+            cleaned.append(rd)
+        data = {**data, "decisions": cleaned}
+
+        # Pydantic parse: validates action values, importance range, UUID fields.
+        # Use exclude_unset=True so that fields the LLM didn't send remain absent
+        # from the returned dicts — preserving the is_card check in _execute_keep
+        # which relies on "scope" and "evidence_quotes" being absent for non-card
+        # decisions, not just None.
+        #
+        # Decisions with malformed importance bypass Pydantic (handled above)
+        # and are returned as raw dicts.  All other decisions go through validation.
+        valid_decisions = []
+        invalid_decisions = []
+        for rd in data["decisions"]:
+            imp = rd.get("importance")
+            is_bad_imp = imp is not None and not _is_numeric(imp)
+            if is_bad_imp:
+                invalid_decisions.append((rd.get("action"), rd))
+            else:
+                valid_decisions.append(rd)
+
+        # Parse valid decisions through Pydantic (raises ValidationError on bad action)
+        partial_response = ConsolidationResponse(**{**data, "decisions": valid_decisions})
+        result = [d.model_dump(exclude_unset=True) for d in partial_response.decisions]
+
+        # Re-insert malformed-importance decisions as raw dicts (preserves original keys)
+        # in their original order.
+        if invalid_decisions:
+            # Rebuild in original order
+            all_raw = cleaned
+            ordered = []
+            vi = 0  # index into valid_decisions
+            for rd in all_raw:
+                imp = rd.get("importance")
+                if imp is not None and not _is_numeric(imp):
+                    ordered.append(rd)
+                else:
+                    if vi < len(result):
+                        ordered.append(result[vi])
+                        vi += 1
+            result = ordered
+
+        return result
+
+    def _validate_decision_ids(self, decisions: list[dict]) -> list[dict]:
+        """
+        Check that memory IDs referenced in decisions exist in the DB.
+
+        For `reinforces` on promote decisions: the ID must exist for the action
+        to have meaning. Decision is logged and skipped when the ID is missing.
+
+        For `contradicts`: not validated here — `_resolve_conflicts` already
+        handles Memory.DoesNotExist gracefully and provides proper conflict
+        tracking regardless.
+
+        For `resolves_question_id`: optional context, warned if missing but
+        the decision is not dropped.
+
+        Args:
+            decisions: Parsed decision dicts.
+
+        Returns:
+            Filtered list with invalid-reinforces promote decisions removed.
+        """
+        valid = []
+        for decision in decisions:
+            action = decision.get("action", "")
+            skip = False
+
+            # reinforces is required for promote to do anything useful
+            if action == "promote":
+                mid = decision.get("reinforces")
+                if mid and mid != "null":
+                    if not Memory.select().where(Memory.id == mid).exists():
+                        logger.warning(
+                            "PROMOTE references non-existent reinforces=%s; skipping decision",
+                            mid,
+                        )
+                        skip = True
+
+            # resolves_question_id: log if missing, don't skip
+            rqid = decision.get("resolves_question_id")
+            if rqid and rqid != "null":
+                if not Memory.select().where(Memory.id == rqid).exists():
+                    logger.warning(
+                        "Decision references non-existent resolves_question_id=%s; field ignored",
+                        rqid,
+                    )
+
+            if not skip:
+                valid.append(decision)
+        return valid
 
     def _execute_keep(self, decision: dict, session_id: str) -> str | None:
         """
@@ -304,18 +668,63 @@ class Consolidator:
                 raise ValueError(f"Duplicate content detected (hash: {content_hash})")
 
             now = datetime.now().isoformat()
+
+            # Card→memory field promotion (Task 3.1): detect card-shaped decisions
+            is_card = "scope" in decision or "evidence_quotes" in decision
+            if is_card:
+                card_fields = extract_card_memory_fields(decision)
+            else:
+                card_fields = {
+                    "temporal_scope": None,
+                    "confidence": None,
+                    "affect_valence": None,
+                    "actor": None,
+                }
+
+            # tier3 #32: trust LLM card.importance (already incorporates somatic prior from Stage 1)
+            # clamp + log-fallback per CONTEXT-tier3 D4 = "clamp+log+fallback"
+            # Kensinger +0.05 friction bump applied here (sole site per D1=C)
+            card_importance = decision.get("importance") if is_card else None
+            if card_importance is not None:
+                try:
+                    base_importance = max(0.0, min(1.0, float(card_importance)))
+                except (TypeError, ValueError):
+                    logger.warning("malformed card importance %r — falling back to flat formula", card_importance)
+                    base_importance = min(0.5 + importance_boost, 1.0)
+                if card_fields.get("affect_valence") == "friction":
+                    pre_bump = base_importance
+                    base_importance = min(1.0, base_importance + 0.05)
+                    _tw = get_active_writer()
+                    if _tw is not None:
+                        _tw.emit("consolidate", "kensinger_bump", {
+                            "memory_id": None,  # not yet created
+                            "pre_bump_importance": pre_bump,
+                            "post_bump_importance": base_importance,
+                        })
+                mem_importance = base_importance
+            else:
+                mem_importance = min(0.5 + importance_boost, 1.0)
+
             mem = Memory.create(
                 stage="consolidated",
                 title=title,
                 summary=summary,
                 content=full_content,
                 tags=json.dumps(tags),
-                importance=min(0.5 + importance_boost, 1.0),
+                importance=mem_importance,
                 reinforcement_count=0,
                 created_at=now,
                 updated_at=now,
                 source_session=session_id,
                 content_hash=content_hash,
+                temporal_scope=card_fields["temporal_scope"],
+                confidence=card_fields["confidence"],
+                # D3: "neutral" default for card-derived; non-card branches leave NULL
+                affect_valence=card_fields.get("affect_valence") or "neutral" if is_card else card_fields["affect_valence"],
+                actor=card_fields["actor"],
+                # #36-A: wire criterion_weights + rejected_options from card fields
+                criterion_weights=json.dumps(card_fields.get("criterion_weights")) if card_fields.get("criterion_weights") else None,
+                rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
             )
             memory_id = mem.id
 
@@ -330,13 +739,28 @@ class Consolidator:
                 from_stage="ephemeral",
                 to_stage="consolidated",
                 rationale=decision.get("rationale", ""),
+                **self._consolidation_metadata(decision),
             )
+            _tw = get_active_writer()
+            if _tw is not None:
+                _tw.emit("consolidate", "keep", {
+                    "memory_id": str(memory_id),
+                    "importance": mem_importance,
+                    "affect_valence": mem.affect_valence,
+                    "stage": "consolidate",
+                })
             return memory_id
         except ValueError as exc:
             logger.warning("KEEP failed for '%s': %s", title, exc)
             return None
 
-    def _execute_prune(self, observation: str, rationale: str, session_id: str) -> None:
+    def _execute_prune(
+        self,
+        observation: str,
+        rationale: str,
+        session_id: str,
+        decision: dict | None = None,
+    ) -> None:
         """
         Execute a PRUNE decision by logging it (no memory created).
 
@@ -356,8 +780,134 @@ class Consolidator:
             from_stage="ephemeral",
             to_stage="ephemeral",
             rationale=rationale,
+            **self._consolidation_metadata(decision),
         )
+        _tw = get_active_writer()
+        if _tw is not None:
+            _tw.emit("consolidate", "prune", {
+                "content_hash_prefix": hashlib.md5(observation.encode()).hexdigest()[:8],
+                "reason": rationale,
+            })
         logger.debug("PRUNE: %s — %s", observation[:80], rationale)
+
+    def _execute_archive(
+        self,
+        memory_id: str,
+        rationale: str,
+        session_id: str,
+        decision: dict | None = None,
+    ) -> None:
+        """
+        Execute an ARCHIVE decision by moving an existing memory to pending_delete stage.
+
+        Two-phase delete: the memory is not hard-deleted immediately.  It
+        is kept with stage='pending_delete' and will be hard-deleted after
+        MEMESIS_PENDING_DELETE_TTL_DAYS (default 7) days, or immediately via
+        `memesis forget --confirm <id>`.
+
+        Args:
+            memory_id: UUID of the memory to archive.
+            rationale: Why it is being archived.
+            session_id: Current session identifier.
+            decision: Full decision dict for audit metadata.
+        """
+        try:
+            memory = Memory.get_by_id(memory_id)
+        except Memory.DoesNotExist:
+            logger.warning("ARCHIVE target memory not found: %s", memory_id)
+            return
+
+        from_stage = memory.stage
+        memory.stage = "pending_delete"
+        memory.updated_at = datetime.now().isoformat()
+        memory.save()
+
+        ConsolidationLog.create(
+            timestamp=datetime.now().isoformat(),
+            session_id=session_id,
+            action="archived",
+            memory_id=memory_id,
+            from_stage=from_stage,
+            to_stage="pending_delete",
+            rationale=rationale,
+            **self._consolidation_metadata(decision),
+        )
+        _tw = get_active_writer()
+        if _tw is not None:
+            _tw.emit("consolidate", "archive", {
+                "memory_id": str(memory_id),
+                "from_stage": from_stage,
+                "to_stage": "pending_delete",
+                "reason": rationale,
+            })
+        logger.info(
+            "ARCHIVE: memory %s (%s) → pending_delete — %s",
+            memory_id,
+            from_stage,
+            rationale[:80],
+        )
+
+    def _idempotency_key(self, memory_id: str, prompt_version: str = "v1") -> str:
+        """Compute a hash key for idempotency tracking.
+
+        Hash of (memory_id, prompt_version, model).  Used to skip decisions
+        that have already been applied in this run.
+        """
+        raw = f"{memory_id}:{prompt_version}:{self.model}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def consolidate_batch(
+        self,
+        sessions: list[tuple[str, str]],
+    ) -> list[dict]:
+        """
+        Run consolidation for multiple sessions concurrently.
+
+        Uses asyncio.gather with return_exceptions=True so that a single
+        failing session does not abort the batch.  Concurrency is bounded
+        by asyncio.Semaphore(BATCH_CONCURRENCY) to prevent overwhelming
+        the LLM subprocess layer.
+
+        Args:
+            sessions: List of (ephemeral_path, session_id) tuples.
+
+        Returns:
+            List of result dicts in input order.  Entries that raised an
+            exception are {"error": str, "session_id": session_id}.
+        """
+        sem = asyncio.Semaphore(self.BATCH_CONCURRENCY)
+
+        async def _run_one(ephemeral_path: str, session_id: str) -> dict:
+            async with sem:
+                # consolidate_session is synchronous; run in executor so it
+                # doesn't block the event loop and respects the semaphore.
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None,
+                    self.consolidate_session,
+                    ephemeral_path,
+                    session_id,
+                )
+
+        async def _gather_all() -> list:
+            tasks = [_run_one(ep, sid) for ep, sid in sessions]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        results_raw = asyncio.run(_gather_all())
+
+        results = []
+        for (_, sid), raw in zip(sessions, results_raw):
+            if isinstance(raw, Exception):
+                logger.error(
+                    "consolidate_batch: session %s raised %s: %s",
+                    sid,
+                    type(raw).__name__,
+                    raw,
+                )
+                results.append({"error": str(raw), "session_id": sid})
+            else:
+                results.append(raw)
+        return results
 
     def _execute_promote(self, decision: dict, session_id: str) -> str | None:
         """
@@ -382,6 +932,7 @@ class Consolidator:
             logger.warning("PROMOTE target memory not found: %s", memory_id)
             return None
 
+        from_stage = memory.stage
         current_count = memory.reinforcement_count or 0
         memory.reinforcement_count = current_count + 1
         memory.save()
@@ -392,10 +943,28 @@ class Consolidator:
             session_id=session_id,
             action="promoted",
             memory_id=memory_id,
-            from_stage=memory.stage,
-            to_stage=memory.stage,
+            from_stage=from_stage,
+            to_stage=from_stage,
             rationale=decision.get("rationale", "Reinforced by new observation"),
+            **self._consolidation_metadata(decision),
         )
+        _tw = get_active_writer()
+        if _tw is not None:
+            _tw.emit("consolidate", "promote", {
+                "memory_id": str(memory_id),
+                "from_stage": from_stage,
+                "to_stage": from_stage,
+            })
+
+        # RISK-12: hypothesis memories must pass the evidence gate before stage advancement
+        if memory.kind == "hypothesis":
+            from .self_reflection import can_promote_hypothesis, promote_hypothesis
+            if can_promote_hypothesis(memory):
+                promote_hypothesis(memory, rationale=decision.get("rationale", "Evidence gate passed"))
+                logger.info("Hypothesis %s promoted via evidence gate", memory_id)
+            else:
+                logger.info("Hypothesis %s does not yet meet promotion gate", memory_id)
+            return memory_id
 
         # Check if memory now qualifies for lifecycle stage advancement
         can_advance, reason = self.lifecycle.can_promote(memory_id)
@@ -507,6 +1076,7 @@ class Consolidator:
                 from_stage=memory.stage,
                 to_stage=memory.stage,
                 rationale=f"Contradiction resolved ({resolution_type}): {observation[:100]}",
+                **self._consolidation_metadata(),
             )
 
             resolved.append({
@@ -571,6 +1141,7 @@ class Consolidator:
                         from_stage="archived",
                         to_stage=match_stage,
                         rationale=f"Rehydrated by new observation: {memory.title or 'untitled'}",
+                        **self._consolidation_metadata(),
                     )
                     rehydrated.append(match_id)
                     logger.info(
@@ -584,6 +1155,15 @@ class Consolidator:
         return rehydrated
 
 
+def _is_numeric(value) -> bool:
+    """Return True if value can be coerced to float."""
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _format_markdown(metadata: dict, content: str) -> str:
     """Format metadata and content as markdown with YAML frontmatter."""
     lines = ['---']
@@ -594,3 +1174,27 @@ def _format_markdown(metadata: dict, content: str) -> str:
     lines.append('')
     lines.append(content)
     return '\n'.join(lines)
+
+
+def _split_observation_blocks(content: str) -> list[str]:
+    """Split a markdown-ish ephemeral file into durable observation blocks."""
+    blocks = []
+    current = []
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                blocks.append('\n'.join(current).strip())
+                current = []
+            continue
+        if stripped.startswith('---') and current:
+            blocks.append('\n'.join(current).strip())
+            current = []
+            continue
+        current.append(line.rstrip())
+
+    if current:
+        blocks.append('\n'.join(current).strip())
+
+    return [block for block in blocks if block]

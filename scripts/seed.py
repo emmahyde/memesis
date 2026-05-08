@@ -165,6 +165,18 @@ def seed(kept: list[dict], project_context: str = None, dry_run: bool = False):
         tags.append("source:backfill")
         if d.get("_focus"):
             tags.append(f"focus:{d['_focus'][:30]}")
+        # Borrowed from claude-mem: orthogonal concept dimension (gotcha,
+        # pattern, trade-off, etc.) stored as concept:<id> in the same
+        # tags column. Validation is prompt-only.
+        for concept in (d.get("concept_tags") or []):
+            if isinstance(concept, str) and concept and f"concept:{concept}" not in tags:
+                tags.append(f"concept:{concept}")
+
+        # files_modified persisted to its own column; default empty list.
+        files_modified_raw = d.get("files_modified") or []
+        files_modified_json = json.dumps(
+            [f for f in files_modified_raw if isinstance(f, str) and f]
+        )
 
         content = observation
         rationale = d.get("rationale", "")
@@ -212,6 +224,14 @@ def seed(kept: list[dict], project_context: str = None, dry_run: bool = False):
                 updated_at=created_at,
                 source_session=d.get("_session", ""),
                 content_hash=content_hash,
+                files_modified=files_modified_json,
+                # Defensive nulls — seed is a non-card write path (D3)
+                temporal_scope=None,
+                confidence=None,
+                affect_valence=None,
+                actor=None,
+                criterion_weights=None,
+                rejected_options=None,
             )
             file_path.write_text(full_content, encoding="utf-8")
             seeded += 1

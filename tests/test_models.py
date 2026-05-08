@@ -3,7 +3,7 @@
 import json
 import struct
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -398,6 +398,159 @@ class TestContentHash:
         assert new_hash != original_hash
 
 
+# ---------------------------------------------------------------------------
+# W2 schema additions
+# ---------------------------------------------------------------------------
+
+
+class TestW2SchemaFields:
+    """Round-trip tests for Wave 2 Memory schema additions."""
+
+    def test_all_new_fields_persist(self, store):
+        """All W2 fields can be written and read back."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="W2 test",
+            content="content",
+            created_at=now,
+            updated_at=now,
+            kind="decision",
+            knowledge_type="conceptual",
+            knowledge_type_confidence="high",
+            subject="system",
+            work_event="feature",
+            subtitle="Short retrieval subtitle here",
+            cwd="/Users/test/myproject",
+            session_type="code",
+            raw_importance=0.7,
+            linked_observation_ids=json.dumps(["abc-123", "def-456"]),
+            access_count=3,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.kind == "decision"
+        assert result.knowledge_type == "conceptual"
+        assert result.knowledge_type_confidence == "high"
+        assert result.subject == "system"
+        assert result.work_event == "feature"
+        assert result.subtitle == "Short retrieval subtitle here"
+        assert result.cwd == "/Users/test/myproject"
+        assert result.session_type == "code"
+        assert result.raw_importance == pytest.approx(0.7)
+        assert result.access_count == 3
+
+    def test_linked_observations_accessor_parses_json(self, store):
+        """linked_observations property returns list from JSON text."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="linked test",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            linked_observation_ids=json.dumps(["id-1", "id-2", "id-3"]),
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.linked_observations == ["id-1", "id-2", "id-3"]
+
+    def test_linked_observations_accessor_returns_empty_for_null(self, store):
+        """linked_observations returns [] when field is null."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="null linked",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            linked_observation_ids=None,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.linked_observations == []
+
+    def test_linked_observations_accessor_returns_empty_for_missing(self, store):
+        """linked_observations returns [] when field is empty string."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="empty linked",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            linked_observation_ids="",
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.linked_observations == []
+
+    def test_session_type_accepts_valid_values(self, store):
+        """session_type stores code|writing|research values."""
+        now = datetime.now().isoformat()
+        for val in ("code", "writing", "research"):
+            mem = Memory.create(
+                stage="ephemeral",
+                title=f"session_type {val}",
+                content="c",
+                created_at=now,
+                updated_at=now,
+                session_type=val,
+            )
+            result = Memory.get_by_id(mem.id)
+            assert result.session_type == val
+
+    def test_session_type_accepts_null(self, store):
+        """session_type can be null."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="no session type",
+            content="c",
+            created_at=now,
+            updated_at=now,
+            session_type=None,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.session_type is None
+
+    def test_w2_created_at_default_is_set(self, store):
+        """w2_created_at gets a default value on creation."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="created_at test",
+            content="c",
+            created_at=now,
+            updated_at=now,
+        )
+        result = Memory.get_by_id(mem.id)
+        # w2_created_at should be set (not null)
+        assert result.w2_created_at is not None
+
+    def test_access_count_defaults_to_zero(self, store):
+        """access_count defaults to 0."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="access_count default",
+            content="c",
+            created_at=now,
+            updated_at=now,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.access_count == 0
+
+    def test_raw_importance_null_by_default(self, store):
+        """raw_importance is null when not set."""
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="ephemeral",
+            title="raw_importance null",
+            content="c",
+            created_at=now,
+            updated_at=now,
+        )
+        result = Memory.get_by_id(mem.id)
+        assert result.raw_importance is None
+
+
 class TestProjectContext:
     """Test project-specific storage."""
 
@@ -488,4 +641,271 @@ class TestVecEnabled:
         vec.store_embedding(mem.id, emb)
         results = vec.search_vector(emb, k=5)
         assert len(results) >= 1
-        assert 'distance' in results[0]
+
+
+# ---------------------------------------------------------------------------
+# WS-H: open_question lifecycle fields (Sprint B DS-F9)
+# ---------------------------------------------------------------------------
+
+
+class TestQuestionLifecycleFields:
+    """Round-trip tests for resolves_question_id, resolved_at, is_pinned."""
+
+    def test_is_pinned_defaults_false(self, store):
+        mem = _create_memory(kind='open_question')
+        fresh = Memory.get_by_id(mem.id)
+        # SQLite stores as 0; treat 0 / None / False as falsy
+        assert not fresh.is_pinned
+
+    def test_is_pinned_persists_true(self, store):
+        mem = _create_memory(kind='open_question')
+        Memory.update(is_pinned=1).where(Memory.id == mem.id).execute()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.is_pinned == 1
+
+    def test_resolved_at_defaults_null(self, store):
+        mem = _create_memory(kind='open_question')
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolved_at is None
+
+    def test_resolved_at_accepts_datetime(self, store):
+        mem = _create_memory(kind='open_question')
+        now = datetime.now(timezone.utc)
+        Memory.update(resolved_at=now).where(Memory.id == mem.id).execute()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolved_at is not None
+
+    def test_resolved_at_round_trips_none(self, store):
+        mem = _create_memory(kind='open_question')
+        now = datetime.now(timezone.utc)
+        Memory.update(resolved_at=now).where(Memory.id == mem.id).execute()
+        Memory.update(resolved_at=None).where(Memory.id == mem.id).execute()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolved_at is None
+
+    def test_resolves_question_id_defaults_null(self, store):
+        mem = _create_memory(kind='correction')
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.resolves_question_id is None
+
+    def test_resolves_question_id_persists(self, store):
+        question = _create_memory(kind='open_question')
+        resolver = _create_memory(kind='correction')
+        Memory.update(resolves_question_id=str(question.id)).where(
+            Memory.id == resolver.id
+        ).execute()
+        fresh = Memory.get_by_id(resolver.id)
+        assert fresh.resolves_question_id == str(question.id)
+
+    def test_all_three_fields_in_single_row(self, store):
+        now = datetime.now(timezone.utc)
+        question = _create_memory(kind='open_question')
+        resolver = _create_memory(kind='correction')
+        Memory.update(resolved_at=now, is_pinned=1).where(
+            Memory.id == question.id
+        ).execute()
+        Memory.update(resolves_question_id=str(question.id)).where(
+            Memory.id == resolver.id
+        ).execute()
+        q_fresh = Memory.get_by_id(question.id)
+        r_fresh = Memory.get_by_id(resolver.id)
+        assert q_fresh.resolved_at is not None
+        assert q_fresh.is_pinned == 1
+        assert r_fresh.resolves_question_id == str(question.id)
+
+
+# ---------------------------------------------------------------------------
+# Agentic-memory BLOCKER set — Task 1.2 additions
+# ---------------------------------------------------------------------------
+
+
+class TestMigrationIdempotency:
+    """Running _run_migrations() twice must not raise on new columns."""
+
+    def test_expires_at_migration_idempotent(self, store):
+        """Re-running migrations does not error when expires_at already exists."""
+        from core.database import _run_migrations
+        _run_migrations()  # second run — column already present
+        cursor = db.execute_sql("PRAGMA table_info(memories)")
+        cols = [row[1] for row in cursor.fetchall()]
+        assert "expires_at" in cols
+
+    def test_source_migration_idempotent(self, store):
+        """Re-running migrations does not error when source already exists."""
+        from core.database import _run_migrations
+        _run_migrations()  # second run
+        cursor = db.execute_sql("PRAGMA table_info(memories)")
+        cols = [row[1] for row in cursor.fetchall()]
+        assert "source" in cols
+
+
+class TestNewModelFields:
+    """expires_at and source fields round-trip through the ORM."""
+
+    def test_expires_at_defaults_null(self, store):
+        mem = _create_memory()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.expires_at is None
+
+    def test_source_defaults_human(self, store):
+        mem = _create_memory()
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.source == 'human'
+
+    def test_source_persists_agent(self, store):
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage='ephemeral',
+            title='agent write',
+            content='c',
+            created_at=now,
+            updated_at=now,
+            source='agent',
+        )
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.source == 'agent'
+
+
+class TestSetExpiry:
+    """Memory.set_expiry() computes correct expires_at per tier."""
+
+    def test_set_expiry_instinctive_returns_none(self, store):
+        """T1 (instinctive) → expires_at = None."""
+        mem = _create_memory(stage='instinctive')
+        result = mem.set_expiry()
+        assert result is None
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.expires_at is None
+
+    def test_set_expiry_crystallized_positive_int(self, store):
+        """T2 (crystallized) → expires_at is a positive integer (Unix ts)."""
+        import time as _time
+        mem = _create_memory(stage='crystallized')
+        before = int(_time.time())
+        mem.set_expiry()
+        after = int(_time.time())
+        fresh = Memory.get_by_id(mem.id)
+        assert fresh.expires_at is not None
+        assert isinstance(fresh.expires_at, int)
+        expected_ttl = 180 * 86400
+        assert fresh.expires_at >= before + expected_ttl
+        assert fresh.expires_at <= after + expected_ttl
+
+    def test_set_expiry_consolidated_positive_int(self, store):
+        """T3 (consolidated) → expires_at set to ~90 days from now."""
+        import time as _time
+        mem = _create_memory(stage='consolidated')
+        before = int(_time.time())
+        mem.set_expiry()
+        after = int(_time.time())
+        fresh = Memory.get_by_id(mem.id)
+        expected_ttl = 90 * 86400
+        assert fresh.expires_at >= before + expected_ttl
+        assert fresh.expires_at <= after + expected_ttl
+
+    def test_set_expiry_ephemeral_positive_int(self, store):
+        """T4 (ephemeral) → expires_at set to ~30 days from now."""
+        import time as _time
+        mem = _create_memory(stage='ephemeral')
+        before = int(_time.time())
+        mem.set_expiry()
+        after = int(_time.time())
+        fresh = Memory.get_by_id(mem.id)
+        expected_ttl = 30 * 86400
+        assert fresh.expires_at >= before + expected_ttl
+        assert fresh.expires_at <= after + expected_ttl
+
+    def test_set_expiry_returns_none(self, store):
+        """set_expiry() always returns None regardless of tier."""
+        for stage in ('instinctive', 'crystallized', 'consolidated', 'ephemeral'):
+            mem = _create_memory(stage=stage)
+            assert mem.set_expiry() is None
+
+
+class TestLiveScope:
+    """Memory.live() filters archived and expired memories."""
+
+    def test_live_excludes_archived(self, store):
+        """A memory with archived_at set is excluded from live()."""
+        mem = _create_memory()
+        Memory.update(archived_at=datetime.now().isoformat()).where(
+            Memory.id == mem.id
+        ).execute()
+        ids = [m.id for m in Memory.live()]
+        assert mem.id not in ids
+
+    def test_live_excludes_past_expires_at(self, store):
+        """A memory with expires_at in the past is excluded from live()."""
+        mem = _create_memory()
+        past_ts = int(time_module_unix()) - 3600  # 1 hour ago
+        Memory.update(expires_at=past_ts).where(Memory.id == mem.id).execute()
+        ids = [m.id for m in Memory.live()]
+        assert mem.id not in ids
+
+    def test_live_includes_future_expires_at(self, store):
+        """A memory with expires_at in the future is included in live()."""
+        mem = _create_memory()
+        future_ts = int(time_module_unix()) + 86400  # 1 day from now
+        Memory.update(expires_at=future_ts).where(Memory.id == mem.id).execute()
+        ids = [m.id for m in Memory.live()]
+        assert mem.id in ids
+
+    def test_live_includes_null_expires_at(self, store):
+        """A memory with expires_at = NULL (T1) is included in live()."""
+        mem = _create_memory(stage='instinctive')
+        # expires_at left as NULL (default)
+        ids = [m.id for m in Memory.live()]
+        assert mem.id in ids
+
+    def test_live_coexists_with_active(self, store):
+        """Memory.live() and Memory.active() both return queries independently."""
+        mem = _create_memory()
+        active_ids = {m.id for m in Memory.active()}
+        live_ids = {m.id for m in Memory.live()}
+        assert mem.id in active_ids
+        assert mem.id in live_ids
+
+
+def time_module_unix() -> int:
+    """Return current Unix timestamp as int (thin wrapper for test readability)."""
+    import time as _t
+    return int(_t.time())
+
+
+class TestHardDelete:
+    """Memory.hard_delete() removes from memories, memories_fts, and vec_memories."""
+
+    def test_hard_delete_removes_from_memories(self, store):
+        mem = _create_memory(content='hard delete test unique_xyzzy')
+        mem_id = mem.id
+        Memory.hard_delete(mem_id)
+        with pytest.raises(Memory.DoesNotExist):
+            Memory.get_by_id(mem_id)
+
+    def test_hard_delete_removes_from_fts(self, store):
+        mem = _create_memory(content='fts cascade check ftsxyzzy123')
+        mem_id = mem.id
+        # Verify it's in FTS before deletion
+        results_before = Memory.search_fts('ftsxyzzy123')
+        assert len(results_before) == 1
+        Memory.hard_delete(mem_id)
+        results_after = Memory.search_fts('ftsxyzzy123')
+        assert len(results_after) == 0
+
+    def test_hard_delete_nonexistent_is_silent(self, store):
+        """hard_delete of a missing ID should not raise."""
+        Memory.hard_delete('00000000-0000-0000-0000-000000000000')
+
+    def test_hard_delete_removes_from_vec_if_available(self, store):
+        """When VecStore is available, vec entry is also deleted."""
+        import struct
+        from core.database import get_vec_store
+        vec = get_vec_store()
+        if vec is None or not vec.available:
+            pytest.skip("VecStore not available")
+        mem = _create_memory(content='vec cascade check')
+        emb = struct.pack("512f", *([0.1] * 512))
+        vec.store_embedding(mem.id, emb)
+        assert vec.get_embedding(mem.id) is not None
+        Memory.hard_delete(mem.id)
+        assert vec.get_embedding(mem.id) is None

@@ -369,3 +369,232 @@ class TestContentAwareUsage:
         used_events = [e for e in events if e["event"] == "memory_used"]
         assert len(used_events) == 1
         assert 0 < used_events[0]["confidence"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestCardsUnusedInSubsequentSessions (Wave 3 Task 3.1)
+# ---------------------------------------------------------------------------
+
+
+class TestCardsUnusedInSubsequentSessions:
+    """DB-backed tests for cards_unused_in_subsequent_sessions()."""
+
+    from core.feedback import cards_unused_in_subsequent_sessions
+
+    def _make_memory_with_session(self, session_id, importance=0.9, ts_offset=0):
+        """Create a Memory row with source_session set and a deterministic timestamp."""
+        from datetime import datetime, timedelta
+        base_ts = datetime(2026, 1, 1, 0, 0, 0)
+        ts = (base_ts + timedelta(seconds=ts_offset)).isoformat()
+        mem = Memory.create(
+            stage="consolidated",
+            title=f"Memory from {session_id}",
+            summary="auto-generated",
+            content="some content",
+            importance=importance,
+            source_session=session_id,
+            created_at=ts,
+            updated_at=ts,
+        )
+        return mem.id
+
+    def _record_retrieval(self, memory_id, session_id, was_used=False, ts_offset=0):
+        """Insert a RetrievalLog row."""
+        from datetime import datetime, timedelta
+        base_ts = datetime(2026, 1, 2, 0, 0, 0)
+        ts = (base_ts + timedelta(hours=ts_offset)).isoformat()
+        RetrievalLog.create(
+            timestamp=ts,
+            session_id=session_id,
+            memory_id=memory_id,
+            retrieval_type="injected",
+            was_used=1 if was_used else 0,
+        )
+
+    def test_happy_path_returns_unused_ids(self, base):
+        """3 high-importance memories with 10 subsequent sessions but no retrieval hits."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-001"
+        mem_ids = [self._make_memory_with_session(src, importance=0.9, ts_offset=i) for i in range(3)]
+
+        # Create 10 distinct subsequent sessions with retrieval log entries (not for our memories)
+        other_mem = self._make_memory_with_session("other-session", importance=0.3, ts_offset=100)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"sub-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert sorted(result) == sorted(mem_ids)
+
+    def test_insufficient_lookahead_returns_empty(self, base):
+        """Fewer than `lookahead_sessions` exist → returns [] (no false positives)."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-002"
+        self._make_memory_with_session(src, importance=0.9, ts_offset=0)
+
+        # Only 5 subsequent sessions, lookahead=10 → insufficient
+        other_mem = self._make_memory_with_session("other-s", importance=0.3, ts_offset=50)
+        for i in range(5):
+            self._record_retrieval(other_mem, f"few-sess-{i}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert result == []
+
+    def test_below_threshold_importance_excluded(self, base):
+        """Memories below importance_threshold are not included in result."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-003"
+        high_id = self._make_memory_with_session(src, importance=0.9, ts_offset=0)
+        low_id = self._make_memory_with_session(src, importance=0.5, ts_offset=1)  # below 0.8
+
+        # 10 subsequent sessions
+        other_mem = self._make_memory_with_session("other-sess-003", importance=0.1, ts_offset=50)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"thr-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, importance_threshold=0.8, lookahead_sessions=10)
+        assert high_id in result
+        assert low_id not in result
+
+    def test_retrieved_memories_excluded(self, base):
+        """Memories that were retrieved (was_used=True) in the window are excluded."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-004"
+        used_id = self._make_memory_with_session(src, importance=0.9, ts_offset=0)
+        unused_id = self._make_memory_with_session(src, importance=0.9, ts_offset=1)
+
+        # 10 subsequent sessions; used_id gets retrieved in session 3
+        other_mem = self._make_memory_with_session("other-sess-004", importance=0.1, ts_offset=50)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"ret-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+        # Mark used_id as retrieved in ret-sess-03
+        self._record_retrieval(used_id, "ret-sess-03", was_used=True, ts_offset=4)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert used_id not in result
+        assert unused_id in result
+
+    def test_no_high_importance_memories_returns_empty(self, base):
+        """Source session has no high-importance memories → []."""
+        from core.feedback import cards_unused_in_subsequent_sessions
+
+        src = "src-session-005"
+        self._make_memory_with_session(src, importance=0.3, ts_offset=0)
+
+        other_mem = self._make_memory_with_session("other-sess-005", importance=0.1, ts_offset=50)
+        for i in range(10):
+            self._record_retrieval(other_mem, f"nhi-sess-{i:02d}", was_used=False, ts_offset=i + 1)
+
+        result = cards_unused_in_subsequent_sessions(src, lookahead_sessions=10)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# RISK-09: injection_count decoupling from importance / relevance scoring
+# ---------------------------------------------------------------------------
+
+
+class TestInjectionCountDecoupling:
+    """
+    Confirm that varying injection_count has no effect on importance (feedback)
+    or relevance scores (relevance engine).
+
+    These tests exist to guard against regressions that re-couple the two.
+    No LLM calls are made; all data is synthetic fixture data.
+    """
+
+    def _make_memory_dict(self, *, usage_count=0, injection_count=0, importance=0.5, **kwargs) -> dict:
+        """Build a memory-like dict for RelevanceEngine.compute_relevance()."""
+        now = datetime.now().isoformat()
+        return {
+            "id": "test-id",
+            "importance": importance,
+            "usage_count": usage_count,
+            "injection_count": injection_count,
+            "usage_count": usage_count,
+            "last_used_at": now,
+            "last_injected_at": now,
+            "updated_at": now,
+            "created_at": now,
+            "project_context": None,
+            "reinforcement_count": 0,
+            "stage": "consolidated",
+            "archived_at": None,
+            "subsumed_by": None,
+            "tags": "[]",
+            **kwargs,
+        }
+
+    def test_relevance_unchanged_when_injection_count_varies(self, base):
+        """
+        inject_count 1 vs 100 with same usage_count must produce identical
+        relevance scores (RISK-09 decoupling).
+        """
+        from core.relevance import RelevanceEngine
+        engine = RelevanceEngine()
+        now = datetime.now()
+
+        low_inject = self._make_memory_dict(usage_count=2, injection_count=1)
+        high_inject = self._make_memory_dict(usage_count=2, injection_count=100)
+
+        score_low = engine.compute_relevance(low_inject, now=now)
+        score_high = engine.compute_relevance(high_inject, now=now)
+
+        assert abs(score_low - score_high) < 1e-9, (
+            f"relevance changed with injection_count: {score_low} vs {score_high} — "
+            "injection_count is coupled to scoring (RISK-09 regression)"
+        )
+
+    def test_relevance_unchanged_when_injection_count_zero_vs_large(self, base):
+        """Edge case: zero vs large injection_count, zero usage_count."""
+        from core.relevance import RelevanceEngine
+        engine = RelevanceEngine()
+        now = datetime.now()
+
+        zero_inject = self._make_memory_dict(usage_count=0, injection_count=0)
+        large_inject = self._make_memory_dict(usage_count=0, injection_count=500)
+
+        score_zero = engine.compute_relevance(zero_inject, now=now)
+        score_large = engine.compute_relevance(large_inject, now=now)
+
+        assert abs(score_zero - score_large) < 1e-9, (
+            f"relevance changed with injection_count: {score_zero} vs {score_large}"
+        )
+
+    def test_importance_score_unchanged_when_injection_count_varies(self, base, feedback):
+        """
+        FeedbackLoop.update_importance_scores() must not change importance
+        differently based on injection_count value — only was_used matters.
+        """
+        # Two identical memories, different injection_count values.
+        # Neither is used in the session being scored.
+        mem_low = Memory.create(
+            stage="consolidated",
+            title="Low Inject Memory",
+            summary="nothing relevant here at all",
+            content="body",
+            importance=0.5,
+            injection_count=1,
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
+        mem_high = Memory.create(
+            stage="consolidated",
+            title="High Inject Memory",
+            summary="nothing relevant here at all",
+            content="body",
+            importance=0.5,
+            injection_count=999,
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
+
+        # Neither was seen in the session, no RetrievalLog rows → no consecutive
+        # unused trigger. Importance must stay at 0.5 for both.
+        feedback.update_importance_scores("new-session-xyz")
+
+        assert Memory.get_by_id(mem_low.id).importance == 0.5
+        assert Memory.get_by_id(mem_high.id).importance == 0.5

@@ -2,13 +2,13 @@
 
 1. **All persistence through `MemoryStore` or `database.py`.** Never write memory markdown files or SQLite rows directly. Atomic writes use `tempfile.mkstemp` + `shutil.move`.
 
-2. **Privacy filter before every LLM call.** The consolidator's privacy filter strips emotional state patterns before content reaches the API. Never bypass it, even in tests.
+2. **All LLM calls through `core.llm.call_llm()`.** Do not create `anthropic.Anthropic()` clients in service modules.
 
-3. **All LLM calls through `core.llm.call_llm()`.** Do not create `anthropic.Anthropic()` clients in service modules.
+3. **Tests never touch `~/.claude/memory`.** Use the `conftest.py` temporary directory fixtures.
 
-4. **Tests never touch `~/.claude/memory`.** Use the `conftest.py` temporary directory fixtures.
+4. **Skill invocations use full form.** `/memesis:learn`, `/memesis:recall`, `/memesis:forget` — not shorthand.
 
-5. **Skill invocations use full form.** `/memesis:learn`, `/memesis:recall`, `/memesis:forget` — not shorthand.
+5. **Behavioral framing for friction signals.** When observations describe user friction (giving up, retries, scope reductions), phrase as workflow patterns rather than feelings. Both forms are allowed; behavioral framing transfers better across sessions.
 
 ## Context
 

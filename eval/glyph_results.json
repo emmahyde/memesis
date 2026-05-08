@@ -1,0 +1,54 @@
+{
+  "timestamp": "2026-04-26T10:52:48.538955",
+  "model": "cl100k_base",
+  "tests": {
+    "flow-simple": {
+      "mermaid_tokens": 36,
+      "glyph_tokens": 33,
+      "ratio": 1.09,
+      "savings_pct": 8.3
+    },
+    "flow-chain": {
+      "mermaid_tokens": 34,
+      "glyph_tokens": 32,
+      "ratio": 1.06,
+      "savings_pct": 5.9
+    },
+    "erd-compact": {
+      "mermaid_tokens": 61,
+      "glyph_tokens": 33,
+      "ratio": 1.85,
+      "savings_pct": 45.9
+    },
+    "erd-dense": {
+      "mermaid_tokens": 92,
+      "glyph_tokens": 46,
+      "ratio": 2.0,
+      "savings_pct": 50.0
+    },
+    "seq-inferred": {
+      "mermaid_tokens": 43,
+      "glyph_tokens": 30,
+      "ratio": 1.43,
+      "savings_pct": 30.2
+    },
+    "class-basic": {
+      "mermaid_tokens": 39,
+      "glyph_tokens": 24,
+      "ratio": 1.62,
+      "savings_pct": 38.5
+    },
+    "flow-subgraph": {
+      "mermaid_tokens": 48,
+      "glyph_tokens": 40,
+      "ratio": 1.2,
+      "savings_pct": 16.7
+    }
+  },
+  "overall": {
+    "total_mermaid": 353,
+    "total_glyph": 238,
+    "avg_ratio": 1.48,
+    "avg_savings": 32.6
+  }
+}

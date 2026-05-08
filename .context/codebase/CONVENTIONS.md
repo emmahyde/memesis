@@ -1,5 +1,7 @@
 # Code Conventions
 
+> Last updated: 2026-05-06. Covers T1/T2/T3 wave patterns through Wave 4.
+
 ## Style
 
 - **Python 3.10+**: `requires-python = ">=3.10"` in `pyproject.toml`. No linter, formatter, or type checker configured -- no `ruff`, `black`, `flake8`, `mypy`, or `isort` in `pyproject.toml` or standalone config files. Formatting is consistent but enforced only by convention. Python 3.10+ syntax (`X | Y` union types, `tuple[A, B]` lowercase generics) is partially adopted in newer files; older files still use `Optional[X]`.
@@ -81,3 +83,61 @@ All importance updates use `max(0.1, ...)` on decay and `min(1.0, ...)` on boost
 ### Feature flag guards for optional behavior
 
 New optional behaviors are gated behind `get_flag()` checks. Examples: `get_flag("thompson_sampling")`, `get_flag("reconsolidation")`, `get_flag("contradiction_tensors")`, `get_flag("affect_awareness")` (`core/retrieval.py`, `core/reconsolidation.py`).
+
+---
+
+## T1/T2/T3 Wave Patterns (added 2026-05-06)
+
+### Write-site discipline for importance
+
+**Importance is preserved at the consolidator, not recomputed.** When an issue card is present in a consolidation decision (`"scope" in decision or "evidence_quotes" in decision`), the consolidator trusts `card.importance` as the base value — it already incorporates any somatic prior computed during Stage 1. The only transformation applied at the write site is the Kensinger friction bump (see below). Non-card decisions (raw observation path) retain the legacy formula `0.5 + importance_boost`.
+
+Concrete location: `core/consolidator.py:_execute_keep()` lines ~524-538. The test asserting this: `TestCardImportance.test_card_importance_flows_from_card_dict` (`tests/test_consolidator.py:927`).
+
+The anti-pattern to avoid: applying somatic classification *again* at the consolidator on top of a card-sourced importance value. That would double-count the signal.
+
+### Kensinger single-site friction bump
+
+The Kensinger 2009 friction bump (`+0.05` to importance for `user_affect_valence == "friction"`) is applied **only** at `core/consolidator.py:_execute_keep()`. No other module applies it.
+
+- The `ISSUE_SYNTHESIS_PROMPT` in `core/issue_cards.py` explicitly instructs the LLM *not* to pre-apply the bump: `"(Kensinger +0.05 friction bump is applied at persistence in consolidator.py, not here — do not pre-apply it.)"` (line ~103).
+- `TestRule3KensingerRemoved` (`tests/test_issue_cards.py:343`) verifies the prompt does not contain `"bump +0.05"` or `"Kensinger 2009"` text.
+- `TestCardImportance.test_friction_valence_triggers_kensinger_bump` (`tests/test_consolidator.py:939`) verifies `importance == 0.85` when card importance is `0.8` and valence is `"friction"`.
+- `TestCardImportance.test_non_friction_card_does_not_get_kensinger_bump` verifies delight cards are NOT bumped.
+
+### Card-field wiring: criterion_weights and rejected_options
+
+Decision cards produced by Stage 1.5 (`core/issue_cards.py`) can include two decision-specific fields that are now round-tripped through to `Memory` rows:
+
+- `criterion_weights`: `dict[str, Literal["hard_veto", "strong", "weak", "mentioned"]]` — stored as JSON string in `Memory.criterion_weights` (`core/models.py:125`).
+- `rejected_options`: `list[dict]` with keys `option` and `reason` — stored as JSON string in `Memory.rejected_options` (`core/models.py:126`).
+
+Both fields are extracted by `extract_card_memory_fields()` in `core/issue_cards.py:370-398` and written by `_execute_keep()` in `core/consolidator.py:558-559`. When the card dict does not include either field, the column is stored as `NULL` (not `'{}'` or `'[]'`). Callers reading the fields must handle `None` and parse with `json.loads()`.
+
+Round-trip contract: `json.loads(mem.criterion_weights) == original_dict` exactly. Tests in `TestCardFieldsNewWiring` (`tests/test_consolidator.py:1026`) cover storage, round-trip fidelity, and NULL-on-absent behavior.
+
+`extract_card_memory_fields()` also maps `scope → temporal_scope`, `knowledge_type_confidence → confidence` (high→0.9, low→0.5, else→0.7), `user_affect_valence → affect_valence`, and actor extraction from `evidence_quotes` via capitalized-word regex.
+
+### Evidence-indices validators with demotion-to-orphan logic
+
+`core/card_validators.py` provides pure-predicate functions used by `synthesize_issue_cards()` in `core/issue_cards.py` to validate LLM output:
+
+- `_card_evidence_indices_valid(card, window_count)`: returns `True` if at least one entry in `evidence_obs_indices` is an in-range integer `[0, window_count)`. Cards with `[]` or all-hallucinated indices (e.g. `[999]` when only 5 windows exist) return `False`.
+- `_card_evidence_load_bearing(card)`: checks that single-quote cards are not self-referential (pronoun presence, imperative start, or novel technical token not in the card body). Multi-quote cards pass automatically.
+
+**Demotion pipeline** in `synthesize_issue_cards()` (`core/issue_cards.py:293-320`):
+1. Out-of-range or non-integer indices are stripped from `evidence_obs_indices`.
+2. Cards where `_card_evidence_indices_valid` returns `False` are demoted: `card["demoted_invalid_indices"] = True`, appended to `orphans`, removed from `valid_cards`. The `stats` dict includes `dropped_invalid_indices` (count of stripped indices) and `cards_invalid_indices_demoted` (count of demoted cards).
+3. Cards surviving index validation are then filtered for `evidence_quotes` presence.
+
+A card with even **one** valid index is not demoted; partial-valid indices are allowed (only the invalid entries are stripped). Tests: `TestAllIndicesInvalidDemotion` (`tests/test_issue_cards.py:355`) and `TestEvidenceIndicesValidation` (`tests/test_issue_cards.py:213`).
+
+### Orphan quality gate
+
+`synthesize_issue_cards()` treats orphaning as a quality signal, not a fallback. The prompt rules (6–10 in `ISSUE_SYNTHESIS_PROMPT`) enforce:
+- ENTITY GATE (Rule 6): observations sharing no named entity with any other must be orphaned, not force-fit into a card.
+- ORPHAN TARGET (Rule 7): aim for ≥1 orphan per 15 input observations unless the session is monothematic.
+- ZERO-ORPHAN AUDIT (Rule 8): if `orphans == []` and `len(issue_cards) > 8`, every card must be re-examined.
+- DROP GATE (Rule 10): observations with `importance < 0.3` sharing no entity sibling may be dropped entirely (not even orphaned).
+
+Demoted cards (from invalid-indices logic) are appended to `orphans[]` and thus contribute to the orphan count in `stats`.

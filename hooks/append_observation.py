@@ -22,6 +22,8 @@ from pathlib import Path
 # Allow running from any directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from hooks._safe import emit_stderr
+
 from core.prompts import OBSERVATION_TYPES, format_observation
 
 
@@ -54,17 +56,21 @@ def append(buffer_path: str, observation: str, obs_type: str = None) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Append observation to ephemeral buffer"
-    )
-    parser.add_argument("buffer_path", help="Path to the ephemeral session buffer")
-    parser.add_argument("observation", help="Observation text")
-    parser.add_argument(
-        "--type",
-        dest="obs_type",
-        choices=list(OBSERVATION_TYPES.keys()),
-        help="Observation type for structured metadata",
-    )
+    try:
+        parser = argparse.ArgumentParser(
+            description="Append observation to ephemeral buffer"
+        )
+        parser.add_argument("buffer_path", help="Path to the ephemeral session buffer")
+        parser.add_argument("observation", help="Observation text")
+        parser.add_argument(
+            "--type",
+            dest="obs_type",
+            choices=list(OBSERVATION_TYPES.keys()),
+            help="Observation type for structured metadata",
+        )
 
-    args = parser.parse_args()
-    append(args.buffer_path, args.observation, obs_type=args.obs_type)
+        args = parser.parse_args()
+        append(args.buffer_path, args.observation, obs_type=args.obs_type)
+    except Exception as exc:
+        emit_stderr(f"AppendObservation error: {exc}")
+        sys.exit(1)

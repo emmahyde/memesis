@@ -1,139 +1,246 @@
 """
 Somatic marker classification — tags observations with emotional valence.
 
-Four valence categories:
-- neutral: no emotional signal detected
-- friction: frustration, conflict, correction, failure
-- surprise: unexpected result, discovery, contradiction
-- delight: success, praise, excitement, satisfaction
+Returns scores on three independent axes (friction, surprise, delight).
+Callers use whichever axes they need — no forced single-label priority.
 
-Non-neutral valence bumps the observation's importance score.
-Pure rule-based — no LLM call.
+Detection:
+- friction / delight: VADER compound score + dev-vocabulary lexicon overrides
+- surprise: NRC Emotion Lexicon word lookup (direct JSON, no textblob dep)
+             + colloquial regex fallback ("turns out", "wow", "wait what", etc.)
+
+`SomaticResult.valence` is the dominant axis (highest weighted score) for
+callers that need a single label. `SomaticResult.emotion_scores` exposes all
+axes for callers that want the full picture.
 """
 
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
-# Importance boosts by valence (added to base importance)
+# RISK-11: experimental flag scaffold.
+# somatic is production-validated (VADER + NRC + dev-lexicon tri-axis classification confirmed stable).
+# Opt-in override: include "somatic" in MEMESIS_EXPERIMENTAL_MODULES env var to force-exclude from scoring.
+experimental: bool = False
+
 VALENCE_BOOSTS = {
     "neutral": 0.0,
     "friction": 0.25,
     "surprise": 0.20,
     "delight": 0.10,
+    "uncertainty": 0.15,  # user unsure/nervous at decision time — captures state, not observation quality
 }
 
-# Pattern lists — checked in priority order (friction > surprise > delight > neutral)
-_FRICTION_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"\bno[,.]?\s+that'?s\s+wrong\b",
-        r"\bactually\b",
-        r"\bnot\s+what\s+I\b",
-        r"\bI\s+said\b",
-        r"\bfrustrat",
-        r"\banno[yi]",
-        r"\bwrong\b",
-        r"\bbroken\b",
-        r"\bfail(?:ed|ure|ing|s)?\b",
-        r"\berror\b",
-        r"\bbug\b",
-        r"\bcrash(?:ed|es|ing)?\b",
-        r"\bregress(?:ion|ed)?\b",
-        r"\bwaste[ds]?\b",
-        r"\bstuck\b",
-        r"\bblock(?:ed|er|ing)?\b",
-        r"\bconfus(?:ed|ing)\b",
-        r"\bugh\b",
-        r"\barg\b",
-        r"\bfuck\b",
-        r"\bshit\b",
-        r"\bdamn\b",
-        r"\bforget\s+(?:it|this)\b",
-        r"\bdelete\s+all\b",
-        r"\bnuke\b",
-    ]
-]
+# VADER compound → axis intensity mapping
+_FRICTION_THRESHOLD = -0.05   # compound ≤ this → some friction
+_DELIGHT_THRESHOLD  =  0.05   # compound ≥ this → some delight
 
-_SURPRISE_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"\bunexpect(?:ed|edly)?\b",
-        r"\bsurpris(?:ed|ing|ingly)?\b",
-        r"\bwow\b",
-        r"\bwhoa\b",
-        r"\bwait\s+what\b",
-        r"\bholy\s+shit\b",
-        r"\boh\s+my\b",
-        r"\bdidn'?t\s+(?:know|expect|realize)\b",
-        r"\bturns?\s+out\b",
-        r"\bcontradicts?\b",
-        r"\bactually\s+(?:it|this|that)\s+(?:is|was)\b",
-        r"\bnever\s+(?:seen|noticed|knew)\b",
-        r"\bdiscover(?:ed|y)?\b",
-    ]
-]
+# NRC fraction of words with 'surprise' tag required to score surprise
+_NRC_SURPRISE_THRESHOLD = 0.10
 
-_DELIGHT_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"\bperfect\b",
-        r"\bexcellent\b",
-        r"\bamazin[gly]?\b",
-        r"\bbeautiful\b",
-        r"\blove\s+(?:it|this|that)\b",
-        r"\bgreat\s+(?:job|work)\b",
-        r"\bnice\b",
-        r"\bawesome\b",
-        r"\bbrilliant\b",
-        r"\bexactly\s+(?:right|what)\b",
-        r"\bnailed\s+it\b",
-        r"\byes!\b",
-        r"\b(?:we|you)'?re\s+genius",
-        r"\bship\s+it\b",
-        r"\bcelebrat",
-    ]
-]
+# Dev-vocabulary overrides for VADER's social-media lexicon (-4..+4 scale)
+_DEV_LEXICON: dict[str, float] = {
+    "crash": -3.0, "crashed": -3.0,
+    "regression": -2.5, "regressed": -2.5,
+    "blocked": -2.0, "blocker": -2.5,
+    "broken": -2.5, "deadlock": -2.5,
+    "flaky": -2.0, "corrupt": -2.5, "corrupted": -2.5,
+    "stale": -1.5, "ugh": -2.0, "nope": -1.5,
+    "cancel": -1.5, "revert": -1.5, "rollback": -1.5,
+    "undo": -1.0, "nuke": -3.0, "wipe": -1.5,
+    "purge": -1.5, "scrap": -2.0, "delete": -2.0, "remove": -1.0,
+    "actually": -1.5,  # correction marker — VADER treats as neutral
+    "contradicts": -1.5,
+    # delight
+    "shipped": 2.5, "passing": 1.5, "green": 1.0,
+    "elegant": 2.0, "clean": 1.5, "fast": 1.5,
+    "nailed": 2.5, "solved": 2.0, "fixed": 1.5,
+}
+
+# Uncertainty — user nervous/unsure about a decision. NRC "fear" covers some
+# of this but misses multi-word doubt phrases. Targeted regex + NRC fear axis.
+_UNCERTAINTY_RE = re.compile(
+    r"\b(not\s+sure|not\s+certain|unsure|uncertain|i\s+think\s+but|"
+    r"might\s+be\s+wrong|could\s+be\s+wrong|worried\s+(that|about)|"
+    r"not\s+confident|risky|might\s+break|could\s+break|"
+    r"i\s+don'?t\s+(know|get)|unclear|ambiguous|"
+    r"not\s+100|not\s+entirely|not\s+fully\s+sure)\b",
+    re.IGNORECASE,
+)
+
+_SURPRISE_COLLOQUIAL = re.compile(
+    r"\b(wow|whoa|wait\s+what|holy\s+shit|oh\s+my|huh\??"
+    r"|turns?\s+out|didn'?t\s+(know|expect|realize)"
+    r"|never\s+(seen|noticed|knew)|actually\s+(it|this|that)\s+(is|was)"
+    r"|contradicts?)\b",
+    re.IGNORECASE,
+)
+
+_NON_TYPED_PREFIXES = (
+    "Base directory for this skill:",
+    "<command-message>",
+    "<command-name>",
+    "<system-reminder>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "This session is being continued",
+)
+
+_vader_analyzer = None
+_nrc_lexicon: dict[str, list[str]] | None = None
+
+
+def _get_vader():
+    global _vader_analyzer
+    if _vader_analyzer is not None:
+        return _vader_analyzer
+    try:
+        from nltk.sentiment.vader import SentimentIntensityAnalyzer
+        import nltk
+    except ImportError:
+        return None
+    try:
+        _vader_analyzer = SentimentIntensityAnalyzer()
+    except LookupError:
+        try:
+            nltk.download("vader_lexicon", quiet=True)
+            _vader_analyzer = SentimentIntensityAnalyzer()
+        except Exception:
+            return None
+    _vader_analyzer.lexicon.update(_DEV_LEXICON)
+    return _vader_analyzer
+
+
+def _get_nrc() -> dict[str, list[str]] | None:
+    global _nrc_lexicon
+    if _nrc_lexicon is not None:
+        return _nrc_lexicon
+    try:
+        import nrclex.core as _nrc_core
+        data_path = Path(_nrc_core.__file__).parent / "data" / "nrc_en.json"
+        with open(data_path) as f:
+            _nrc_lexicon = json.load(f)
+        return _nrc_lexicon
+    except Exception:
+        return None
+
+
+def _nrc_surprise_score(text: str) -> float:
+    lex = _get_nrc()
+    if lex is None:
+        return 0.0
+    words = re.findall(r"\b[a-z]+\b", text.lower())
+    if not words:
+        return 0.0
+    return sum(1 for w in words if "surprise" in lex.get(w, [])) / len(words)
+
+
+def _is_typed_user_text(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return False
+    if any(s.startswith(p) for p in _NON_TYPED_PREFIXES):
+        return False
+    if s.startswith("# ") and len(s) > 200:
+        return False
+    if s.startswith("---\n"):
+        return False
+    if "Generated by" in s[:200] and "session_analysis" in s[:300]:
+        return False
+    if len(s) > 800:
+        return False
+    return True
 
 
 @dataclass
 class SomaticResult:
-    """Result of somatic marker classification."""
-    valence: str  # "neutral", "friction", "surprise", "delight"
-    importance_boost: float  # how much to add to base importance
-    matched_patterns: list[str]  # which patterns fired (for debugging)
+    """Multi-axis emotion scores for a user turn.
+
+    emotion_scores: {"friction": 0..1, "surprise": 0..1, "delight": 0..1}
+    valence: dominant axis label (for callers needing a single label)
+    importance_boost: max boost across axes
+    matched_patterns: evidence strings for debugging
+    """
+    emotion_scores: dict[str, float] = field(default_factory=dict)
+    matched_patterns: list[str] = field(default_factory=list)
+
+    @property
+    def valence(self) -> str:
+        if not self.emotion_scores:
+            return "neutral"
+        best = max(self.emotion_scores, key=lambda k: self.emotion_scores[k] * VALENCE_BOOSTS.get(k, 0))
+        return best if self.emotion_scores[best] > 0 else "neutral"
+
+    @property
+    def importance_boost(self) -> float:
+        """Full boost of the dominant axis — backward-compatible with old single-label API.
+        Intensity (0..1) is in emotion_scores; this gives the fixed-magnitude boost
+        callers use to bump observation importance."""
+        v = self.valence
+        return VALENCE_BOOSTS.get(v, 0.0)
 
 
 def classify_valence(text: str) -> SomaticResult:
-    """Classify the emotional valence of an observation text.
+    """Score text on friction, surprise, and delight axes independently.
 
-    Priority order: friction > surprise > delight > neutral.
-    Returns the highest-priority match.
+    Returns a SomaticResult with emotion_scores populated for all detected axes.
+    Falls back to regex if VADER is unavailable.
     """
     from .flags import get_flag
 
     if not get_flag("somatic_markers"):
-        return SomaticResult(valence="neutral", importance_boost=0.0, matched_patterns=[])
+        return SomaticResult()
 
-    # Check in priority order
-    friction_matches = [p.pattern for p in _FRICTION_PATTERNS if p.search(text)]
-    if friction_matches:
-        return SomaticResult(
-            valence="friction",
-            importance_boost=VALENCE_BOOSTS["friction"],
-            matched_patterns=friction_matches,
+    if not _is_typed_user_text(text):
+        return SomaticResult()
+
+    scores: dict[str, float] = {}
+    patterns: list[str] = []
+
+    analyzer = _get_vader()
+    if analyzer is not None:
+        compound = analyzer.polarity_scores(text)["compound"]
+        patterns.append(f"vader:{compound:.3f}")
+        if compound <= _FRICTION_THRESHOLD:
+            # Map compound [-1, threshold] → intensity [1, 0]
+            scores["friction"] = min(1.0, abs(compound))
+        if compound >= _DELIGHT_THRESHOLD:
+            scores["delight"] = min(1.0, compound)
+    else:
+        # Regex fallback for friction/delight
+        _FRICTION_RE = re.compile(
+            r"\b(frustrat|wrong|broken|fail(ed|ure|ing|s)?|error|bug"
+            r"|crash(ed|es|ing)?|stuck|ugh|cancel\s+(that|this|it)"
+            r"|start\s+over|not\s+(that|this|right|correct))\b",
+            re.IGNORECASE,
         )
-
-    surprise_matches = [p.pattern for p in _SURPRISE_PATTERNS if p.search(text)]
-    if surprise_matches:
-        return SomaticResult(
-            valence="surprise",
-            importance_boost=VALENCE_BOOSTS["surprise"],
-            matched_patterns=surprise_matches,
+        _DELIGHT_RE = re.compile(
+            r"\b(perfect|excellent|awesome|nailed\s+it|ship\s+it)\b",
+            re.IGNORECASE,
         )
+        if _FRICTION_RE.search(text):
+            scores["friction"] = 1.0
+            patterns.append("regex_fallback:friction")
+        if _DELIGHT_RE.search(text):
+            scores["delight"] = 1.0
+            patterns.append("regex_fallback:delight")
 
-    delight_matches = [p.pattern for p in _DELIGHT_PATTERNS if p.search(text)]
-    if delight_matches:
-        return SomaticResult(
-            valence="delight",
-            importance_boost=VALENCE_BOOSTS["delight"],
-            matched_patterns=delight_matches,
-        )
+    # Surprise axis — NRC lexicon + colloquial regex (independent of VADER)
+    nrc_score = _nrc_surprise_score(text)
+    colloquial = _SURPRISE_COLLOQUIAL.search(text)
+    if nrc_score >= _NRC_SURPRISE_THRESHOLD:
+        scores["surprise"] = min(1.0, nrc_score * 5)
+        patterns.append(f"nrc:{nrc_score:.2f}")
+    elif colloquial:
+        scores["surprise"] = 0.8
+        patterns.append(f"colloquial:{colloquial.group()}")
 
-    return SomaticResult(valence="neutral", importance_boost=0.0, matched_patterns=[])
+    # Uncertainty axis — user nervous/unsure at decision time.
+    # NRC "fear" is too noisy (tags "broken", "failed", "crash" as fear — those
+    # are friction, not uncertainty). Use only targeted doubt phrases.
+    if _UNCERTAINTY_RE.search(text):
+        scores["uncertainty"] = 0.8
+        patterns.append("uncertainty_phrase")
+
+    return SomaticResult(emotion_scores=scores, matched_patterns=patterns)

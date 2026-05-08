@@ -13,8 +13,11 @@ The relevance score uses an exponential decay model:
 
 Where:
     recency      = 0.5 ^ (days_since_last_activity / half_life)
-    usage_signal = clamp(0.3 + 0.7 * (usage_count / max(injection_count, 1)), 0.3, 1.0)
+    usage_signal = clamp(0.3 + 0.7 * (usage_count / 5), 0.0, 1.0)
     context_boost = 1.5 when project matches, 1.0 otherwise
+
+NOTE: usage_signal is decoupled from injection_count (RISK-09). injection_count
+is still tracked in the DB for observability, but does not affect scoring.
 
 This produces a smooth decay curve — memories fade gradually, never cliff-edge.
 """
@@ -100,23 +103,35 @@ class RelevanceEngine:
         days_since = self._days_since_last_activity(memory, now)
         recency = 0.5 ** (days_since / self.half_life_days) if self.half_life_days > 0 else 1.0
 
-        # Usage signal: memories that are actually used (not just injected) get boosted
+        # Usage signal: reflects confirmed utility, not injection frequency.
+        # Decoupled from injection_count (RISK-09): using injection_count as the
+        # denominator created a feedback loop where frequently-retrieved memories
+        # appeared more useful regardless of actual confirmed usage.
+        # New formula: saturating function over usage_count alone.
+        # A memory used 5+ times earns full signal; zero-usage starts at 0.3.
         usage_count = _get("usage_count", 0) or 0
-        injection_count = max(_get("injection_count", 0) or 0, 1)
-        usage_ratio = usage_count / injection_count
-        usage_signal = min(1.0, 0.3 + 0.7 * usage_ratio)
+        _USAGE_SATURATION = 5  # confirmed uses for full usage_signal
+        usage_signal = min(1.0, 0.3 + 0.7 * (usage_count / _USAGE_SATURATION))
 
         # Context boost: memories from the same project are more relevant
         context_boost = 1.0
         if project_context and _get("project_context") == project_context:
             context_boost = 1.5
 
-        # Saturation penalty: memories injected often but never used
+        # Saturation penalty: memories confirmed as unused in recent injections.
+        # Previously used injection_count as the accumulator (RISK-09 coupling).
+        # Now uses confirmed usage_count as the baseline: memories with zero
+        # confirmed uses accumulate a penalty up to 0.3. This preserves the
+        # saturation signal without coupling it to raw injection frequency.
         from .flags import get_flag
         saturation_penalty = 0.0
         if get_flag("saturation_decay"):
-            unused_injections = max((_get("injection_count", 0) or 0) - usage_count, 0)
-            saturation_penalty = min(0.3, unused_injections * 0.05)
+            # Penalty scales with how under-used the memory is relative to
+            # a low baseline (1 confirmed use clears the first penalty step).
+            # injection_count is preserved in the DB for observability (RISK-09),
+            # but does not contribute to this calculation.
+            unused_count = max(1 - usage_count, 0)  # 0 if used at least once
+            saturation_penalty = min(0.3, unused_count * 0.1)
 
         # Integration factor: isolated memories decay faster
         integration_factor = 1.0
@@ -137,6 +152,43 @@ class RelevanceEngine:
                 integration_factor = 0.75
             # else: connected — no penalty (1.0)
 
+        # W5 schema-promoted fields (Wave 3a). Wired behind flags so unset
+        # columns are no-op for legacy memories.
+        # affect_valence: Kensinger prior — friction-bearing memories are
+        #   load-bearing in similar future contexts; surface them earlier.
+        # temporal_scope: session-local memories should not follow the user
+        #   across sessions; cross-session-durable get a small lift.
+        # confidence: multiplicative tie-breaker for extraction certainty.
+        affect_factor = 1.0
+        if get_flag("affect_weighted_retrieval"):
+            valence = _get("affect_valence")
+            if valence == "friction":
+                affect_factor = 1.20
+            elif valence == "delight":
+                affect_factor = 1.10
+            elif valence == "surprise":
+                affect_factor = 1.05
+            # neutral / mixed / None: no change
+
+        scope_factor = 1.0
+        if get_flag("temporal_scope_weighting"):
+            scope = _get("temporal_scope")
+            if scope == "session-local":
+                scope_factor = 0.6
+            elif scope == "cross-session-durable":
+                scope_factor = 1.10
+            elif scope == "permanent":
+                scope_factor = 1.20
+            # None / unset: no change
+
+        confidence_factor = 1.0
+        if get_flag("confidence_weighting"):
+            confidence = _get("confidence")
+            if confidence is not None:
+                # Map [0.0, 1.0] confidence → [0.7, 1.0] factor so low-confidence
+                # memories are demoted but never zeroed out.
+                confidence_factor = 0.7 + 0.3 * max(0.0, min(1.0, float(confidence)))
+
         # Weighted geometric mean
         relevance = (
             (importance ** 0.4)
@@ -144,6 +196,9 @@ class RelevanceEngine:
             * (usage_signal ** 0.2)
             * (context_boost ** 0.1)
             * integration_factor
+            * affect_factor
+            * scope_factor
+            * confidence_factor
         )
 
         # Apply saturation penalty as subtraction (post-multiply)

@@ -1,0 +1,13 @@
+{
+  "enabledPlugins": {
+    "memesis@memesis-local": true
+  },
+  "extraKnownMarketplaces": {
+    "memesis-local": {
+      "source": {
+        "source": "directory",
+        "path": "/Users/emmahyde/projects/memesis"
+      }
+    }
+  }
+}

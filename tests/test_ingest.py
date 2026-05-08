@@ -156,3 +156,12 @@ class TestIngestor:
         NativeMemoryIngestor().ingest()
         auth = next(m for m in Memory.by_stage("consolidated") if m.title == "Auth Rewrite")
         assert "Auth middleware rewrite driven by legal compliance" in auth.content
+
+    def test_ingested_memory_has_null_card_fields(self, base, native_dir, monkeypatch):
+        # D3: non-card write path must leave criterion_weights, rejected_options, affect_valence as NULL
+        monkeypatch.setattr("core.ingest.find_native_memory_dir", lambda ctx: native_dir)
+        NativeMemoryIngestor().ingest()
+        mem = next(m for m in Memory.by_stage("consolidated"))
+        assert mem.criterion_weights is None
+        assert mem.rejected_options is None
+        assert mem.affect_valence is None

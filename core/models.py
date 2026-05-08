@@ -9,12 +9,14 @@ import hashlib
 import json
 import logging
 import re
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from peewee import (
     AutoField,
     CompositeKey,
+    DateTimeField,
     FloatField,
     IntegerField,
     Model,
@@ -79,9 +81,81 @@ class Memory(BaseModel):
     next_injection_due = TextField(null=True)
     injection_ease_factor = FloatField(default=2.5, null=True)
     injection_interval_days = FloatField(default=1.0, null=True)
+    files_modified = TextField(null=True, default="[]")  # JSON array of relative paths
+
+    # W2 schema additions
+    kind = TextField(null=True)                       # decision | finding | preference | constraint | correction | open_question
+    knowledge_type = TextField(null=True)             # factual | conceptual | procedural | metacognitive
+    knowledge_type_confidence = TextField(null=True)  # low | high
+    subject = TextField(null=True)                    # self | user | system | collaboration | workflow | aesthetic | domain
+    work_event = TextField(null=True)                 # bugfix | feature | refactor | discovery | change | null
+    subtitle = TextField(null=True)                   # ≤24 words retrieval card
+    cwd = TextField(null=True)                        # multi-project attribution
+    session_type = TextField(null=True)               # code | writing | research | null (Sprint B forward-compat)
+    raw_importance = FloatField(null=True)            # Stage 1 importance, preserved for audit (C7)
+    linked_observation_ids = TextField(null=True)     # JSON-serialized list of UUIDs
+
+    # WS-H: open_question lifecycle fields (Sprint B DS-F9)
+    resolves_question_id = TextField(null=True)   # UUID of the open_question this memory resolves
+    resolved_at = DateTimeField(null=True)         # when this question was resolved (set on question row)
+    is_pinned = IntegerField(default=0, null=True) # 1 = exempt from auto-pruning (open_questions)
+
+    # DS-F3 forward-compat: shadow-prune logger fields
+    access_count = IntegerField(default=0, null=True)
+    last_accessed_at = DateTimeField(null=True)
+    # NOTE: created_at already exists as TextField; w2_created_at captures timezone-aware value
+    w2_created_at = DateTimeField(null=True, default=lambda: datetime.now(timezone.utc))
+
+    # Agentic-memory BLOCKER set (B4 + E3)
+    expires_at = IntegerField(null=True)          # Unix timestamp; NULL = never expires (T1)
+    source = TextField(default='human')           # 'human' | 'agent'; guards poisoning (E3)
+
+    # Stage 1.5 / tasks #14-#18: extended observation metadata
+    temporal_scope = TextField(null=True)         # session-local | cross-session-durable; gates expiry/injection
+    extraction_confidence = FloatField(null=True) # 0-1 certainty of extraction; distinct from raw_importance
+    actor = TextField(null=True)                  # user | assistant | system | external; who produced the observation
+    polarity = TextField(null=True)               # positive | negative | corrective | neutral; sign within kind=finding
+    revisable = TextField(default='0', null=True) # '0'=stable, '1'=provisional; reciprocal to is_pinned
+
+    # Task 3.1 — card→memory field promotion (Wave 3)
+    confidence = FloatField(null=True)            # 0.0–1.0; default 0.7 at write time; derived from knowledge_type_confidence
+    affect_valence = TextField(null=True)         # friction|delight|surprise|neutral|mixed
+
+    # Tier-3 audit (Wave A): fields returned by extract_card_memory_fields() but previously dropped by consolidator
+    criterion_weights = TextField(null=True)  # JSON dict: {criterion: hard_veto|strong|weak|mentioned}
+    rejected_options = TextField(null=True)   # JSON list: [{option, reason}]
+
+    # RISK-12: hypothesis evidence tracking (Wave 2.2)
+    # kind is already defined above (W2 schema); evidence_count and evidence_session_ids are new.
+    evidence_count = IntegerField(default=0, null=True)          # number of sessions that observed this hypothesis
+    evidence_session_ids = TextField(default='[]', null=True)    # JSON array of session IDs that contributed evidence
 
     class Meta:
         table_name = "memories"
+
+    # -- Convenience accessors -----------------------------------------
+
+    @property
+    def linked_observations(self) -> list[str]:
+        """Parse linked_observation_ids JSON into a Python list. Empty list on null/error."""
+        if not self.linked_observation_ids:
+            return []
+        try:
+            value = json.loads(self.linked_observation_ids)
+            return value if isinstance(value, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    @property
+    def files_list(self) -> list[str]:
+        """Parse files_modified JSON into a Python list. Empty list on error."""
+        import json as _json
+        raw = self.files_modified or "[]"
+        try:
+            value = _json.loads(raw)
+            return value if isinstance(value, list) else []
+        except (ValueError, TypeError):
+            return []
 
     # -- Scopes --------------------------------------------------------
 
@@ -89,6 +163,75 @@ class Memory(BaseModel):
     def active(cls):
         """Return a query for non-archived memories."""
         return cls.select().where(cls.archived_at.is_null())
+
+    @classmethod
+    def live(cls):
+        """Return a query for non-archived, non-expired memories.
+
+        Includes memories where expires_at is NULL (never-expire, T1) or
+        expires_at is in the future.  Does NOT replace active() — both coexist.
+        """
+        now_ts = int(time.time())
+        return cls.select().where(
+            cls.archived_at.is_null()
+            & (cls.expires_at.is_null() | (cls.expires_at > now_ts))
+        )
+
+    def set_expiry(self) -> None:
+        """Compute and persist expires_at based on this memory's stage/tier.
+
+        T1 (instinctive) → expires_at = None (never expire).
+        All other tiers → expires_at = int(time.time()) + tier_ttl(stage_to_tier(stage)).
+        Calls self.save() to persist.
+        """
+        from .tiers import stage_to_tier, tier_ttl
+        ttl = tier_ttl(stage_to_tier(self.stage))
+        if ttl is None:
+            self.expires_at = None
+        else:
+            self.expires_at = int(time.time()) + ttl
+        self.save()
+        return None
+
+    @classmethod
+    def hard_delete(cls, memory_id: str) -> None:
+        """Hard-delete a memory with cascade to FTS5 and vec_memories.
+
+        All three DELETE statements run inside a single db.atomic() block.
+        This is the ONLY sanctioned path for raw deletion — no app code
+        should issue raw DELETE FROM memories outside this method.
+        """
+        from .database import get_vec_store
+        with db.atomic():
+            # FTS5 cascade: fetch current DB values first (same as _fts_delete_from_db)
+            cursor = db.execute_sql(
+                "SELECT rowid, title, summary, tags, content FROM memories WHERE id = ?",
+                (memory_id,),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                rowid, title, summary, tags, content = row
+                db.execute_sql(
+                    "INSERT INTO memories_fts(memories_fts, rowid, title, summary, tags, content) "
+                    "VALUES('delete', ?, ?, ?, ?, ?)",
+                    (rowid, title or "", summary or "", tags or "", content or ""),
+                )
+            # vec_memories cascade (no-op when VecStore unavailable)
+            vec_store = get_vec_store()
+            if vec_store is not None and vec_store.available:
+                try:
+                    conn = vec_store._connect()
+                    try:
+                        conn.execute(
+                            "DELETE FROM vec_memories WHERE memory_id = ?",
+                            (memory_id,),
+                        )
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+            # Primary row
+            db.execute_sql("DELETE FROM memories WHERE id = ?", (memory_id,))
 
     @classmethod
     def by_stage(cls, stage, include_archived=False):
@@ -378,6 +521,10 @@ class RetrievalLog(BaseModel):
     was_used = IntegerField(default=0)
     relevance_score = FloatField(null=True)
     project_context = TextField(null=True)
+    query_text = TextField(null=True)
+    limit_count = IntegerField(null=True)
+    selected_count = IntegerField(null=True)
+    metadata = TextField(null=True)
 
     class Meta:
         table_name = "retrieval_log"
@@ -399,6 +546,99 @@ class ConsolidationLog(BaseModel):
     from_stage = TextField(null=True)
     to_stage = TextField(null=True)
     rationale = TextField(null=True)
+    prompt = TextField(null=True)
+    llm_response = TextField(null=True)
+    model = TextField(null=True)
+    input_tokens = IntegerField(null=True)
+    output_tokens = IntegerField(null=True)
+    latency_ms = IntegerField(null=True)
+    input_observation_refs = TextField(null=True)
 
     class Meta:
         table_name = "consolidation_log"
+
+
+# ---------------------------------------------------------------------------
+# Observer instrumentation tables
+# ---------------------------------------------------------------------------
+
+
+class Observation(BaseModel):
+    """Raw and filtered observations captured before consolidation decisions."""
+
+    id = AutoField()
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+    session_id = TextField(null=True)
+    source_path = TextField(null=True)
+    ordinal = IntegerField(null=True)
+    content = TextField()
+    filtered_content = TextField(null=True)
+    content_hash = TextField(null=True)
+    status = TextField(null=True)
+    memory_id = TextField(null=True)
+    metadata = TextField(null=True)
+
+    class Meta:
+        table_name = "observations"
+
+
+class RetrievalCandidate(BaseModel):
+    """Per-candidate retrieval scoring details for Observer waterfall views."""
+
+    id = AutoField()
+    retrieval_log_id = IntegerField()
+    memory_id = TextField()
+    rank = IntegerField()
+    fts_rank = IntegerField(null=True)
+    vector_rank = IntegerField(null=True)
+    semantic_score = FloatField(default=0.0)
+    recency_score = FloatField(default=0.0)
+    importance_score = FloatField(default=0.0)
+    affect_score = FloatField(default=0.0)
+    reinforcement_score = FloatField(default=0.0)
+    boost_score = FloatField(default=0.0)
+    final_score = FloatField(default=0.0)
+    was_selected = IntegerField(default=0)
+    metadata = TextField(null=True)
+
+    class Meta:
+        table_name = "retrieval_candidates"
+
+
+class AffectLog(BaseModel):
+    """Point-in-time affect/coherence state snapshots for Observer timelines."""
+
+    id = AutoField()
+    timestamp = TextField(default=lambda: datetime.now().isoformat())
+    session_id = TextField(null=True)
+    project_context = TextField(null=True)
+    frustration = FloatField(default=0.0)
+    satisfaction = FloatField(default=0.0)
+    momentum = FloatField(default=0.0)
+    arousal = FloatField(default=0.0)
+    valence = FloatField(default=0.0)
+    degradation = FloatField(default=0.0)
+    coherence = FloatField(null=True)
+    metadata = TextField(null=True)
+
+    class Meta:
+        table_name = "affect_log"
+
+
+class EvalRun(BaseModel):
+    """Eval report metadata and JSON payloads consumed by Observer."""
+
+    id = AutoField()
+    run_id = TextField(unique=True)
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+    finished_at = TextField(null=True)
+    suite = TextField()
+    status = TextField(default="running")
+    command = TextField(null=True)
+    config_a = TextField(null=True)
+    config_b = TextField(null=True)
+    score = FloatField(null=True)
+    report_json = TextField(null=True)
+
+    class Meta:
+        table_name = "eval_runs"

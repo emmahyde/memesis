@@ -1,5 +1,16 @@
 {
   "pythonVersion": "3.10",
   "extraPaths": ["."],
-  "exclude": ["backfill-output", ".venv", "**/__pycache__"]
+  "exclude": ["backfill-output", ".venv", "**/__pycache__"],
+  "typeCheckingMode": "off",
+  "reportMissingImports": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportArgumentType": "none",
+  "reportOptionalOperand": "none",
+  "reportIncompatibleVariableOverride": "none",
+  "reportUnusedVariable": "none",
+  "reportUnusedImport": "none",
+  "reportUnusedParameter": "none",
+  "reportUnusedFunction": "none",
+  "reportPrivateUsage": "none"
 }

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from .database import get_base_dir
-from .models import Memory
+from .models import Memory, Observation
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,19 @@ class NativeMemoryIngestor:
 
             now = datetime.now().isoformat()
             try:
+                observation = Observation.create(
+                    session_id=None,
+                    source_path=mem["path"],
+                    ordinal=len(ingested) + skipped,
+                    content=content,
+                    filtered_content=content,
+                    content_hash=content_hash,
+                    status="ingested",
+                    metadata=json.dumps({
+                        "source": "native-claude-code",
+                        "native_type": native_type,
+                    }),
+                )
                 new_mem = Memory.create(
                     stage="consolidated",
                     title=mem["name"],
@@ -228,7 +241,16 @@ class NativeMemoryIngestor:
                     created_at=now,
                     updated_at=now,
                     content_hash=content_hash,
+                    # Defensive nulls — ingest is a non-card write path (D3)
+                    temporal_scope=None,
+                    confidence=None,
+                    affect_valence=None,
+                    actor=None,
+                    criterion_weights=None,
+                    rejected_options=None,
                 )
+                observation.memory_id = new_mem.id
+                observation.save()
                 # Write file
                 file_path.write_text(full_content, encoding="utf-8")
 

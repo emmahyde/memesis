@@ -29,7 +29,7 @@ from core.crystallizer import Crystallizer
 from core.database import close_db, get_base_dir, get_db_path, init_db
 from core.lifecycle import LifecycleManager
 from core.manifest import ManifestGenerator
-from core.models import Memory, db
+from core.models import AffectLog, Memory, db
 from core.relevance import RelevanceEngine
 from core.self_reflection import SelfReflector
 from core.threads import build_threads
@@ -224,6 +224,62 @@ def regenerate_manifest(dry_run: bool = False) -> None:
                 token_count, fraction * 100)
 
 
+def record_affect_snapshot(project_context: str = None, dry_run: bool = False) -> dict:
+    """Record a cheap affect/coherence snapshot for Observer timelines."""
+    stage_counts = {}
+    valence_counts = {"friction": 0, "surprise": 0, "delight": 0, "neutral": 0}
+    total = 0
+
+    for memory in Memory.active():
+        stage_counts[memory.stage] = stage_counts.get(memory.stage, 0) + 1
+        total += 1
+        tags = memory.tag_list
+        matched = False
+        for tag in tags:
+            if tag.startswith("valence:"):
+                valence = tag.split(":", 1)[1]
+                valence_counts[valence] = valence_counts.get(valence, 0) + 1
+                matched = True
+                break
+        if not matched:
+            valence_counts["neutral"] += 1
+
+    friction = valence_counts.get("friction", 0)
+    delight = valence_counts.get("delight", 0)
+    surprise = valence_counts.get("surprise", 0)
+    denominator = max(total, 1)
+    frustration = friction / denominator
+    satisfaction = delight / denominator
+    arousal = (friction + delight + surprise) / denominator
+    valence = (delight - friction) / denominator
+
+    payload = {
+        "stage_counts": stage_counts,
+        "valence_counts": valence_counts,
+    }
+
+    if not dry_run:
+        AffectLog.create(
+            timestamp=datetime.now().isoformat(),
+            project_context=project_context,
+            frustration=frustration,
+            satisfaction=satisfaction,
+            momentum=valence,
+            arousal=arousal,
+            valence=valence,
+            degradation=0.0,
+            metadata=json.dumps(payload),
+        )
+
+    return {
+        "frustration": frustration,
+        "satisfaction": satisfaction,
+        "arousal": arousal,
+        "valence": valence,
+        **payload,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Health report
 # ---------------------------------------------------------------------------
@@ -386,6 +442,11 @@ def main():
     maintenance = run_relevance_maintenance(project_context, dry_run=dry_run)
     print(f"  Archived: {len(maintenance.get('archived', []))}, "
           f"Rehydrated: {len(maintenance.get('rehydrated', []))}")
+
+    # Phase 2.5: Affect snapshot
+    print(f"\n--- Phase 2.5: Affect snapshot ---")
+    affect = record_affect_snapshot(project_context, dry_run=dry_run)
+    print(f"  Arousal: {affect['arousal']:.3f}, Valence: {affect['valence']:.3f}")
 
     # Phase 3: Self-reflection
     print(f"\n--- Phase 3: Self-reflection ---")

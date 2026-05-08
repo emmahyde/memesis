@@ -2,6 +2,8 @@
 
 AI assistant guidance for working in the `memesis/` subdirectory.
 
+**Design ethos and decision north star:** `.context/DESIGN_ETHOS.md` — read before proposing architecture changes or resolving design disagreements.
+
 ## Directory Structure
 
 ```
@@ -36,7 +38,7 @@ python3 -m pytest tests/
 python3 -m pytest tests/test_storage.py
 
 # Single test by name
-python3 -m pytest tests/test_consolidator.py -k test_filter_privacy
+python3 -m pytest tests/test_consolidator.py -k test_consolidate_session
 
 # With verbose output
 python3 -m pytest tests/ -v
