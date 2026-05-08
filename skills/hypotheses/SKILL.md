@@ -10,11 +10,11 @@ List, promote, reject, or edit hypothesis memories. Hypotheses are LLM-inferred 
 ## Usage
 
 ```
-/memesis hypotheses
-/memesis hypotheses list
-/memesis hypotheses promote <memory-id>
-/memesis hypotheses reject <memory-id>
-/memesis hypotheses edit <memory-id>
+/memesis:hypotheses
+/memesis:hypotheses list
+/memesis:hypotheses promote <memory-id>
+/memesis:hypotheses reject <memory-id>
+/memesis:hypotheses edit <memory-id>
 ```
 
 ## Procedure
@@ -37,7 +37,7 @@ List, promote, reject, or edit hypothesis memories. Hypotheses are LLM-inferred 
 1. Resolve the memory ID (full or 8-char prefix match).
 2. Call `can_promote_hypothesis(memory)` from `core.self_reflection`.
    - If gate returns False: explain which criterion is unmet (evidence_count < 3, sessions < 2, or contradiction exists) and abort.
-3. If gate returns True: call `promote_hypothesis(memory, rationale="User-initiated promotion via /memesis hypotheses")`.
+3. If gate returns True: call `promote_hypothesis(memory, rationale="User-initiated promotion via /memesis:hypotheses")`.
 4. Confirm: `Promoted '<title>' from <from_stage> to <to_stage>. kind cleared.`
 
 ### reject <memory-id>
@@ -45,7 +45,7 @@ List, promote, reject, or edit hypothesis memories. Hypotheses are LLM-inferred 
 1. Resolve the memory ID.
 2. Set `memory.archived_at = datetime.now().isoformat()`.
 3. Call `memory.save()`.
-4. Log to ConsolidationLog: action='archived', rationale='User rejected hypothesis via /memesis hypotheses'.
+4. Log to ConsolidationLog: action='archived', rationale='User rejected hypothesis via /memesis:hypotheses'.
 5. Confirm: `Rejected '<title>'. Memory archived and removed from promotion queue.`
 
 ### edit <memory-id>
