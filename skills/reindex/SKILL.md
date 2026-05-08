@@ -1,4 +1,9 @@
-# Skill: memesis reindex --vec
+---
+name: reindex
+description: Use when the user requests a vector embedding reindex, after changing the active embedding model, or when VecStore logs dimension-mismatch warnings. Re-embeds all memories under the current model and updates vec_memories and vec_embedding_meta atomically.
+---
+
+# /memesis:reindex — Re-embed All Memories
 
 Re-embeds all memories under the active embedding model and performs an atomic
 swap of the vec_memories table. Use this after changing the active embedding
