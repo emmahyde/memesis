@@ -481,7 +481,7 @@ class SelfReflector:
         file_path = base_dir / "instinctive" / path
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build full content with frontmatter
+        # Build full content for file storage (frontmatter + body)
         frontmatter_lines = [
             '---',
             f'name: {title}',
@@ -492,7 +492,8 @@ class SelfReflector:
             content,
         ]
         full_content = '\n'.join(frontmatter_lines)
-        content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+        # Hash from body only — must match what Memory.save() will compute
+        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
 
         # Dedup check
         if Memory.select().where(Memory.content_hash == content_hash).exists():
@@ -504,7 +505,7 @@ class SelfReflector:
             stage="instinctive",
             title=title,
             summary=summary,
-            content=full_content,
+            content=content,   # body only — better FTS signal
             tags=json.dumps(tags),
             importance=importance,
             reinforcement_count=0,
