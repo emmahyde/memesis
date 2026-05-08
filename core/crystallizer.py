@@ -365,7 +365,8 @@ class Crystallizer:
         if is_codebook_enabled():
             full_content = encode_field_value(full_content)
 
-        content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+        # Hash from body only — must match what Memory.save() will compute
+        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
 
         # Dedup check
         if Memory.select().where(Memory.content_hash == content_hash).exists():
@@ -376,7 +377,7 @@ class Crystallizer:
             stage="crystallized",
             title=result["title"],
             summary=result["insight"][:150],
-            content=full_content,
+            content=content,   # body only — better FTS, consistent hash
             tags=json.dumps(tags),
             importance=0.75,
             reinforcement_count=0,
