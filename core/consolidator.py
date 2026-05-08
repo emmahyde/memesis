@@ -701,7 +701,12 @@ class Consolidator:
                 )
                 full_content = compressed
 
-            content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+            # Extract body-only content for DB storage (no YAML frontmatter).
+            # Memory.save() overrides content_hash = md5(content), so the hash
+            # must be computed from the same body-only string stored in content.
+            # The full_content (with frontmatter) is only written to the file below.
+            body_content = observation  # raw observation text without frontmatter
+            content_hash = hashlib.md5(body_content.encode('utf-8')).hexdigest()
 
             # Dedup check
             if Memory.select().where(Memory.content_hash == content_hash).exists():
@@ -749,7 +754,7 @@ class Consolidator:
                 stage="consolidated",
                 title=title,
                 summary=summary,
-                content=full_content,
+                content=body_content,   # body only — better FTS, matches hash
                 tags=json.dumps(tags),
                 importance=mem_importance,
                 reinforcement_count=0,
