@@ -66,8 +66,9 @@ def db_path(tmp_path: Path):
 
 def make_store(session_id: str = "test-session-001"):
     from core.session_vec import SessionVecStore
-
-    return SessionVecStore(session_id)
+    import tempfile, pathlib
+    db = pathlib.Path(tempfile.mkdtemp()) / "session.db"
+    return SessionVecStore(db, session_id)
 
 
 # ---------------------------------------------------------------------------
