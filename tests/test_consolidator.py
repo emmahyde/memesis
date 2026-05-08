@@ -1149,8 +1149,10 @@ class TestPydanticValidation:
         ]})
         with patch("core.consolidator._call_llm_transport") as mock_transport:
             mock_transport.return_value = bad_response
-            with pytest.raises((ValueError, ValidationError)):
-                consolidator.consolidate_session(ephemeral_file, "pydantic-001")
+            # Invalid actions are now skipped per-decision (graceful degradation),
+            # not raised as exceptions for the whole batch.
+            result = consolidator.consolidate_session(ephemeral_file, "pydantic-001")
+        assert result["kept"] == [] and result["promoted"] == []
 
     def test_valid_actions_pass_through(self, consolidator, base, ephemeral_file):
         """All valid actions parse without error."""

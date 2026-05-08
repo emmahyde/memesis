@@ -35,7 +35,7 @@ from .linking import link_memory as _link_memory
 from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, Observation, db
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
-from .schemas import ConsolidationResponse
+from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
 from .question_lifecycle import (
     detect_resolution,
     get_unresolved_questions,
@@ -555,9 +555,20 @@ class Consolidator:
             else:
                 valid_decisions.append(rd)
 
-        # Parse valid decisions through Pydantic (raises ValidationError on bad action)
-        partial_response = ConsolidationResponse(**{**data, "decisions": valid_decisions})
-        result = [d.model_dump(exclude_unset=True) for d in partial_response.decisions]
+        # Validate each decision individually via Pydantic; skip invalid ones with a warning.
+        from pydantic import ValidationError as PydanticValidationError
+        validated_decisions = []
+        for rd in valid_decisions:
+            try:
+                validated = _ConsolidationDecisionSchema(**rd)
+                validated_decisions.append(validated.model_dump(exclude_unset=True))
+            except PydanticValidationError as exc:
+                logger.warning(
+                    "Skipping invalid decision (Pydantic): action=%r reason=%s",
+                    rd.get("action"),
+                    exc.errors()[0]["msg"] if exc.errors() else str(exc),
+                )
+        result = validated_decisions
 
         # Re-insert malformed-importance decisions as raw dicts (preserves original keys)
         # in their original order.
@@ -754,6 +765,11 @@ class Consolidator:
                 # #36-A: wire criterion_weights + rejected_options from card fields
                 criterion_weights=json.dumps(card_fields.get("criterion_weights")) if card_fields.get("criterion_weights") else None,
                 rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
+                # Stage 2 enrichment fields from consolidation prompt
+                subject=decision.get("subject"),
+                work_event=decision.get("work_event"),
+                knowledge_type=decision.get("knowledge_type"),
+                knowledge_type_confidence=decision.get("knowledge_type_confidence"),
             )
             memory_id = mem.id
 
