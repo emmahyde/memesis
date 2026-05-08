@@ -345,6 +345,22 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
 def main():
     logger.info("Starting hourly lifecycle run")
 
+    # --- Step 0: Extract observations from recent session transcripts ---
+    # Runs BEFORE finding ephemeral buffers so freshly-extracted observations
+    # are included in this cron's consolidation pass.
+    try:
+        from core.transcript_ingest import tick as _transcript_tick
+        tick_results = _transcript_tick(max_sessions=10)
+        if tick_results["observations_total"] > 0 or tick_results["processed"] > 0:
+            logger.info(
+                "Transcript extraction: %d session(s) processed, %d observation(s) appended, %d skipped",
+                tick_results["processed"],
+                tick_results["observations_total"],
+                tick_results["skipped"],
+            )
+    except Exception as e:
+        logger.warning("Transcript extraction error (non-fatal): %s", e)
+
     buffers = sorted(find_ephemeral_buffers())
     if not buffers:
         logger.info("No ephemeral buffers with observations found")
