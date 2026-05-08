@@ -26,7 +26,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _REPO_ROOT = Path(os.environ.get("MEMESIS_REPO_ROOT", Path(__file__).parent.parent))
-_OBS_DIR = _REPO_ROOT / "backfill-output" / "observability"
+_OBS_DIR = (
+    Path(os.environ["MEMESIS_OBS_DIR"])
+    if os.environ.get("MEMESIS_OBS_DIR")
+    else _REPO_ROOT / "backfill-output" / "observability"
+)
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -83,6 +87,7 @@ def compute_precision_at_k(k: int) -> dict:
             accepted_map[rid] = set(rec.get("accepted_ids", []))
 
     precisions = []
+    by_tier: dict[str, list[float]] = {"tier1": [], "tier2": [], "active_search": []}
     no_acceptance_signal = 0
     for ret in retrievals:
         rid = ret.get("retrieval_id", "")
@@ -96,6 +101,22 @@ def compute_precision_at_k(k: int) -> dict:
         hits = sum(1 for mid in top_k if mid in accepted)
         precisions.append(hits / len(top_k))
 
+        # Per-tier breakdown using context.tier_map (inject_for_session) or
+        # context.retrieval_type=='active_search' (Tier 3 hybrid).
+        ctx = ret.get("context") or {}
+        tier_map = ctx.get("tier_map") or {}
+        if ctx.get("retrieval_type") == "active_search":
+            t3_top = top_k
+            if t3_top:
+                t3_hits = sum(1 for mid in t3_top if mid in accepted)
+                by_tier["active_search"].append(t3_hits / len(t3_top))
+        elif tier_map:
+            for tier_label in ("tier1", "tier2"):
+                tier_ids = [mid for mid in top_k if tier_map.get(mid) == tier_label]
+                if tier_ids:
+                    tier_hits = sum(1 for mid in tier_ids if mid in accepted)
+                    by_tier[tier_label].append(tier_hits / len(tier_ids))
+
     if not precisions:
         return {
             "status": "no_data",
@@ -108,6 +129,16 @@ def compute_precision_at_k(k: int) -> dict:
             "no_acceptance_signal": no_acceptance_signal,
         }
 
+    def _summary(vals: list[float]) -> dict:
+        if not vals:
+            return {"n": 0}
+        return {
+            "n": len(vals),
+            "mean": round(sum(vals) / len(vals), 4),
+            "min": round(min(vals), 4),
+            "max": round(max(vals), 4),
+        }
+
     mean_p = sum(precisions) / len(precisions)
     return {
         "status": "ok",
@@ -118,6 +149,7 @@ def compute_precision_at_k(k: int) -> dict:
         "min": round(min(precisions), 4),
         "max": round(max(precisions), 4),
         "no_acceptance_signal": no_acceptance_signal,
+        "by_tier": {tier: _summary(vals) for tier, vals in by_tier.items()},
     }
 
 
