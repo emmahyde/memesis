@@ -61,9 +61,16 @@ class HabituationModel:
         return "untyped"
 
     # These event types are always injected regardless of habituation count.
-    # Corrections and preference signals are the highest-value observations —
-    # suppressing them defeats the purpose of the memory system.
-    _NEVER_SUPPRESS = frozenset({"correction", "preference_signal", "self_observation"})
+    # "untyped" is included because unclassified observations cannot be reliably
+    # filtered by frequency — the consolidation LLM handles quality filtering.
+    # Without this, untyped observations would be suppressed after ~10 sessions,
+    # repeating the same bug that was fixed for the '-' bullet misclassification.
+    _NEVER_SUPPRESS = frozenset({
+        "correction",
+        "preference_signal",
+        "self_observation",
+        "untyped",  # unclassified; let consolidation LLM decide
+    })
 
     def get_factor(self, event_type: str) -> float:
         """Compute habituation factor for an event type."""
