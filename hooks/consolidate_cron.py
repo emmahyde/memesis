@@ -49,6 +49,7 @@ os.environ.setdefault("CLAUDE_CODE_USE_BEDROCK", "true")
 
 # Run self-reflection every N consolidations.
 REFLECTION_INTERVAL = 5
+STALENESS_INTERVAL = 20  # Run staleness detection every 20 cron consolidations (~daily at hourly cron)
 
 
 def find_ephemeral_buffers() -> list[Path]:
@@ -244,6 +245,92 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
                     summary_parts.append("self-model updated")
             except Exception as e:
                 logger.warning("Self-reflection error (non-fatal): %s", e)
+
+        # --- Periodic staleness detection ---
+        if count % STALENESS_INTERVAL == 0:
+            try:
+                from core.llm import call_llm
+                from core.models import Observation
+                from datetime import timezone, timedelta
+
+                # Pull recent observations as session context
+                recent_sessions: set[str] = set()
+                for row in Observation.select(Observation.session_id).where(
+                    Observation.session_id.is_null(False)
+                ).distinct():
+                    if row.session_id:
+                        recent_sessions.add(row.session_id)
+                recent_sessions_list = sorted(recent_sessions, reverse=True)[:5]
+
+                obs_parts = []
+                if recent_sessions_list:
+                    obs_rows = list(
+                        Observation.select()
+                        .where(Observation.session_id.in_(recent_sessions_list))
+                        .order_by(Observation.created_at.desc())
+                        .limit(20)
+                    )
+                    obs_parts = [
+                        (o.filtered_content or o.content or "").strip()[:200]
+                        for o in obs_rows
+                        if (o.filtered_content or o.content or "").strip()
+                    ]
+                observations_text = "\n".join(f"- {p}" for p in obs_parts[:15]) or "(no recent observations)"
+
+                # Find stale candidates
+                cutoff_days = 30
+                cutoff_ts = (
+                    datetime.now(timezone.utc) - timedelta(days=cutoff_days)
+                ).isoformat()
+                candidates = list(
+                    Memory.select()
+                    .where(
+                        Memory.stage.in_(["consolidated", "crystallized"]),
+                        Memory.importance <= 0.8,
+                        Memory.archived_at.is_null(True),
+                    )
+                    .order_by(Memory.importance.asc())
+                    .limit(5)
+                )
+
+                stale_found = 0
+                for mem in candidates:
+                    last_activity = mem.last_used_at or mem.created_at or ""
+                    if last_activity and last_activity >= cutoff_ts:
+                        continue  # recently active, skip
+                    prompt = (
+                        f"Memory to evaluate:\nTitle: {mem.title or '(untitled)'}\n"
+                        f"Stage: {mem.stage}\nContent: {(mem.content or '')[:400]}\n\n"
+                        f"Recent observations:\n{observations_text}\n\n"
+                        "Is this memory VALID, OUTDATED, or UNCERTAIN given the recent observations? "
+                        "Reply with JSON: {\"verdict\": \"VALID|OUTDATED|UNCERTAIN\", \"reasoning\": \"one sentence\"}"
+                    )
+                    try:
+                        import json as _json
+                        raw = call_llm(
+                            prompt,
+                            model="claude-haiku-4-5-20251001",
+                            max_tokens=100,
+                        )
+                        result_dict = _json.loads(raw.strip().strip("```json").strip("```"))
+                        if result_dict.get("verdict") == "OUTDATED":
+                            new_imp = max(0.0, round((mem.importance or 0.5) - 0.15, 3))
+                            Memory.update(importance=new_imp).where(Memory.id == mem.id).execute()
+                            stale_found += 1
+                            logger.info(
+                                "Staleness: %s importance %.2f→%.2f (%s)",
+                                (mem.title or mem.id)[:40],
+                                mem.importance or 0.5,
+                                new_imp,
+                                result_dict.get("reasoning", "")[:60],
+                            )
+                    except Exception:
+                        pass  # per-memory errors are non-fatal
+
+                if stale_found:
+                    summary_parts.append(f"{stale_found} stale decayed")
+            except Exception as e:
+                logger.warning("Staleness detection error (non-fatal): %s", e)
 
         # --- Manifest ---
         manifest.write_manifest()
