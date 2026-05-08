@@ -154,3 +154,111 @@ class TestFilterObservations:
         content = self._make_content("correction", "correction")
         model.filter_observations(content)
         assert model._counts["correction"] == 2
+
+
+# ---------------------------------------------------------------------------
+# _NEVER_SUPPRESS regression tests
+# ---------------------------------------------------------------------------
+
+class TestNeverSuppress:
+    """
+    Regression tests for the _NEVER_SUPPRESS bug.
+
+    Before the fix, corrections and preference_signals with high event counts
+    (correction had 28, dashes had 302) were suppressed below the 0.3 threshold.
+    These tests ensure the never-suppress list works correctly.
+    """
+
+    def _flag_enabled(self, monkeypatch):
+        import core.flags
+        monkeypatch.setattr(core.flags, "_cache", {"habituation_baseline": True})
+
+    def test_correction_with_high_count_returns_1(self, tmp_path, monkeypatch):
+        """correction is never suppressed regardless of event count."""
+        self._flag_enabled(monkeypatch)
+        model = HabituationModel(tmp_path)
+        model._counts["correction"] = 100  # factor would be ~0.18 without guard
+        assert model.get_factor("correction") == 1.0
+
+    def test_preference_signal_with_high_count_returns_1(self, tmp_path, monkeypatch):
+        """preference_signal is never suppressed regardless of event count."""
+        self._flag_enabled(monkeypatch)
+        model = HabituationModel(tmp_path)
+        model._counts["preference_signal"] = 100
+        assert model.get_factor("preference_signal") == 1.0
+
+    def test_self_observation_with_high_count_returns_1(self, tmp_path, monkeypatch):
+        """self_observation is never suppressed regardless of event count."""
+        self._flag_enabled(monkeypatch)
+        model = HabituationModel(tmp_path)
+        model._counts["self_observation"] = 100
+        assert model.get_factor("self_observation") == 1.0
+
+    def test_untyped_with_high_count_returns_1(self, tmp_path, monkeypatch):
+        """untyped events are never suppressed — they couldn't be classified.
+
+        Without this guard, untyped events would accumulate to a count of ~10
+        and then be suppressed, silencing all unclassifiable observations.
+        """
+        self._flag_enabled(monkeypatch)
+        model = HabituationModel(tmp_path)
+        model._counts["untyped"] = 50
+        assert model.get_factor("untyped") == 1.0
+
+    def test_never_suppress_types_pass_through_filter(self, tmp_path, monkeypatch):
+        """Never-suppress types remain in filtered content even at high counts."""
+        self._flag_enabled(monkeypatch)
+        model = HabituationModel(tmp_path)
+        # Pre-seed so all three would be suppressed without the guard
+        for t in ("correction", "preference_signal", "untyped"):
+            model._counts[t] = 200
+        model._save()
+
+        lines = ["# Session\n\n"]
+        for i, t in enumerate(["correction", "preference_signal", "untyped"]):
+            lines.append(f"## [2026-03-29T12:{i:02d}:00] {t}\nContent about {t}\n\n")
+        content = "".join(lines)
+
+        filtered, suppressed = model.filter_observations(content)
+        assert suppressed == 0
+        for t in ("correction", "preference_signal"):
+            assert t in filtered
+
+
+# ---------------------------------------------------------------------------
+# Regex fix — markdown bullets not misclassified as event types
+# ---------------------------------------------------------------------------
+
+class TestObsHeaderRegex:
+    """Regression for the dash-bullet misclassification.
+
+    Before the fix, _OBS_HEADER_RE captured '-' and '*' from observation content
+    as event types. With 302+ sessions, the '-' event type accumulated a count
+    that caused all observations starting with '## [timestamp] -' to be suppressed.
+    """
+
+    def test_dash_not_extracted_as_event_type(self, tmp_path):
+        """A bullet dash in observation content is not an event type."""
+        model = HabituationModel(tmp_path)
+        # This was the bug: '## [ts] - some bullet' would extract '-' as the event type
+        block = "## [2026-03-29T12:00:00] - this is a bullet point\n- item 1"
+        result = model.extract_event_signature(block)
+        # '-' is not a word character — should NOT be extracted as an event type
+        assert result != "-"
+        # Falls back to untyped since '-' doesn't match \w\S*
+        assert result == "untyped"
+
+    def test_star_not_extracted_as_event_type(self, tmp_path):
+        """A markdown asterisk is not extracted as an event type."""
+        model = HabituationModel(tmp_path)
+        block = "## [2026-03-29T12:00:00] * bold item\nContent"
+        result = model.extract_event_signature(block)
+        assert result != "*"
+        assert result == "untyped"
+
+    def test_word_event_type_still_extracted(self, tmp_path):
+        """Legitimate word event types are still extracted correctly after the fix."""
+        model = HabituationModel(tmp_path)
+        for etype in ("correction", "domain_knowledge", "decision_context", "preference_signal"):
+            block = f"## [2026-03-29T12:00:00] {etype}\nContent"
+            assert model.extract_event_signature(block) == etype
