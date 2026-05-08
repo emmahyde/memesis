@@ -66,7 +66,7 @@ def main() -> None:
     # --- Init ---
     print("Database")
     def do_init():
-        bd = init_db(base_dir=base_dir, project_context=project_context)
+        bd = init_db(project_context=project_context, base_dir=base_dir)
         return f"→ {bd}"
     total += 1
     if check("init_db() + migrations", do_init):

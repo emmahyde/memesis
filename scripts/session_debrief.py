@@ -236,6 +236,7 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--base-dir", default=os.path.expanduser("~/.claude/memory"))
+    parser.add_argument("--project-context", default=os.getcwd(), metavar="PATH")
     parser.add_argument("--session", type=str, default=None, help="Specific session ID")
     parser.add_argument("--last", type=int, default=1, metavar="N",
                         help="Nth most recent session (default: 1 = latest)")
@@ -243,7 +244,7 @@ def main() -> None:
                         help="List recent session IDs and exit")
     args = parser.parse_args()
 
-    init_db(args.base_dir)
+    init_db(project_context=args.project_context, base_dir=args.base_dir)
     try:
         sessions = _latest_sessions(n=20)
 
