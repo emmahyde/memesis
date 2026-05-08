@@ -219,7 +219,9 @@ class NativeMemoryIngestor:
                 content,
             ]
             full_content = '\n'.join(frontmatter_lines)
-            content_hash = hashlib.md5(full_content.encode('utf-8')).hexdigest()
+            # Hash must match what Memory.save() computes (md5 of content field),
+            # since save() overrides content_hash on write.
+            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
 
             # Dedup check
             if Memory.select().where(Memory.content_hash == content_hash).exists():
@@ -249,7 +251,7 @@ class NativeMemoryIngestor:
                     stage="consolidated",
                     title=mem["name"],
                     summary=(mem.get("description") or "")[:150],
-                    content=full_content,
+                    content=content,   # description-enriched body (no frontmatter) — better FTS signal
                     tags=json.dumps(tags),
                     importance=importance,
                     reinforcement_count=0,
