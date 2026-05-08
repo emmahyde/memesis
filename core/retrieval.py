@@ -11,6 +11,7 @@ filter source != 'agent' OR access_count > K once agent-write path ships.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,116 @@ from .codebook import (
 
 if TYPE_CHECKING:
     from .vec import VecStore
+
+
+# ---------------------------------------------------------------------------
+# RISK-11: Cognitive module registry and experimental opt-in
+#
+# Modules listed here contribute scores to retrieval ranking.  Modules marked
+# experimental=True are excluded from scoring by default; opt-in via the env
+# var MEMESIS_EXPERIMENTAL_MODULES (comma-separated module names).
+#
+# Example: MEMESIS_EXPERIMENTAL_MODULES=self_reflection,coherence
+# ---------------------------------------------------------------------------
+
+_COGNITIVE_MODULES = [
+    "affect",
+    "coherence",
+    "habituation",
+    "orienting",
+    "replay",
+    "self_reflection",
+    "somatic",
+]
+
+
+def _get_enabled_modules() -> set[str]:
+    """Return the set of cognitive module names active for scoring.
+
+    Non-experimental modules are always enabled.
+    Experimental modules are enabled only when listed in the
+    MEMESIS_EXPERIMENTAL_MODULES environment variable.
+    """
+    import importlib
+
+    opt_in_raw = os.environ.get("MEMESIS_EXPERIMENTAL_MODULES", "")
+    opted_in = {name.strip() for name in opt_in_raw.split(",") if name.strip()}
+
+    enabled: set[str] = set()
+    for module_name in _COGNITIVE_MODULES:
+        try:
+            mod = importlib.import_module(f"core.{module_name}")
+            is_experimental = getattr(mod, "experimental", False)
+        except Exception:
+            is_experimental = False
+
+        if not is_experimental or module_name in opted_in:
+            enabled.add(module_name)
+
+    return enabled
+
+
+def compute_module_scores(memories: list, enabled_modules: set[str] | None = None) -> dict[str, float]:
+    """Compute per-module mean score contribution across a set of memories.
+
+    For each enabled cognitive module, extracts the relevant signal from
+    each memory's attributes and averages across the set.
+
+    Returns a dict mapping module name -> mean contribution (0.0–1.0).
+    Modules absent from enabled_modules contribute 0.0 and are excluded.
+    """
+    if enabled_modules is None:
+        enabled_modules = _get_enabled_modules()
+
+    if not memories:
+        return {m: 0.0 for m in _COGNITIVE_MODULES}
+
+    scores: dict[str, list[float]] = {m: [] for m in _COGNITIVE_MODULES}
+
+    for memory in memories:
+        # affect: importance-weighted affect_valence presence
+        if "affect" in enabled_modules:
+            affect_val = getattr(memory, "affect_valence", None)
+            scores["affect"].append(1.0 if affect_val and affect_val != "neutral" else 0.0)
+
+        # somatic: same signal as affect (valence presence)
+        if "somatic" in enabled_modules:
+            affect_val = getattr(memory, "affect_valence", None)
+            scores["somatic"].append(1.0 if affect_val and affect_val != "neutral" else 0.0)
+
+        # habituation: modeled as inverse of reinforcement_count (higher = less novel)
+        if "habituation" in enabled_modules:
+            rc = getattr(memory, "reinforcement_count", 0) or 0
+            import math
+            factor = 1.0 / (1.0 + math.log(max(rc, 1)))
+            scores["habituation"].append(factor)
+
+        # orienting: modeled as importance above baseline (higher importance = orienting)
+        if "orienting" in enabled_modules:
+            imp = getattr(memory, "importance", 0.5) or 0.5
+            scores["orienting"].append(max(0.0, (imp - 0.5) * 2.0))
+
+        # replay: injection_count relative to reinforcement (frequently replayed = salient)
+        if "replay" in enabled_modules:
+            ic = getattr(memory, "injection_count", 0) or 0
+            scores["replay"].append(min(1.0, ic / 10.0))
+
+        # coherence: divergence flag presence (tagged memories score higher on coherence need)
+        if "coherence" in enabled_modules:
+            tags = getattr(memory, "tag_list", []) or []
+            scores["coherence"].append(1.0 if "coherence_divergent" in tags else 0.0)
+
+        # self_reflection: only present when explicitly opted in
+        if "self_reflection" in enabled_modules:
+            stage = getattr(memory, "stage", "") or ""
+            scores["self_reflection"].append(1.0 if stage == "instinctive" else 0.0)
+
+    result: dict[str, float] = {}
+    for module_name in _COGNITIVE_MODULES:
+        vals = scores[module_name]
+        result[module_name] = sum(vals) / len(vals) if vals else 0.0
+
+    return result
 
 CONTEXT_WINDOW_CHARS = 200_000 * 4  # 200K tokens x 4 chars/token
 # Friction memories encode emotionally-salient negative affect (Kensinger 2007);
@@ -114,6 +225,8 @@ class RetrievalEngine:
         # token_limit is in *characters* (chars/4 is the token estimate)
         self.token_limit = int(token_budget_pct * 200_000) * 4  # chars
         self._last_hybrid_candidates = []
+        # RISK-11: last computed module_scores (dict[str, float]) populated after each retrieval call.
+        self._last_module_scores: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -155,6 +268,9 @@ class RetrievalEngine:
         # Log injections for every memory surfaced
         for memory in tier1 + tier2:
             _record_injection(memory.id, session_id, project_context=project_context)
+
+        # RISK-11: compute per-module scores over all injected memories.
+        self._last_module_scores = compute_module_scores(tier1 + tier2)
 
         if not tier1 and not tier2:
             return ""
@@ -280,10 +396,12 @@ class RetrievalEngine:
 
         # Preserve RRF order when building the output
         disclosed = []
+        selected_memories = []
         for memory_id, rrf_score in ranked:
             memory = memories_by_id.get(memory_id)
             if memory is None:
                 continue
+            selected_memories.append(memory)
             disclosed.append({
                 "id": memory.id,
                 "title": memory.title,
@@ -295,6 +413,12 @@ class RetrievalEngine:
                 "rank": rrf_score,
                 "project_context": memory.project_context,
             })
+
+        # RISK-11: compute per-module contribution scores and attach to each result
+        module_scores = compute_module_scores(selected_memories)
+        self._last_module_scores = module_scores
+        for item in disclosed:
+            item["module_scores"] = module_scores
 
         self._record_retrieval_run(
             query=query,

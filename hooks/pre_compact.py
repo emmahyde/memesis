@@ -16,6 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from hooks._safe import emit_stderr, emit_stdout
+
 from core.affect import load_analyzer
 from core.consolidator import Consolidator
 from core.crystallizer import Crystallizer
@@ -70,7 +72,7 @@ def main():
             analyzer = load_analyzer(base_dir, session_id)
             session_affect = analyzer.current_state()
         except Exception as e:
-            print(f"Affect load error (non-fatal): {e}", file=sys.stderr)
+            emit_stderr(f"Affect load error (non-fatal): {e}")
 
         lifecycle = LifecycleManager()
         consolidator = Consolidator(lifecycle)
@@ -83,7 +85,7 @@ def main():
 
         ephemeral_path = base_dir / "ephemeral" / f"session-{today}.md"
         if not ephemeral_path.exists():
-            print("", flush=True)
+            emit_stdout("")
             return
 
         # --- Lock: snapshot the buffer and clear it ---
@@ -96,7 +98,7 @@ def main():
                 content = ephemeral_path.read_text(encoding="utf-8")
                 lines = [l for l in content.splitlines() if l.strip() and not l.startswith("# Session")]
                 if not lines:
-                    print("", flush=True)
+                    emit_stdout("")
                     return
                 ephemeral_path.write_text(header, encoding="utf-8")
             finally:
@@ -140,14 +142,13 @@ def main():
                     recon = reconsolidate(injected_ids, usage_text, session_id,
                                           session_affect=affect_dict)
                     if any(recon.values()):
-                        print(
+                        emit_stderr(
                             f"Reconsolidation: {len(recon['confirmed'])} confirmed,"
                             f" {len(recon['contradicted'])} contradicted,"
-                            f" {len(recon['refined'])} refined",
-                            file=sys.stderr,
+                            f" {len(recon['refined'])} refined"
                         )
                 except Exception as e:
-                    print(f"Reconsolidation error (non-fatal): {e}", file=sys.stderr)
+                    emit_stderr(f"Reconsolidation error (non-fatal): {e}")
 
             result = consolidator.consolidate_session(str(snapshot_path), session_id)
             feedback.update_importance_scores(session_id)
@@ -166,7 +167,7 @@ def main():
                     if embedding and vec_store:
                         vec_store.store_embedding(memory_id, embedding)
                 except Exception as e:
-                    print(f"Embedding error (non-fatal): {e}", file=sys.stderr)
+                    emit_stderr(f"Embedding error (non-fatal): {e}")
 
             # Crystallization: synthesize promotion candidates into higher-level insights
             crystallized = []
@@ -174,7 +175,7 @@ def main():
                 crystallizer = Crystallizer(lifecycle)
                 crystallized = crystallizer.crystallize_candidates()
             except Exception as e:
-                print(f"Crystallization error (non-fatal): {e}", file=sys.stderr)
+                emit_stderr(f"Crystallization error (non-fatal): {e}")
 
             for crystal in crystallized:
                 try:
@@ -188,14 +189,14 @@ def main():
                         if embedding and vec_store:
                             vec_store.store_embedding(cid, embedding)
                 except Exception as e:
-                    print(f"Crystal embedding error (non-fatal): {e}", file=sys.stderr)
+                    emit_stderr(f"Crystal embedding error (non-fatal): {e}")
 
             # Narrative threads: detect and synthesize episodic arcs
             threads_built = []
             try:
                 threads_built = build_threads()
             except Exception as e:
-                print(f"Thread building error (non-fatal): {e}", file=sys.stderr)
+                emit_stderr(f"Thread building error (non-fatal): {e}")
 
             # Instinctive promotion: crystallized memories that earned it
             instinctive_promoted = 0
@@ -222,7 +223,7 @@ def main():
                         reflector.apply_reflection(reflection)
                         reflected = True
                 except Exception as e:
-                    print(f"Self-reflection error (non-fatal): {e}", file=sys.stderr)
+                    emit_stderr(f"Self-reflection error (non-fatal): {e}")
 
             manifest.write_manifest()
 
@@ -243,16 +244,16 @@ def main():
                 summary += f", {len(maint['rehydrated'])} rehydrated"
             if reflected:
                 summary += ", self-model updated"
-            print(summary, file=sys.stderr)
+            emit_stderr(summary)
         finally:
             snapshot_path.unlink(missing_ok=True)
             close_db()
 
-        print("", flush=True)  # stdout must be empty for Claude Code
+        emit_stdout("")  # stdout must be empty for Claude Code
 
     except Exception as e:
-        print(f"PreCompact error: {e}", file=sys.stderr)
-        print("", flush=True)
+        emit_stderr(f"PreCompact error: {e}")
+        emit_stdout("")
 
 
 if __name__ == "__main__":

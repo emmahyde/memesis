@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from peewee import SqliteDatabase
+
 _SCHEMA_VERSION = 2
 
 from .models import (
@@ -106,16 +108,51 @@ def init_db(
     # Create tables (safe_create=True → IF NOT EXISTS)
     db.create_tables(ALL_TABLES, safe=True)
 
-    # FTS5 virtual table and migrations (must run raw SQL)
+    # FTS5 virtual table
     _create_fts_table()
-    _run_migrations()
+
+    # Schema migrations via core.migrations runner (RISK-10).
+    # Fresh DB: user_version is 0 (SQLite default) after create_tables, but all
+    # columns already exist in the model, so we bump to _SCHEMA_VERSION first so
+    # the runner seeds (records without re-executing) all migration files.
+    _cursor = db.execute_sql("PRAGMA user_version")
+    if _cursor.fetchone()[0] == 0:
+        db.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    from .migrations import run_migrations as _run_mig
+    _run_mig(db)
 
     # VecStore
     from .vec import VecStore
 
-    _vec_store = VecStore()
+    _vec_store = VecStore(dp)
 
     return bd
+
+
+def make_connection(db_path: str) -> SqliteDatabase:
+    """
+    Factory for creating a Peewee SqliteDatabase with recommended pragmas.
+
+    This is the canonical path for all new Peewee connections outside the
+    main singleton managed by init_db().  It sets busy_timeout=5000ms so
+    that concurrent writers back off gracefully instead of immediately
+    raising OperationalError: database is locked.
+
+    Args:
+        db_path: Absolute path to the SQLite database file.
+
+    Returns:
+        A configured (but not yet opened/init'd) SqliteDatabase instance.
+    """
+    return SqliteDatabase(
+        db_path,
+        pragmas={
+            "journal_mode": "wal",
+            "synchronous": "normal",
+            "busy_timeout": 5000,
+        },
+    )
 
 
 def get_vec_store():
@@ -164,180 +201,12 @@ def _create_fts_table():
 
 
 def _run_migrations():
+    """Backward-compat shim — delegates to core.migrations.run_migrations(db).
+
+    Retained because tests outside the migration task import this name.
+    New code should call core.migrations.run_migrations(db) directly.
     """
-    Run schema migrations for backwards compatibility.
+    from .migrations import run_migrations as _run_mig
+    _run_mig(db)
 
-    - Add 'content' column to memories if missing
-    - Add 'archived_at' column if missing
-    - Add 'subsumed_by' column if missing
-    - Add 'project_context' to retrieval_log if missing
-    - Add 'last_surfaced_at' to narrative_threads if missing
-    - Rebuild consolidation_log CHECK constraint if outdated
-    """
-    # Helper: get column names for a table
-    def _columns(table_name):
-        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
-        return [row[1] for row in cursor.fetchall()]
 
-    # memories migrations
-    mem_cols = _columns("memories")
-    for col, typ in [
-        ("content", "TEXT"),
-        ("archived_at", "TEXT"),
-        ("subsumed_by", "TEXT"),
-        ("echo_count", "INTEGER DEFAULT 0"),
-        ("next_injection_due", "TEXT"),
-        ("injection_ease_factor", "REAL DEFAULT 2.5"),
-        ("injection_interval_days", "REAL DEFAULT 1.0"),
-        ("files_modified", "TEXT DEFAULT '[]'"),
-        # W2 schema additions
-        ("kind", "TEXT"),
-        ("knowledge_type", "TEXT"),
-        ("knowledge_type_confidence", "TEXT"),
-        ("subject", "TEXT"),
-        ("work_event", "TEXT"),
-        ("subtitle", "TEXT"),
-        ("cwd", "TEXT"),
-        ("session_type", "TEXT"),
-        ("raw_importance", "REAL"),
-        ("linked_observation_ids", "TEXT"),
-        ("access_count", "INTEGER DEFAULT 0"),
-        ("last_accessed_at", "TEXT"),
-        ("w2_created_at", "TEXT"),
-        # WS-H: open_question lifecycle fields (Sprint B DS-F9)
-        ("resolves_question_id", "TEXT"),
-        ("resolved_at", "TEXT"),
-        ("is_pinned", "INTEGER DEFAULT 0"),
-        # Stage 1.5 / tasks #14-#18: extended observation metadata
-        ("temporal_scope", "TEXT"),
-        ("extraction_confidence", "REAL"),
-        ("actor", "TEXT"),
-        ("polarity", "TEXT"),
-        ("revisable", "TEXT"),
-        # Task 3.1 — card→memory field promotion (Wave 3)
-        ("confidence", "REAL"),
-        ("affect_valence", "TEXT"),
-    ]:
-        if col not in mem_cols:
-            try:
-                db.execute_sql(f"ALTER TABLE memories ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    # retrieval_log migration
-    ret_cols = _columns("retrieval_log")
-    for col, typ in [
-        ("project_context", "TEXT"),
-        ("query_text", "TEXT"),
-        ("limit_count", "INTEGER"),
-        ("selected_count", "INTEGER"),
-        ("metadata", "TEXT"),
-    ]:
-        if col not in ret_cols:
-            try:
-                db.execute_sql(f"ALTER TABLE retrieval_log ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    # narrative_threads migration
-    nt_cols = _columns("narrative_threads")
-    for col, typ in [
-        ("last_surfaced_at", "TEXT"),
-        ("arc_affect", "TEXT"),
-    ]:
-        if col not in nt_cols:
-            try:
-                db.execute_sql(f"ALTER TABLE narrative_threads ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    # memory_edges migration
-    edge_cols = _columns("memory_edges")
-    if "metadata" not in edge_cols:
-        try:
-            db.execute_sql("ALTER TABLE memory_edges ADD COLUMN metadata TEXT")
-        except Exception:
-            pass
-
-    # Consolidation log CHECK constraint migration
-    cursor = db.execute_sql(
-        "SELECT sql FROM sqlite_master WHERE name='consolidation_log'"
-    )
-    schema_row = cursor.fetchone()
-    if schema_row and "'subsumed'" not in (schema_row[0] or ""):
-        rows = list(
-            db.execute_sql(
-                "SELECT timestamp, session_id, action, memory_id, "
-                "from_stage, to_stage, rationale FROM consolidation_log"
-            ).fetchall()
-        )
-        db.execute_sql("DROP TABLE consolidation_log")
-        db.execute_sql(
-            """
-            CREATE TABLE consolidation_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                session_id TEXT,
-                action TEXT CHECK(action IN ('kept', 'pruned', 'promoted',
-                    'demoted', 'merged', 'deprecated', 'subsumed', 'archived')),
-                memory_id TEXT,
-                from_stage TEXT,
-                to_stage TEXT,
-                rationale TEXT
-            )
-            """
-        )
-        for r in rows:
-            db.execute_sql(
-                "INSERT INTO consolidation_log "
-                "(timestamp, session_id, action, memory_id, from_stage, to_stage, rationale) "
-                "VALUES (?,?,?,?,?,?,?)",
-                list(r),
-            )
-
-    # TTL + poisoning-guard columns (agentic-memory BLOCKER set)
-    for col, typ in [
-        ("expires_at", "INTEGER DEFAULT NULL"),
-        ("source", "TEXT DEFAULT 'human'"),
-    ]:
-        if col not in mem_cols:
-            try:
-                db.execute_sql(f"ALTER TABLE memories ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    # consolidation_log observer instrumentation columns
-    con_cols = _columns("consolidation_log")
-    for col, typ in [
-        ("prompt", "TEXT"),
-        ("llm_response", "TEXT"),
-        ("model", "TEXT"),
-        ("input_tokens", "INTEGER"),
-        ("output_tokens", "INTEGER"),
-        ("latency_ms", "INTEGER"),
-        ("input_observation_refs", "TEXT"),
-        ("compression_ratio", "REAL"),
-    ]:
-        if col not in con_cols:
-            try:
-                db.execute_sql(f"ALTER TABLE consolidation_log ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-
-    # retrieval_log composite index for cards_unused_high_importance cross-session join
-    try:
-        db.execute_sql(
-            "CREATE INDEX IF NOT EXISTS idx_retrieval_log_memid_session "
-            "ON retrieval_log(memory_id, session_id, was_used)"
-        )
-    except Exception:
-        pass
-
-    # Schema version bump — idempotent: only write if current < target
-    try:
-        cursor = db.execute_sql("PRAGMA user_version")
-        current_version = cursor.fetchone()[0]
-        if current_version < _SCHEMA_VERSION:
-            db.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-    except Exception:
-        pass

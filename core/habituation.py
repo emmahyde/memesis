@@ -17,6 +17,11 @@ import math
 import re
 from pathlib import Path
 
+# RISK-11: experimental flag scaffold.
+# habituation is production-validated (event-frequency decay model confirmed through consolidation filtering).
+# Opt-in override: include "habituation" in MEMESIS_EXPERIMENTAL_MODULES env var to force-exclude from scoring.
+experimental: bool = False
+
 logger = logging.getLogger(__name__)
 
 # Pattern matching observation block headers: ## [2026-03-29T12:00:00] correction
