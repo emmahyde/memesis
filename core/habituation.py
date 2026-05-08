@@ -25,7 +25,9 @@ experimental: bool = False
 logger = logging.getLogger(__name__)
 
 # Pattern matching observation block headers: ## [2026-03-29T12:00:00] correction
-_OBS_HEADER_RE = re.compile(r"^##\s+\[\S+\]\s+(\S+)", re.MULTILINE)
+# Matches "## [timestamp] event_type" where event_type is a word (not punctuation).
+# The capture group intentionally rejects markdown bullets ("-", "*") and similar.
+_OBS_HEADER_RE = re.compile(r"^##\s+\[\S+\]\s+(\w\S*)", re.MULTILINE)
 # Split on observation headers while keeping the delimiter
 _OBS_SPLIT_RE = re.compile(r"(?=^##\s+\[)", re.MULTILINE)
 

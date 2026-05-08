@@ -144,6 +144,55 @@ class TestSM2Component:
 # Habituation component
 # ---------------------------------------------------------------------------
 
+class TestHabituationFilterObservations:
+    """Test the filter_observations method against the regex bug where '-' was
+    extracted as the event type, causing all bullet-list observations to be
+    misclassified and suppressed after 10+ occurrences."""
+
+    def test_untyped_obs_not_suppressed_by_bullet_classification(self, base):
+        """Bullet character must NOT be extracted as event type."""
+        from core.habituation import HabituationModel
+        base_dir = get_base_dir()
+        if base_dir is None:
+            pytest.skip("No base_dir")
+        model = HabituationModel(base_dir)
+        # Seed high count for "-" event type (the old bug would classify bullets as this)
+        model._counts["-"] = 500
+        model._save()
+
+        # Untyped observation (header has no event type, followed by bullet list)
+        content = (
+            "# Session\n\n"
+            "## [2026-05-08T10:00:00]\n"
+            "- Important correction about a bug found\n\n"
+            "## [2026-05-08T10:01:00]\n"
+            "- Another significant finding\n\n"
+        )
+        filtered, suppressed = model.filter_observations(content)
+        assert suppressed == 0, (
+            f"Untyped observations suppressed ({suppressed}) due to '-' event type misclassification. "
+            "The habituation regex must not match markdown bullets as event types."
+        )
+
+    def test_typed_correction_obs_tracked_separately(self, base):
+        """Typed observations should use their type, not 'untyped'."""
+        from core.habituation import HabituationModel
+        base_dir = get_base_dir()
+        if base_dir is None:
+            pytest.skip("No base_dir")
+        model = HabituationModel(base_dir)
+        model._counts["correction"] = 1
+        model._save()
+
+        content = (
+            "## [2026-05-08T10:00:00] correction\n"
+            "- A correction observation\n\n"
+        )
+        filtered, suppressed = model.filter_observations(content)
+        # correction count=1 → factor=1.0 (still novel enough)
+        assert suppressed == 0
+
+
 class TestHabituationComponent:
     """Test habituation-based novelty component."""
 
