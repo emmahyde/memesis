@@ -75,9 +75,19 @@ _OBS_DIR = _REPO_ROOT / "backfill-output" / "observability"
 
 
 def _obs_dir() -> Path:
-    """Return the observability output directory, creating it if needed."""
-    _OBS_DIR.mkdir(parents=True, exist_ok=True)
-    return _OBS_DIR
+    """Return the observability output directory, creating it if needed.
+
+    Re-reads MEMESIS_OBS_DIR / MEMESIS_REPO_ROOT env vars on every call so
+    tests (and other isolated contexts) can redirect output without re-importing.
+    """
+    override = os.environ.get("MEMESIS_OBS_DIR")
+    if override:
+        target = Path(override)
+    else:
+        repo_root = Path(os.environ.get("MEMESIS_REPO_ROOT", _REPO_ROOT))
+        target = repo_root / "backfill-output" / "observability"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def _append_jsonl(path: Path, record: dict) -> None:

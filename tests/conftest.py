@@ -11,6 +11,11 @@ import pytest
 # Ensure tests never hit the real Bedrock API
 os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)
 
+# Redirect observability JSONL output to a session-scoped temp dir so test
+# runs don't pollute backfill-output/observability/ in the real repo.
+_TEST_OBS_DIR = Path(tempfile.mkdtemp(prefix="memesis-test-obs-"))
+os.environ["MEMESIS_OBS_DIR"] = str(_TEST_OBS_DIR)
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 

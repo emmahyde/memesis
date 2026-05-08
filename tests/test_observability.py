@@ -26,12 +26,10 @@ def isolate_obs_dir(tmp_path, monkeypatch):
     """Redirect observability output to a temp directory for every test."""
     obs_out = tmp_path / "observability"
     obs_out.mkdir()
+    # MEMESIS_OBS_DIR takes precedence in _obs_dir() — overrides the
+    # session-level conftest default with this test's tmp_path.
+    monkeypatch.setenv("MEMESIS_OBS_DIR", str(obs_out))
     monkeypatch.setenv("MEMESIS_REPO_ROOT", str(tmp_path))
-    # Re-import to pick up the env var — patch the module-level _REPO_ROOT
-    import importlib
-    import core.observability as obs_mod
-    obs_mod._REPO_ROOT = tmp_path
-    obs_mod._OBS_DIR = obs_out
     yield obs_out
 
 
