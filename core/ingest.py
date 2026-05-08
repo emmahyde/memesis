@@ -113,7 +113,18 @@ def scan_native_memories(memory_dir: Path) -> list[dict]:
     for match in link_pattern.finditer(index_content):
         linked_files.add(match.group(2))
 
-    memesis_dirs = {"ephemeral", "consolidated", "crystallized", "instinctive", "archived", "meta"}
+    # Plugin-written subdirectories to skip (avoid re-ingesting plugin output).
+    # "consolidated/native" is where NativeMemoryIngestor writes its output.
+    # Other consolidated/ files (user-authored memories) ARE eligible for re-ingestion.
+    _SKIP_SUBTREE = {
+        Path("consolidated") / "native",
+        Path("ephemeral"),
+        Path("crystallized"),
+        Path("instinctive"),
+        Path("archived"),
+        Path("meta"),
+    }
+
     for md_file in memory_dir.glob("*.md"):
         if md_file.name != "MEMORY.md":
             linked_files.add(md_file.name)
@@ -125,7 +136,11 @@ def scan_native_memories(memory_dir: Path) -> list[dict]:
 
         try:
             relative = file_path.relative_to(memory_dir)
-            if relative.parts[0] in memesis_dirs:
+            # Skip if any parent prefix matches a skip subtree
+            if any(
+                Path(*relative.parts[:len(skip.parts)]) == skip
+                for skip in _SKIP_SUBTREE
+            ):
                 continue
         except (ValueError, IndexError):
             pass
