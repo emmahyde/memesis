@@ -140,6 +140,52 @@ def _check_orphaned_observations(fix: bool) -> int:
     return 1
 
 
+def _check_crashed_cron_sessions(fix: bool, min_age_hours: int = 1) -> int:
+    """Pending observations from cron-* sessions with no consolidation_log entry.
+
+    These are pre-cycle-12 crashed cron runs: consolidate_session was invoked
+    (session_id was created and observations captured), but the LLM call/
+    validation crashed before any decisions processed and before the
+    failed-status sweep was wired. Bookkeeping leak.
+
+    Conservatively scoped: session_id matches 'cron-*' AND no consolidation_log
+    entry AND session is older than min_age_hours (so we don't snag a
+    currently-running cron mid-flight).
+    """
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(hours=min_age_hours)).isoformat()
+    try:
+        rows = db.execute_sql(
+            """
+            SELECT o.id
+            FROM observations o
+            WHERE o.status = 'pending'
+              AND o.session_id LIKE 'cron-%'
+              AND o.created_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM consolidation_log cl WHERE cl.session_id = o.session_id
+              )
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception:
+        return 0
+
+    if not rows:
+        return 0
+
+    print(f"  CRASHED CRON: {len(rows)} pending observation(s) from cron sessions that never logged decisions")
+    if fix:
+        ids = [r[0] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        db.execute_sql(
+            f"UPDATE observations SET status='failed' WHERE id IN ({placeholders})",
+            ids,
+        )
+        print(f"    FIXED — marked 'failed' (matches cycle-12 LLM-crash bookkeeping)")
+    return 1
+
+
 def _check_aged_pending(fix: bool, max_age_days: int = 7) -> int:
     """Pending observations older than max_age_days are almost certainly stale.
 
@@ -314,6 +360,12 @@ def main() -> None:
         n = _check_orphaned_observations(args.fix)
         if n == 0:
             print("  ✓ No orphaned observations")
+        total_issues += n
+
+        print("\n=== Crashed cron sessions (pre-cycle-12 leak) ===")
+        n = _check_crashed_cron_sessions(args.fix)
+        if n == 0:
+            print("  ✓ No crashed-cron observations")
         total_issues += n
 
         print("\n=== Aged pending observations (>7d) ===")
