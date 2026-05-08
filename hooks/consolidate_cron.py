@@ -203,6 +203,28 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         if instinctive_promoted:
             summary_parts.append(f"{instinctive_promoted} -> instinctive")
 
+        # --- Hypothesis reconsolidation ---
+        # Check all pending hypotheses against this session's buffer content.
+        # Hypothesis memories are ephemeral so they're never injected; this is
+        # the only path for them to accumulate or lose evidence in cron mode.
+        try:
+            from core.reconsolidation import reconsolidate_hypotheses
+            hyp_result = reconsolidate_hypotheses(content, session_id)
+            if any(hyp_result.values()):
+                confirmed_n = len(hyp_result["confirmed"])
+                contradicted_n = len(hyp_result["contradicted"])
+                logger.info(
+                    "Hypothesis reconsolidation: %d confirmed, %d contradicted",
+                    confirmed_n,
+                    contradicted_n,
+                )
+                if confirmed_n:
+                    summary_parts.append(f"{confirmed_n} hyp confirmed")
+                if contradicted_n:
+                    summary_parts.append(f"{contradicted_n} hyp contradicted")
+        except Exception as e:
+            logger.warning("Hypothesis reconsolidation error (non-fatal): %s", e)
+
         # --- Relevance maintenance ---
         relevance = RelevanceEngine()
         maint = relevance.run_maintenance(project_context)
