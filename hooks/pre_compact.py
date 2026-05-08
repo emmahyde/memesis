@@ -150,8 +150,9 @@ def main():
                 except Exception as e:
                     emit_stderr(f"Reconsolidation error (non-fatal): {e}")
 
-                # Hypothesis matching: check ALL pending hypotheses against session,
-                # not just injected ones (ephemeral hypotheses are never injected).
+            # Hypothesis matching: fires regardless of injected_ids —
+            # ephemeral hypotheses are never injected so they need a separate pass.
+            if usage_text.strip():
                 try:
                     from core.reconsolidation import reconsolidate_hypotheses
                     hyp_recon = reconsolidate_hypotheses(usage_text, session_id)
