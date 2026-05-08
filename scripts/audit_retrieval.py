@@ -256,7 +256,7 @@ def main() -> None:
     parser.add_argument("--out", type=str, default=None, metavar="PATH")
     args = parser.parse_args()
 
-    init_db(args.base_dir)
+    init_db(base_dir=args.base_dir)
     try:
         sessions = _recent_sessions(args.sessions)
         if not sessions:
