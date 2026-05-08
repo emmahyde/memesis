@@ -199,6 +199,28 @@ def reconsolidate(
     return result
 
 
+_HYPOTHESIS_PROMPT = """You are reviewing whether a session's content confirms or contradicts pending behavioral hypotheses.
+
+These are inferred patterns about the user's behavior, preferences, or tendencies — not facts that were observed, but hypotheses waiting for enough evidence to be confirmed.
+
+## Pending Hypotheses
+{memories_block}
+
+## Session Content (excerpt)
+{session_excerpt}
+
+For each hypothesis, determine ONE of:
+- "confirmed" — session content reinforces or is consistent with this hypothesis
+- "contradicted" — session content clearly contradicts this hypothesis
+- "unmentioned" — session content provides no signal about this hypothesis
+
+Be conservative. Only mark "contradicted" if there is clear, specific contradiction. Mark "unmentioned" when in doubt.
+
+Return a JSON array. Each element: {{"memory_id": "...", "action": "confirmed|contradicted|unmentioned", "evidence": "one-sentence explanation"}}
+
+Only return the JSON array, no other text."""
+
+
 def reconsolidate_hypotheses(
     session_content: str,
     session_id: str,
@@ -238,7 +260,7 @@ def reconsolidate_hypotheses(
         mem_lines.append(f"### [{mem.id}] {title}\n{content}")
     memories_block = "\n\n".join(mem_lines)
 
-    prompt = RECONSOLIDATION_PROMPT.format(
+    prompt = _HYPOTHESIS_PROMPT.format(
         memories_block=memories_block,
         session_excerpt=session_content[:3000],
     )
