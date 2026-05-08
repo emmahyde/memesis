@@ -103,6 +103,43 @@ def _check_fts_coverage() -> int:
     return 0
 
 
+def _check_orphaned_observations(fix: bool) -> int:
+    """Find pending observations whose session already ran consolidation.
+
+    These are stranded by the consolidator's _refs_for_observation lookup
+    failing to pair the LLM-decision text with the captured row. They
+    will never advance without intervention.
+    """
+    try:
+        rows = db.execute_sql(
+            """
+            SELECT o.id, o.session_id
+            FROM observations o
+            WHERE o.status = 'pending'
+              AND EXISTS (
+                  SELECT 1 FROM consolidation_log cl WHERE cl.session_id = o.session_id
+              )
+            """
+        ).fetchall()
+    except Exception:
+        return 0
+
+    if not rows:
+        return 0
+
+    print(f"  ORPHANED: {len(rows)} pending observations whose session already consolidated")
+    if fix:
+        ids = [r[0] for r in rows]
+        # Batch update by id list (small enough — bound by pending count)
+        placeholders = ",".join("?" * len(ids))
+        db.execute_sql(
+            f"UPDATE observations SET status='orphaned' WHERE id IN ({placeholders})",
+            ids,
+        )
+        print(f"    FIXED — marked 'orphaned'")
+    return 1
+
+
 def _check_observation_backlog() -> int:
     """Flag stalled consolidation: observations stuck in 'pending' status.
 
@@ -187,6 +224,12 @@ def main() -> None:
         n = _check_fts_coverage()
         if n == 0:
             print("  ✓ FTS fully covered")
+        total_issues += n
+
+        print("\n=== Orphaned observations (post-consolidation) ===")
+        n = _check_orphaned_observations(args.fix)
+        if n == 0:
+            print("  ✓ No orphaned observations")
         total_issues += n
 
         print("\n=== Observation backlog (consolidation health) ===")
