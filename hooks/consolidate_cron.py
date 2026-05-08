@@ -375,8 +375,29 @@ def main():
             result = process_buffer(buf)
             if result is None:
                 logger.info("  (empty after lock — skipped)")
-        except Exception:
+        except Exception as exc:
             logger.exception("  Failed to process %s", buf)
+            # Persist a structured error record so db_check / observability
+            # can surface failed cron runs that would otherwise vanish into
+            # stderr. Without this, 5 consecutive failures in production
+            # (cron-20260508-*) had no on-disk trace.
+            try:
+                import json as _json
+                from datetime import datetime as _dt
+                meta_dir = buf.parent.parent / "meta"
+                meta_dir.mkdir(parents=True, exist_ok=True)
+                err_path = meta_dir / "consolidation-errors.jsonl"
+                record = {
+                    "ts": _dt.now().isoformat(),
+                    "buffer": str(buf),
+                    "project": project_hash,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+                with err_path.open("a", encoding="utf-8") as f:
+                    f.write(_json.dumps(record) + "\n")
+            except Exception:
+                pass  # error-logging is best-effort
 
     logger.info("Lifecycle run complete")
 

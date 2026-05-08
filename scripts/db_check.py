@@ -140,6 +140,53 @@ def _check_orphaned_observations(fix: bool) -> int:
     return 1
 
 
+def _check_consolidation_errors(base_dir: str) -> int:
+    """Surface recent consolidation cron failures from meta/consolidation-errors.jsonl.
+
+    Cron writes structured error records here when process_buffer crashes —
+    without this surface, errors vanish into stderr and stalled pipelines
+    are invisible until backlog audits.
+    """
+    err_path = Path(base_dir) / "meta" / "consolidation-errors.jsonl"
+    if not err_path.exists():
+        return 0
+
+    try:
+        lines = err_path.read_text(encoding="utf-8").strip().splitlines()
+    except Exception:
+        return 0
+
+    if not lines:
+        return 0
+
+    import json as _json
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+    recent = []
+    for line in lines:
+        try:
+            rec = _json.loads(line)
+            if rec.get("ts", "") >= cutoff:
+                recent.append(rec)
+        except Exception:
+            continue
+
+    if not recent:
+        return 0
+
+    print(f"  CRON FAILURES: {len(recent)} consolidation error(s) in the last 7 days")
+    by_type: dict[str, int] = {}
+    for rec in recent:
+        et = rec.get("error_type", "Unknown")
+        by_type[et] = by_type.get(et, 0) + 1
+    for et, cnt in sorted(by_type.items(), key=lambda x: -x[1]):
+        print(f"    {et}: {cnt}")
+    if recent:
+        last = recent[-1]
+        print(f"    last: {last.get('ts', '')[:19]} — {last.get('error', '')[:100]}")
+    return 1
+
+
 def _check_observation_backlog() -> int:
     """Flag stalled consolidation: observations stuck in 'pending' status.
 
@@ -236,6 +283,12 @@ def main() -> None:
         n = _check_observation_backlog()
         if n == 0:
             print("  ✓ No stalled-consolidation backlog")
+        total_issues += n
+
+        print("\n=== Recent consolidation cron errors ===")
+        n = _check_consolidation_errors(args.base_dir)
+        if n == 0:
+            print("  ✓ No errors logged in last 7 days")
         total_issues += n
 
         print(f"\n{'─'*40}")
