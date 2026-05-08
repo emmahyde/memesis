@@ -53,7 +53,12 @@ def _keep_decision(**overrides) -> dict:
 class TestConsolidationDecisionAction:
     def test_valid_actions_accepted(self):
         for action in ALLOWED_ACTIONS:
-            d = ConsolidationDecision(**_keep_decision(action=action, rationale="non-empty" if action in ("prune", "archive") else "rationale"))
+            extra = {}
+            if action == "promote":
+                extra["reinforces"] = _valid_uuid4()
+            overrides = {"action": action, "rationale": "non-empty" if action in ("prune", "archive") else "rationale"}
+            overrides.update(extra)
+            d = ConsolidationDecision(**_keep_decision(**overrides))
             assert d.action == action
 
     def test_action_normalised_to_lowercase(self):
@@ -231,8 +236,18 @@ class TestConsolidationDecisionDestructiveRationale:
             action="promote",
             observation="Something.",
             rationale="",
+            reinforces=_valid_uuid4(),
         )
         assert d.action == "promote"
+
+    def test_promote_without_reinforces_raises(self):
+        with pytest.raises(ValidationError):
+            ConsolidationDecision(
+                action="promote",
+                observation="Something.",
+                rationale="valid rationale",
+                reinforces=None,
+            )
 
 
 # ---------------------------------------------------------------------------

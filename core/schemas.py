@@ -212,6 +212,14 @@ class ConsolidationDecision(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_promote_requires_reinforces(self) -> "ConsolidationDecision":
+        if self.action == "promote" and not self.reinforces:
+            raise ValueError(
+                "action='promote' requires a non-null 'reinforces' (target memory id)"
+            )
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Consolidation response envelope
