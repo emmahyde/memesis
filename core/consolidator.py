@@ -252,6 +252,24 @@ class Consolidator:
             else:
                 logger.warning("Unknown action '%s' in LLM response; skipping", action)
 
+        # 5b. Sweep — mark orphaned observations.
+        # If the LLM didn't return a decision matching a captured observation
+        # (or _refs_for_observation couldn't pair them), the observation row
+        # stays 'pending' forever and inflates the backlog. Mark them so
+        # bookkeeping stays honest.
+        all_captured_ids = {ref["id"] for ref in observation_refs}
+        touched_ids: set[int] = set()
+        for d in decisions:
+            for rid in d.get("_observer_refs", []) or []:
+                touched_ids.add(rid)
+        orphaned_ids = list(all_captured_ids - touched_ids)
+        if orphaned_ids:
+            self._mark_observations(orphaned_ids, "orphaned")
+            logger.info(
+                "Consolidation: %d/%d observations had no matching decision; marked 'orphaned'",
+                len(orphaned_ids), len(all_captured_ids),
+            )
+
         # 6. Resolve contradictions — refine conflicting memories with scope/nuance
         resolved = []
         if conflicts:
