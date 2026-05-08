@@ -506,6 +506,29 @@ class RetrievalEngine:
                     was_selected=1 if candidate["memory_id"] in selected else 0,
                     metadata=json.dumps(candidate.get("metadata", {})),
                 )
+
+            # Observability: emit retrieval-trace for Tier 3 active search.
+            # Captures full candidate set + final scores so precision@k can
+            # measure recall of intentional retrievals (skill-driven), not just
+            # passive injections.
+            try:
+                from .observability import log_retrieval
+                candidate_ids = [c["memory_id"] for c in candidates]
+                log_retrieval(
+                    query=query,
+                    candidate_ids=candidate_ids,
+                    returned_ids=list(selected_ids),
+                    scores={c["memory_id"]: float(c.get("final_score", 0.0)) for c in candidates},
+                    context={
+                        "session_id": session_id,
+                        "project_context": project_context,
+                        "retrieval_type": retrieval_type,
+                        "limit": limit,
+                        "source": "_record_retrieval_run",
+                    },
+                )
+            except Exception:
+                pass
         except Exception:
             # Retrieval must stay available even if observer instrumentation lags a migration.
             return
