@@ -879,7 +879,15 @@ class RetrievalEngine:
 
         # --- Static path (no query) — preserved exactly as before --------------
         from .spaced import is_injection_eligible
-        records = [m for m in Memory.by_stage("crystallized") if is_injection_eligible(m)]
+        # Tier 2 includes crystallized + high-importance consolidated (>= 0.7).
+        # High-importance consolidated memories may carry critical behavioral signals
+        # before they accumulate enough reinforcement to crystallize.
+        crystallized = [m for m in Memory.by_stage("crystallized") if is_injection_eligible(m)]
+        high_value_consolidated = [
+            m for m in Memory.by_stage("consolidated")
+            if is_injection_eligible(m) and (m.importance or 0.0) >= 0.7
+        ]
+        records = crystallized + high_value_consolidated
 
         # Three-pass stable sort
         # DEFERRED: Interleave injection ordering (primacy/recency slots)
