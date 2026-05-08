@@ -60,11 +60,19 @@ class HabituationModel:
             return match.group(1).lower()
         return "untyped"
 
+    # These event types are always injected regardless of habituation count.
+    # Corrections and preference signals are the highest-value observations —
+    # suppressing them defeats the purpose of the memory system.
+    _NEVER_SUPPRESS = frozenset({"correction", "preference_signal", "self_observation"})
+
     def get_factor(self, event_type: str) -> float:
         """Compute habituation factor for an event type."""
         from .flags import get_flag
 
         if not get_flag("habituation_baseline"):
+            return 1.0
+
+        if event_type in self._NEVER_SUPPRESS:
             return 1.0
 
         count = self._counts.get(event_type, 0)
