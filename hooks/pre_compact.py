@@ -124,9 +124,10 @@ def main():
                 .where(RetrievalLog.session_id == session_id)
                 .distinct()
             ]
+            # Usage text is available for both injected-memory reconsolidation
+            # and hypothesis matching, regardless of whether there were injections.
+            usage_text = conversation_text + "\n" + content
             if injected_ids:
-                # Use conversation text + ephemeral content as usage signal
-                usage_text = conversation_text + "\n" + content
                 feedback.track_usage(session_id, injected_ids, usage_text)
 
                 # Reconsolidate: check if session confirms/contradicts/refines memories
