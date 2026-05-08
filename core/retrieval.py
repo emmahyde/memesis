@@ -267,6 +267,10 @@ class RetrievalEngine:
                 limit=len(tier2),
             )
 
+        # RISK-11: compute per-module scores over all injected memories.
+        # Done before log_retrieval so module breakdown can ride along in the trace.
+        self._last_module_scores = compute_module_scores(tier1 + tier2)
+
         # Observability: emit one retrieval-trace covering this session's injection.
         # Captures the candidate set so downstream acceptance signals (track_usage)
         # can compute precision@k. Retrieval_id stashed on each RetrievalLog row
@@ -276,6 +280,8 @@ class RetrievalEngine:
             from .observability import log_retrieval
             returned_ids = [m.id for m in tier1 + tier2]
             if returned_ids:
+                tier1_ids = [m.id for m in tier1]
+                tier_map = {mid: ("tier1" if mid in set(tier1_ids) else "tier2") for mid in returned_ids}
                 retrieval_id = log_retrieval(
                     query=query or "",
                     candidate_ids=returned_ids,
@@ -286,6 +292,8 @@ class RetrievalEngine:
                         "project_context": project_context,
                         "tier1_count": len(tier1),
                         "tier2_count": len(tier2),
+                        "tier_map": tier_map,
+                        "module_scores": self._last_module_scores,
                         "source": "inject_for_session",
                     },
                 )
@@ -295,9 +303,6 @@ class RetrievalEngine:
         # Log injections for every memory surfaced (retrieval_id correlates them)
         for memory in tier1 + tier2:
             _record_injection(memory.id, session_id, project_context=project_context, retrieval_id=retrieval_id)
-
-        # RISK-11: compute per-module scores over all injected memories.
-        self._last_module_scores = compute_module_scores(tier1 + tier2)
 
         if not tier1 and not tier2:
             return ""
