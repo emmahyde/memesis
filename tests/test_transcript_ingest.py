@@ -1076,7 +1076,9 @@ class TestReframeA:
 
             # After extraction, the table should have been dropped.
             # SessionVecStore re-creates it (IF NOT EXISTS) but entries are gone.
-            store = SessionVecStore(session_id)
+            import tempfile, pathlib
+            _svec_db = pathlib.Path(tempfile.gettempdir()) / f"memesis_svec_{session_id[:12]}.db"
+            store = SessionVecStore(_svec_db, session_id)
             if store.available:
                 results = store.query_similar(embed_a, k=3)
                 assert results == [], "Expected no entries after table was dropped and recreated"

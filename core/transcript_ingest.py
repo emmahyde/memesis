@@ -621,7 +621,9 @@ def extract_observations_hierarchical(
         from core.embeddings import embed_text
         from core.session_vec import SessionVecStore
 
-        svec = SessionVecStore(session_id)
+        import tempfile
+        _svec_db = Path(tempfile.gettempdir()) / f"memesis_svec_{session_id[:12]}.db"
+        svec = SessionVecStore(_svec_db, session_id)
         if not svec.available:
                 logger.warning(
                     "hierarchical: SessionVecStore unavailable for session %s — running without Reframe A",
