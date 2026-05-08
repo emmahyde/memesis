@@ -1101,8 +1101,19 @@ def append_to_ephemeral(
             continue  # malformed observation — skip rather than crash
         kind = obs.get("kind")
         mode = obs.get("mode")
-        # Prefer W5 'kind'; fall back to legacy 'mode' for ephemeral header tag.
-        obs_type = kind if kind in OBSERVATION_TYPES else (
+        # Map extraction 'kind' vocab to OBSERVATION_TYPES vocab.
+        # The extraction prompt uses different terms than the ephemeral buffer header tags.
+        _KIND_MAP = {
+            "decision": "decision_context",
+            "finding": "domain_knowledge",
+            "preference": "preference_signal",
+            "constraint": "domain_knowledge",
+            "correction": "correction",
+            "open_question": "shared_insight",
+        }
+        # Prefer W5 'kind' (after mapping); fall back to legacy 'mode' for ephemeral header tag.
+        mapped_kind = _KIND_MAP.get(kind, kind) if kind else None
+        obs_type = mapped_kind if mapped_kind in OBSERVATION_TYPES else (
             mode if mode in OBSERVATION_TYPES else None
         )
         lines.append(format_observation(content_text, obs_type=obs_type))
