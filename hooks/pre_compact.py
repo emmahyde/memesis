@@ -150,6 +150,19 @@ def main():
                 except Exception as e:
                     emit_stderr(f"Reconsolidation error (non-fatal): {e}")
 
+                # Hypothesis matching: check ALL pending hypotheses against session,
+                # not just injected ones (ephemeral hypotheses are never injected).
+                try:
+                    from core.reconsolidation import reconsolidate_hypotheses
+                    hyp_recon = reconsolidate_hypotheses(usage_text, session_id)
+                    if any(hyp_recon.values()):
+                        emit_stderr(
+                            f"Hypothesis reconsolidation: {len(hyp_recon['confirmed'])} confirmed,"
+                            f" {len(hyp_recon['contradicted'])} contradicted"
+                        )
+                except Exception as e:
+                    emit_stderr(f"Hypothesis reconsolidation error (non-fatal): {e}")
+
             result = consolidator.consolidate_session(str(snapshot_path), session_id)
             feedback.update_importance_scores(session_id)
 

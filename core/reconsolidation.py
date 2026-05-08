@@ -199,6 +199,107 @@ def reconsolidate(
     return result
 
 
+def reconsolidate_hypotheses(
+    session_content: str,
+    session_id: str,
+    model: str = "claude-haiku-4-5-20251001",
+) -> dict:
+    """Check pending hypothesis memories against session content.
+
+    Unlike the main reconsolidate(), this operates on ALL ephemeral
+    hypothesis memories — not just those that were injected. This is
+    necessary because ephemeral memories are not included in the
+    normal injection cycle.
+
+    One batched LLM call per PreCompact, not per-memory.
+
+    Returns:
+        {"confirmed": [id, ...], "contradicted": [id, ...]}
+    """
+    if not get_flag("reconsolidation"):
+        return {"confirmed": [], "contradicted": []}
+
+    if not session_content.strip():
+        return {"confirmed": [], "contradicted": []}
+
+    hypotheses = list(
+        Memory.select().where(
+            Memory.kind == "hypothesis",
+            Memory.archived_at.is_null(True),
+        )
+    )
+    if not hypotheses:
+        return {"confirmed": [], "contradicted": []}
+
+    mem_lines = []
+    for mem in hypotheses:
+        title = mem.title or "Untitled"
+        content = (mem.content or "")[:200]
+        mem_lines.append(f"### [{mem.id}] {title}\n{content}")
+    memories_block = "\n\n".join(mem_lines)
+
+    prompt = RECONSOLIDATION_PROMPT.format(
+        memories_block=memories_block,
+        session_excerpt=session_content[:3000],
+    )
+
+    try:
+        raw = call_llm(prompt, model=model)
+        cleaned = strip_markdown_fences(raw)
+        decisions = json.loads(cleaned)
+    except Exception as e:
+        logger.warning("Hypothesis reconsolidation LLM call failed: %s", e)
+        return {"confirmed": [], "contradicted": []}
+
+    result: dict = {"confirmed": [], "contradicted": []}
+    now = datetime.now().isoformat()
+    mem_by_id = {m.id: m for m in hypotheses}
+
+    for decision in decisions:
+        mid = decision.get("memory_id", "")
+        action = decision.get("action", "unmentioned")
+        evidence = decision.get("evidence", "")
+        mem = mem_by_id.get(mid)
+        if not mem or action == "unmentioned":
+            continue
+
+        if action == "confirmed":
+            mem.reinforcement_count = (mem.reinforcement_count or 0) + 1
+            mem.evidence_count = (mem.evidence_count or 0) + 1
+            try:
+                existing = json.loads(mem.evidence_session_ids or "[]")
+            except Exception:
+                existing = []
+            if session_id and session_id not in existing:
+                existing.append(session_id)
+                mem.evidence_session_ids = json.dumps(existing)
+            mem.save()
+            result["confirmed"].append(mid)
+            logger.info("Hypothesis %s confirmed (evidence=%d)", mid[:8], mem.evidence_count)
+
+        elif action == "contradicted":
+            mem.evidence_count = max(0, (mem.evidence_count or 1) - 1)
+            if mem.evidence_count == 0:
+                mem.stage = "ephemeral"
+                mem.kind = None
+                logger.info("Hypothesis %s demoted (evidence exhausted)", mid[:8])
+            tags = mem.tag_list
+            if "contradiction_flagged" not in tags:
+                tags.append("contradiction_flagged")
+                mem.tag_list = tags
+            mem.save()
+            result["contradicted"].append(mid)
+            ConsolidationLog.create(
+                timestamp=now,
+                session_id=session_id,
+                action="deprecated",
+                memory_id=mid,
+                rationale=f"Hypothesis contradicted: {evidence}",
+            )
+
+    return result
+
+
 def _build_affect_meta(session_affect: dict | None) -> dict | None:
     """Build affect sub-dict for edge metadata from a session_affect dict.
 
