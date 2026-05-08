@@ -223,3 +223,92 @@ class TestReconsolidation:
                 "test-session",
             )
         assert call_count == 1
+
+
+class TestHypothesisReconsolidation:
+    """Tests for reconsolidate_hypotheses() — session-wide hypothesis matching."""
+
+    def test_confirmed_hypothesis_increments_evidence(self, store):
+        from core.reconsolidation import reconsolidate_hypotheses
+        hyp = Memory.create(
+            stage="ephemeral",
+            kind="hypothesis",
+            title="User favors small commits",
+            content="Inferred: commits scoped to single feature",
+            importance=0.5,
+            evidence_count=1,
+            evidence_session_ids=json.dumps(["s0"]),
+        )
+        response = json.dumps([
+            {"memory_id": hyp.id, "action": "confirmed", "evidence": "Commit was small and scoped"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=response):
+            result = reconsolidate_hypotheses("User committed a small focused change", "s1")
+        assert hyp.id in result["confirmed"]
+        fresh = Memory.get_by_id(hyp.id)
+        assert fresh.evidence_count == 2
+        sessions = json.loads(fresh.evidence_session_ids or "[]")
+        assert "s1" in sessions
+
+    def test_contradicted_hypothesis_decays_and_demotes(self, store):
+        from core.reconsolidation import reconsolidate_hypotheses
+        hyp = Memory.create(
+            stage="ephemeral",
+            kind="hypothesis",
+            title="User always writes tests first",
+            content="Inferred: TDD pattern observed",
+            importance=0.5,
+            evidence_count=1,
+        )
+        response = json.dumps([
+            {"memory_id": hyp.id, "action": "contradicted", "evidence": "User shipped code with no tests"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=response):
+            result = reconsolidate_hypotheses("User shipped without tests", "s1")
+        assert hyp.id in result["contradicted"]
+        fresh = Memory.get_by_id(hyp.id)
+        assert fresh.evidence_count == 0
+        assert fresh.stage == "ephemeral"
+        assert fresh.kind is None
+
+    def test_empty_session_skips_llm(self, store):
+        from core.reconsolidation import reconsolidate_hypotheses
+        Memory.create(
+            stage="ephemeral",
+            kind="hypothesis",
+            title="Some hypothesis",
+            content="...",
+            importance=0.5,
+        )
+        with patch("core.reconsolidation.call_llm") as mock_llm:
+            result = reconsolidate_hypotheses("   ", "s1")
+        mock_llm.assert_not_called()
+        assert result == {"confirmed": [], "contradicted": []}
+
+    def test_no_hypotheses_skips_llm(self, store):
+        from core.reconsolidation import reconsolidate_hypotheses
+        with patch("core.reconsolidation.call_llm") as mock_llm:
+            result = reconsolidate_hypotheses("lots of session content", "s1")
+        mock_llm.assert_not_called()
+        assert result == {"confirmed": [], "contradicted": []}
+
+    def test_single_llm_call_for_all_hypotheses(self, store):
+        from core.reconsolidation import reconsolidate_hypotheses
+        for i in range(3):
+            Memory.create(
+                stage="ephemeral",
+                kind="hypothesis",
+                title=f"Hypothesis {i}",
+                content=f"Pattern {i}",
+                importance=0.5,
+            )
+        call_count = 0
+
+        def counting_llm(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return json.dumps([])
+
+        with patch("core.reconsolidation.call_llm", side_effect=counting_llm):
+            reconsolidate_hypotheses("session content", "s1")
+        assert call_count == 1
