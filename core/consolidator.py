@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .compression import compress_memory_content, compress_memory_for_stage, compression_ratio, get_stage_depth
+from .compression import compress_memory_for_stage, compression_ratio, get_stage_depth
 
 from .database import get_base_dir, get_vec_store
 from .issue_cards import extract_card_memory_fields

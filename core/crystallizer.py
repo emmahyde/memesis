@@ -24,6 +24,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
+from .codebook import encode_field_value, is_codebook_enabled
 from .database import get_base_dir, get_vec_store
 from .flags import get_flag
 from .lifecycle import LifecycleManager
