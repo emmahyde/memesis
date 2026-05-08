@@ -629,11 +629,11 @@ def extract_observations_hierarchical(
         _svec_db = Path(tempfile.gettempdir()) / f"memesis_svec_{session_id[:12]}.db"
         svec = SessionVecStore(_svec_db, session_id)
         if not svec.available:
-                logger.warning(
-                    "hierarchical: SessionVecStore unavailable for session %s — running without Reframe A",
-                    session_id,
-                )
-                svec = None
+            logger.warning(
+                "hierarchical: SessionVecStore unavailable for session %s — running without Reframe A",
+                session_id,
+            )
+            svec = None
 
     if svec is not None:
         # --- Reframe A: sequential per-window loop ---
