@@ -112,6 +112,49 @@ class TestReconsolidation:
             )
         assert result == {"confirmed": [], "contradicted": [], "refined": []}
 
+    def test_confirmed_hypothesis_accumulates_evidence(self, store):
+        hyp = Memory.create(
+            stage="consolidated",
+            kind="hypothesis",
+            title="User prefers small commits",
+            content="Pattern: commits are scoped to single feature or fix.",
+            importance=0.6,
+            evidence_count=1,
+            evidence_session_ids=json.dumps(["session-0"]),
+        )
+        llm_response = json.dumps([
+            {"memory_id": hyp.id, "action": "confirmed", "evidence": "Another small scoped commit observed"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            result = reconsolidate([hyp.id], "User made another small commit", "session-1")
+        assert hyp.id in result["confirmed"]
+        fresh = Memory.get_by_id(hyp.id)
+        assert fresh.evidence_count == 2
+        import json as _json
+        sessions = _json.loads(fresh.evidence_session_ids or "[]")
+        assert "session-1" in sessions
+        assert "session-0" in sessions  # original preserved
+
+    def test_confirmed_hypothesis_no_duplicate_session_ids(self, store):
+        hyp = Memory.create(
+            stage="consolidated",
+            kind="hypothesis",
+            title="User uses type hints",
+            content="Observed: functions consistently have type annotations.",
+            importance=0.65,
+            evidence_count=2,
+            evidence_session_ids=json.dumps(["session-0", "session-1"]),
+        )
+        llm_response = json.dumps([
+            {"memory_id": hyp.id, "action": "confirmed", "evidence": "More type hints seen"},
+        ])
+        with patch("core.reconsolidation.call_llm", return_value=llm_response):
+            reconsolidate([hyp.id], "User added type hints again", "session-1")
+        fresh = Memory.get_by_id(hyp.id)
+        import json as _json
+        sessions = _json.loads(fresh.evidence_session_ids or "[]")
+        assert sessions.count("session-1") == 1  # no duplicate
+
     def test_contradicted_hypothesis_decays_evidence_count(self, store):
         hyp = Memory.create(
             stage="consolidated",

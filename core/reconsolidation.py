@@ -124,6 +124,21 @@ def reconsolidate(
 
         if action == "confirmed":
             mem.reinforcement_count = (mem.reinforcement_count or 0) + 1
+
+            # Hypothesis-specific: accumulate session evidence toward promotion gate.
+            if mem.kind == "hypothesis":
+                mem.evidence_count = (mem.evidence_count or 0) + 1
+                existing_sessions: list[str] = []
+                try:
+                    import json as _json
+                    existing_sessions = _json.loads(mem.evidence_session_ids or "[]")
+                except Exception:
+                    pass
+                if session_id and session_id not in existing_sessions:
+                    existing_sessions.append(session_id)
+                    import json as _json
+                    mem.evidence_session_ids = _json.dumps(existing_sessions)
+
             mem.save()
             result["confirmed"].append(mid)
 
