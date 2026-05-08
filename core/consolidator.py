@@ -130,16 +130,29 @@ class Consolidator:
         # 3b. Build open_questions context block (WS-H)
         open_questions_block = self._build_open_questions_block()
 
-        # 4. Build and send prompt to Claude
+        # 4. Build and send prompt to Claude. If the LLM call or decision
+        # validation crashes, the captured observation_refs would otherwise
+        # leak as 'pending' forever (see cycle-11 production audit). Mark
+        # them 'failed' so the backlog reflects reality and operators can see
+        # which sessions had broken consolidation runs.
         prompt = CONSOLIDATION_PROMPT.format(
             ephemeral_content=filtered_content,
             manifest_summary=manifest_summary,
             open_questions_block=open_questions_block,
         )
-        decisions = self._call_llm(prompt)
-
-        # 4b. Validate referenced memory IDs — drop decisions with dangling refs
-        decisions = self._validate_decision_ids(decisions)
+        try:
+            decisions = self._call_llm(prompt)
+            decisions = self._validate_decision_ids(decisions)
+        except Exception as exc:
+            captured_ids = [ref["id"] for ref in observation_refs]
+            if captured_ids:
+                self._mark_observations(captured_ids, "failed")
+            logger.error(
+                "consolidate_session: LLM call/validation failed for session %s; "
+                "marked %d observations 'failed'. Reason: %s",
+                session_id, len(captured_ids), exc,
+            )
+            raise
 
         # 5. Execute decisions
         kept = []
