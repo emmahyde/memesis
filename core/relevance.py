@@ -609,7 +609,15 @@ class RelevanceEngine:
             base_dir = get_base_dir()
             if base_dir is not None:
                 model = HabituationModel(base_dir)
-                event_key = (_get("title") or "untyped").lower()
+                tags = _get("tag_list") or _get("tags") or []
+                if isinstance(tags, str):
+                    try:
+                        import json as _json
+                        tags = _json.loads(tags)
+                    except (ValueError, TypeError):
+                        tags = []
+                type_tags = [t[5:] for t in tags if isinstance(t, str) and t.startswith("type:")]
+                event_key = type_tags[0].lower() if type_tags else "untyped"
                 habituation_component = model.get_factor(event_key)
         except Exception:
             habituation_component = 1.0

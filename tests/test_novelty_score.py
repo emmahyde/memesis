@@ -204,24 +204,25 @@ class TestHabituationComponent:
         assert score == pytest.approx(1.0)
 
     def test_habituated_event_reduces_score(self, engine, base, tmp_path):
+        import json as _json
         mid = _create_memory("Habituated Event")
         memory = Memory.get_by_id(mid)
+        memory.tags = _json.dumps(["type:domain_knowledge"])
+        memory.save()
 
-        # Seed habituation counts for this memory's title
         base_dir = get_base_dir()
         if base_dir is not None:
             model = HabituationModel(base_dir)
-            model._counts["habituated event"] = 50
+            model._counts["domain_knowledge"] = 50
             model._save()
 
         score = engine._compute_novelty_score(memory)
-        # habituation for count=50: 1/(1+ln(50)) ≈ 0.24
         habituation = 1.0 / (1.0 + math.log(50))
         expected = (1.0 + habituation + 1.0) / 3.0
         assert score == pytest.approx(expected, abs=0.01)
         assert score < 1.0
 
-    def test_untyped_fallback_when_no_title(self, engine, base):
+    def test_untyped_fallback_when_no_type_tag(self, engine, base):
         mem = Memory.create(
             stage="consolidated",
             title=None,
@@ -229,7 +230,7 @@ class TestHabituationComponent:
             importance=0.5,
         )
         score = engine._compute_novelty_score(mem)
-        # title is None → event_key="untyped" → habituation=1.0
+        # no type:* tag → event_key="untyped" (in _NEVER_SUPPRESS) → factor=1.0
         assert score == pytest.approx(1.0)
 
 
