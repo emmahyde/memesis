@@ -6,6 +6,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.cursors import CursorStore
+import time
+
 from core.transcript_ingest import (  # type: ignore[import]
     tick,
     extract_observations,
@@ -13,6 +15,8 @@ from core.transcript_ingest import (  # type: ignore[import]
     _merge_card_affect,
     _parse_extract_response,
     _refine_observations,
+    discover_transcripts,
+    append_to_ephemeral,
 )
 
 
@@ -1114,3 +1118,118 @@ class TestReframeA:
         # Standard batch flow fires
         mock_batch.assert_called_once()
         assert result["cross_window_dedup_hits"] == 0
+
+
+# ---------------------------------------------------------------------------
+# discover_transcripts — mtime sort
+# ---------------------------------------------------------------------------
+
+class TestDiscoverTranscripts:
+    """discover_transcripts() must return files sorted newest-first (mtime desc)."""
+
+    def test_returns_newest_first(self, tmp_path, monkeypatch):
+        """Files are sorted by mtime descending, not alphabetically."""
+        import os
+        fake_home = tmp_path / "home"
+        proj = fake_home / ".claude" / "projects" / "proj-abc"
+        proj.mkdir(parents=True)
+
+        old_file = proj / "aaaa.jsonl"
+        new_file = proj / "zzzz.jsonl"
+        old_file.write_text("{}")
+        new_file.write_text("{}")
+
+        # Set mtime so new_file is newer than old_file
+        now = time.time()
+        os.utime(old_file, (now - 3600, now - 3600))
+        os.utime(new_file, (now - 60, now - 60))
+
+        monkeypatch.setattr("pathlib.Path.home", staticmethod(lambda: fake_home))
+
+        results = discover_transcripts(max_age_hours=25)
+        assert len(results) == 2
+        # newest first: zzzz should come before aaaa despite alphabetical order
+        assert results[0].name == "zzzz.jsonl"
+        assert results[1].name == "aaaa.jsonl"
+
+    def test_excludes_files_older_than_max_age(self, tmp_path, monkeypatch):
+        """Files older than max_age_hours are excluded."""
+        import os
+        fake_home = tmp_path / "home"
+        proj = fake_home / ".claude" / "projects" / "proj-abc"
+        proj.mkdir(parents=True)
+
+        recent = proj / "recent.jsonl"
+        stale = proj / "stale.jsonl"
+        recent.write_text("{}")
+        stale.write_text("{}")
+
+        now = time.time()
+        os.utime(recent, (now - 1800, now - 1800))   # 30 min old — within 25h
+        os.utime(stale, (now - 90010, now - 90010))  # 25.003 hours old — outside
+
+        monkeypatch.setattr("pathlib.Path.home", staticmethod(lambda: fake_home))
+
+        results = discover_transcripts(max_age_hours=25)
+        names = [r.name for r in results]
+        assert "recent.jsonl" in names
+        assert "stale.jsonl" not in names
+
+
+# ---------------------------------------------------------------------------
+# append_to_ephemeral — kind vocabulary mapping
+# ---------------------------------------------------------------------------
+
+class TestAppendToEphemeralKindMapping:
+    """append_to_ephemeral() must map extraction kind vocab to OBSERVATION_TYPES."""
+
+    def _run(self, tmp_path, observations):
+        mem_dir = tmp_path / "memory"
+        mem_dir.mkdir()
+        count = append_to_ephemeral(mem_dir, observations, dry_run=False)
+        target = mem_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
+        return count, target.read_text()
+
+    def test_finding_maps_to_domain_knowledge(self, tmp_path):
+        """kind='finding' → obs_type='domain_knowledge'."""
+        obs = [{"kind": "finding", "content": "Python 3 only codebase."}]
+        count, text = self._run(tmp_path, obs)
+        assert count == 1
+        assert "domain_knowledge" in text
+
+    def test_decision_maps_to_decision_context(self, tmp_path):
+        """kind='decision' → obs_type='decision_context'."""
+        obs = [{"kind": "decision", "content": "Chose PostgreSQL."}]
+        count, text = self._run(tmp_path, obs)
+        assert "decision_context" in text
+
+    def test_preference_maps_to_preference_signal(self, tmp_path):
+        """kind='preference' → obs_type='preference_signal'."""
+        obs = [{"kind": "preference", "content": "Prefers dark mode."}]
+        count, text = self._run(tmp_path, obs)
+        assert "preference_signal" in text
+
+    def test_constraint_maps_to_domain_knowledge(self, tmp_path):
+        """kind='constraint' → obs_type='domain_knowledge'."""
+        obs = [{"kind": "constraint", "content": "Max 4GB RAM on CI."}]
+        count, text = self._run(tmp_path, obs)
+        assert "domain_knowledge" in text
+
+    def test_correction_passes_through(self, tmp_path):
+        """kind='correction' → obs_type='correction' (same name, no mapping needed)."""
+        obs = [{"kind": "correction", "content": "Was wrong about async."}]
+        count, text = self._run(tmp_path, obs)
+        assert "correction" in text
+
+    def test_open_question_maps_to_shared_insight(self, tmp_path):
+        """kind='open_question' → obs_type='shared_insight'."""
+        obs = [{"kind": "open_question", "content": "Should we use Redis?"}]
+        count, text = self._run(tmp_path, obs)
+        assert "shared_insight" in text
+
+    def test_unknown_kind_falls_through_gracefully(self, tmp_path):
+        """Unknown kind not in OBSERVATION_TYPES → still written, just untyped."""
+        obs = [{"kind": "bogus_type", "content": "Some content."}]
+        count, text = self._run(tmp_path, obs)
+        assert count == 1
+        assert "Some content." in text
