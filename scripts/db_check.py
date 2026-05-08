@@ -103,6 +103,48 @@ def _check_fts_coverage() -> int:
     return 0
 
 
+def _check_observation_backlog() -> int:
+    """Flag stalled consolidation: observations stuck in 'pending' status.
+
+    A healthy pipeline keeps the pending count low — pre_compact processes
+    observations into Memory rows. Sustained backlog means consolidation
+    isn't firing (hook misconfigured, LLM call failing, or rate-limited).
+    """
+    try:
+        pending = db.execute_sql(
+            "SELECT COUNT(*) FROM observations WHERE status = 'pending'"
+        ).fetchone()[0]
+        total = db.execute_sql("SELECT COUNT(*) FROM observations").fetchone()[0]
+    except Exception:
+        return 0  # Schema may not have observations table on older DBs
+
+    if total == 0:
+        return 0
+
+    last_consolidation = db.execute_sql(
+        "SELECT MAX(timestamp) FROM consolidation_log"
+    ).fetchone()[0]
+    last_observation = db.execute_sql(
+        "SELECT MAX(created_at) FROM observations"
+    ).fetchone()[0]
+
+    backlog_ratio = pending / total if total else 0
+    issues = 0
+
+    if backlog_ratio >= 0.5:
+        issues += 1
+        print(f"  STALLED PIPELINE: {pending}/{total} observations still 'pending' ({backlog_ratio:.0%})")
+        print(f"    last consolidation: {last_consolidation}")
+        print(f"    most recent observation: {last_observation}")
+        print(f"    → check pre_compact hook, LLM transport, and consolidator logs")
+    elif pending > 100:
+        issues += 1
+        print(f"  PENDING BACKLOG: {pending} observations awaiting consolidation")
+        print(f"    last consolidation: {last_consolidation}")
+
+    return issues
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-dir", default=os.path.expanduser("~/.claude/memory"))
@@ -145,6 +187,12 @@ def main() -> None:
         n = _check_fts_coverage()
         if n == 0:
             print("  ✓ FTS fully covered")
+        total_issues += n
+
+        print("\n=== Observation backlog (consolidation health) ===")
+        n = _check_observation_backlog()
+        if n == 0:
+            print("  ✓ No stalled-consolidation backlog")
         total_issues += n
 
         print(f"\n{'─'*40}")
