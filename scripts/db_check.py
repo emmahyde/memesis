@@ -230,11 +230,16 @@ def _check_observation_backlog() -> int:
         pending = db.execute_sql(
             "SELECT COUNT(*) FROM observations WHERE status = 'pending'"
         ).fetchone()[0]
-        total = db.execute_sql("SELECT COUNT(*) FROM observations").fetchone()[0]
+        # Exclude terminal statuses (orphaned/failed/aged) from the denominator
+        # — those represent resolved bookkeeping, not the pool consolidation
+        # is working through. Pending/processed gives a true backlog ratio.
+        live_total = db.execute_sql(
+            "SELECT COUNT(*) FROM observations WHERE status NOT IN ('orphaned', 'failed', 'aged')"
+        ).fetchone()[0]
     except Exception:
         return 0  # Schema may not have observations table on older DBs
 
-    if total == 0:
+    if live_total == 0:
         return 0
 
     last_consolidation = db.execute_sql(
@@ -244,12 +249,12 @@ def _check_observation_backlog() -> int:
         "SELECT MAX(created_at) FROM observations"
     ).fetchone()[0]
 
-    backlog_ratio = pending / total if total else 0
+    backlog_ratio = pending / live_total if live_total else 0
     issues = 0
 
     if backlog_ratio >= 0.5:
         issues += 1
-        print(f"  STALLED PIPELINE: {pending}/{total} observations still 'pending' ({backlog_ratio:.0%})")
+        print(f"  STALLED PIPELINE: {pending}/{live_total} live observations still 'pending' ({backlog_ratio:.0%})")
         print(f"    last consolidation: {last_consolidation}")
         print(f"    most recent observation: {last_observation}")
         print(f"    → check pre_compact hook, LLM transport, and consolidator logs")
