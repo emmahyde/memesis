@@ -135,6 +135,27 @@ class FeedbackLoop:
             self._session_usage[session_id] = {}
         self._session_usage[session_id].update(usage_map)
 
+        # Observability: emit acceptance trace correlated with log_retrieval.
+        try:
+            import json as _json
+            from .models import RetrievalLog as _RL
+            from .observability import log_acceptance
+            # Pull retrieval_id off the most recent injected row for this session.
+            row = (_RL.select(_RL.metadata)
+                   .where(_RL.session_id == session_id,
+                          _RL.retrieval_type == 'injected',
+                          _RL.metadata.is_null(False))
+                   .order_by(_RL.timestamp.desc())
+                   .first())
+            if row and row.metadata:
+                rid = _json.loads(row.metadata).get("retrieval_id")
+                if rid:
+                    accepted = [mid for mid, used in usage_map.items() if used]
+                    rejected = [mid for mid, used in usage_map.items() if not used]
+                    log_acceptance(rid, accepted, rejected)
+        except Exception:
+            pass
+
         return usage_map
 
     @staticmethod

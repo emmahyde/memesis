@@ -185,7 +185,7 @@ _THREAD_NARRATIVE_CAP = 1_000
 # ---------------------------------------------------------------------------
 
 
-def _record_injection(memory_id: str, session_id: str, project_context: str = None) -> None:
+def _record_injection(memory_id: str, session_id: str, project_context: str = None, retrieval_id: str | None = None) -> None:
     """Record that a memory was injected into a session."""
     now = datetime.now().isoformat()
     Memory.update(
@@ -193,12 +193,14 @@ def _record_injection(memory_id: str, session_id: str, project_context: str = No
         injection_count=Memory.injection_count + 1,
     ).where(Memory.id == memory_id).execute()
 
+    metadata_json = json.dumps({"retrieval_id": retrieval_id}) if retrieval_id else None
     RetrievalLog.create(
         timestamp=now,
         session_id=session_id,
         memory_id=memory_id,
         retrieval_type='injected',
         project_context=project_context,
+        metadata=metadata_json,
     )
 
 
@@ -265,9 +267,34 @@ class RetrievalEngine:
                 limit=len(tier2),
             )
 
-        # Log injections for every memory surfaced
+        # Observability: emit one retrieval-trace covering this session's injection.
+        # Captures the candidate set so downstream acceptance signals (track_usage)
+        # can compute precision@k. Retrieval_id stashed on each RetrievalLog row
+        # via _record_injection so track_usage can correlate later.
+        retrieval_id: str | None = None
+        try:
+            from .observability import log_retrieval
+            returned_ids = [m.id for m in tier1 + tier2]
+            if returned_ids:
+                retrieval_id = log_retrieval(
+                    query=query or "",
+                    candidate_ids=returned_ids,
+                    returned_ids=returned_ids,
+                    scores={m.id: float(m.importance or 0.0) for m in tier1 + tier2},
+                    context={
+                        "session_id": session_id,
+                        "project_context": project_context,
+                        "tier1_count": len(tier1),
+                        "tier2_count": len(tier2),
+                        "source": "inject_for_session",
+                    },
+                )
+        except Exception:
+            retrieval_id = None
+
+        # Log injections for every memory surfaced (retrieval_id correlates them)
         for memory in tier1 + tier2:
-            _record_injection(memory.id, session_id, project_context=project_context)
+            _record_injection(memory.id, session_id, project_context=project_context, retrieval_id=retrieval_id)
 
         # RISK-11: compute per-module scores over all injected memories.
         self._last_module_scores = compute_module_scores(tier1 + tier2)
