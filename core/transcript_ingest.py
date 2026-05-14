@@ -151,7 +151,7 @@ If no refinement is warranted, return {{"refined": <input observations unchanged
 """
 
 
-def discover_transcripts(max_age_hours: int = 25) -> list[Path]:
+def discover_transcripts(max_age_hours: int = 60 * 24) -> list[Path]:
     """Glob JSONL transcripts modified within max_age_hours, sorted newest-first.
 
     Sorted by modification time descending so tick(max_sessions=N) always

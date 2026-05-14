@@ -37,7 +37,7 @@ class LifecycleManager:
     STAGE_ORDER = ['ephemeral', 'consolidated', 'crystallized', 'instinctive']
 
     # Spacing effect: minimum distinct calendar days reinforcements must span.
-    MIN_REINFORCEMENT_SPAN_DAYS = 2
+    MIN_REINFORCEMENT_SPAN_DAYS = 0
 
     def __init__(self):
         pass
