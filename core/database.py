@@ -21,6 +21,7 @@ from .models import (
     EvalRun,
     Memory,
     MemoryEdge,
+    MemoryEmbedding,
     NarrativeThread,
     Observation,
     RetrievalLog,
@@ -47,6 +48,7 @@ ALL_TABLES = [
     RetrievalCandidate,
     AffectLog,
     EvalRun,
+    MemoryEmbedding,
 ]
 
 

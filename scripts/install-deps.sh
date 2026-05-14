@@ -32,7 +32,7 @@ echo "[memesis] Using Python: $PYTHON ($($PYTHON --version 2>&1))" >&2
 mkdir -p "$PLUGIN_DATA"
 "$PYTHON" -m venv --clear "$VENV_DIR"
 
-# Install deps (apsw handles sqlite extension loading internally)
+# Install deps
 "$VENV_DIR/bin/pip" install -q -r "$REQUIREMENTS"
 
 # Download NLTK data into plugin data dir

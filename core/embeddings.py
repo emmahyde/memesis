@@ -1,107 +1,109 @@
 """
-Embedding service — wraps AWS Bedrock Titan Text Embeddings v2.
+Embedding service — wraps fastembed (BAAI/bge-small-en-v1.5) for local CPU embeddings.
 
-Computes text embeddings via API and returns raw float32 bytes ready
-for storage in sqlite-vec's vec0 virtual table.
+Computes text embeddings via ONNX runtime and returns raw float32 bytes ready
+for storage as a Peewee BlobField on the MemoryEmbedding table.
 
-The embedding is computed once at memory creation time and persisted
-in the vec_memories table. Query-time embedding uses the same function.
+The embedding is computed once at memory creation time and persisted in
+memory_embeddings. Query-time embedding uses the same function.
 """
 
-import json
 import logging
-import os
-import struct
+import threading
 
 logger = logging.getLogger(__name__)
 
-# Titan v2 supports 256, 512, or 1024 dimensions.
-# 512 is a good tradeoff: half the storage of 1024, minimal quality loss.
-DEFAULT_DIMENSIONS = 512
+DEFAULT_DIMENSIONS = 384
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_EMBEDDING_VERSION = "fastembed-v1"
 
-# Active embedding model identifier (Bedrock model ID).
-DEFAULT_EMBEDDING_MODEL = "amazon.titan-embed-text-v2:0"
-
-# Embedding schema version — bump when model or dimension changes.
-DEFAULT_EMBEDDING_VERSION = "titan-v2-512-v1"
-
-_client = None
+_model = None
+_model_lock = threading.Lock()
 
 
-def _get_bedrock_client():
-    """Lazy-init the Bedrock runtime client."""
-    global _client
-    if _client is not None:
-        return _client
+def _get_model():
+    """Lazy-init the fastembed model. Singleton, thread-safe."""
+    global _model
+    if _model is not None:
+        return _model
 
-    try:
-        import boto3
-    except ImportError:
-        logger.warning("boto3 not installed — embeddings unavailable")
-        return None
-
-    region = os.environ.get("AWS_REGION", "us-west-2")
-    profile = os.environ.get("AWS_PROFILE", "bedrock-users")
-
-    try:
-        session = boto3.Session(profile_name=profile, region_name=region)
-        _client = session.client("bedrock-runtime")
-        return _client
-    except Exception as e:
-        logger.warning("Failed to create Bedrock client: %s", e)
-        return None
+    with _model_lock:
+        if _model is not None:
+            return _model
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            logger.warning("fastembed not installed — embeddings unavailable")
+            return None
+        try:
+            _model = TextEmbedding(model_name=DEFAULT_EMBEDDING_MODEL)
+            return _model
+        except Exception as e:
+            logger.warning("Failed to init fastembed model: %s", e)
+            return None
 
 
 def embed_text(text: str, dimensions: int = DEFAULT_DIMENSIONS) -> bytes | None:
     """
-    Embed text via Bedrock Titan Text Embeddings v2.
+    Embed text via fastembed (BAAI/bge-small-en-v1.5).
 
-    Returns raw float32 bytes (len = dimensions * 4) for sqlite-vec,
-    or None if embedding is unavailable.
+    Returns raw float32 bytes (len = dimensions * 4), or None if unavailable.
 
     Args:
-        text: The text to embed. Titan v2 supports up to 8192 tokens.
-        dimensions: Output vector dimensions (256, 512, or 1024).
+        text: The text to embed. bge-small handles up to 512 tokens (~2000 chars).
+        dimensions: Output vector dimensions. Must equal DEFAULT_DIMENSIONS (384) —
+                    bge-small is fixed-dim. Other values raise ValueError.
 
     Returns:
-        Raw float32 bytes suitable for sqlite-vec INSERT, or None.
+        Raw float32 bytes suitable for BlobField storage, or None on failure.
     """
-    client = _get_bedrock_client()
-    if client is None:
+    if dimensions != DEFAULT_DIMENSIONS:
+        raise ValueError(
+            f"bge-small-en-v1.5 is fixed at {DEFAULT_DIMENSIONS} dims; "
+            f"requested {dimensions}"
+        )
+
+    model = _get_model()
+    if model is None:
         return None
 
-    # Truncate to reasonable size — Titan v2 handles 8192 tokens,
-    # but we cap text to avoid sending huge payloads for long content.
-    text = text[:4000]
+    text = text[:2000]
 
     try:
-        response = client.invoke_model(
-            modelId="amazon.titan-embed-text-v2:0",
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "inputText": text,
-                "dimensions": dimensions,
-                "normalize": True,  # unit-length → L2 distance = cosine ranking
-            }),
-        )
-        body = json.loads(response["body"].read())
-        embedding = body["embedding"]
-        return struct.pack(f"{len(embedding)}f", *embedding)
+        vec = next(iter(model.embed([text])))
+        # bge-small fastembed output is already L2-normalized; cosine = dot product.
+        return vec.astype("float32").tobytes()
     except Exception as e:
         logger.warning("Embedding failed: %s", e)
         return None
 
 
-def embed_for_memory(title: str, summary: str = "", content: str = "") -> bytes | None:
+def embed_for_memory(
+    title: str,
+    summary: str = "",
+    content: str = "",
+    tags: list[str] | None = None,
+) -> bytes | None:
     """
-    Embed a memory's key fields for storage in vec_memories.
+    Embed a memory's key fields for storage in memory_embeddings.
 
-    Combines title + summary + content prefix into one text block,
-    weighted toward title (appears first, most signal per token).
+    Composition strategy (calibrated for bge-small short-text similarity):
+    - Title is repeated 2× — title carries the strongest topic signal per
+      token; doubling inflates same-topic cosine similarity by ~0.05, which
+      keeps clustering thresholds portable across embedding models.
+    - Tags appended as space-joined text. Shared `type:X` tags pull related
+      memories closer in vector space, reinforcing tag-based grouping.
+    - Full content is included (capped to 2000 chars by embed_text's
+      tokenizer-safe truncation), not just a 500-char prefix.
     """
-    text = f"{title}. {summary}"
+    parts: list[str] = []
+    if title:
+        parts.append(title)
+        parts.append(title)
+    if summary:
+        parts.append(summary)
     if content:
-        # Include content prefix for richer signal
-        text += f" {content[:500]}"
-    return embed_text(text)
+        parts.append(content)
+    if tags:
+        parts.append(" ".join(str(t) for t in tags if t))
+    return embed_text(". ".join(parts))

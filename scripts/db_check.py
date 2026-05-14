@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DB integrity check — validates Memory rows via proper apsw/Peewee interface.
+DB integrity check — validates Memory rows via the Peewee interface.
 
 Checks:
   1. content_hash consistency (stored hash matches md5(content))

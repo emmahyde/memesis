@@ -10,10 +10,11 @@ requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.40.0",
     "nltk>=3.8",
+    "nrclex>=4.0",
     "peewee>=3.17",
     "scikit-learn>=1.4",
-    "sqlite-vec>=0.1.6",
-    "apsw>=3.46",
+    "numpy>=1.24",
+    "fastembed>=0.4",
     "openai>=1.50",
     "flask>=3.0",
     "mcp>=1.8.0",

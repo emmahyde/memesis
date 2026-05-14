@@ -564,7 +564,7 @@ class TestProjectContext:
             close_db()
 
 
-def _make_embedding(dims: int = 512) -> bytes:
+def _make_embedding(dims: int = 384) -> bytes:
     floats = [float(i % 100) / 100.0 for i in range(dims)]
     return struct.pack(f"{dims}f", *floats)
 
@@ -583,22 +583,9 @@ class TestVecEnabled:
 
     @pytest.fixture
     def vec(self, tmp_path):
-        import sqlite3 as _sq3
-        try:
-            import sqlite_vec as _vec
-        except ImportError:
-            pytest.skip("sqlite_vec not installed")
-
-        test_conn = _sq3.connect(":memory:")
-        if not hasattr(test_conn, 'enable_load_extension'):
-            pytest.skip("sqlite3 compiled without extension loading support")
-        test_conn.close()
-
-        base_dir = init_db(base_dir=str(tmp_path / "memory"))
+        init_db(base_dir=str(tmp_path / "memory"))
         v = get_vec_store()
-        if not v or not v.available:
-            close_db()
-            pytest.skip("VecStore not available")
+        assert v is not None and v.available
         yield v
         close_db()
 
@@ -607,7 +594,7 @@ class TestVecEnabled:
 
     def test_store_and_get_embedding_roundtrip(self, vec):
         mem = _create_memory(content='Embedding roundtrip content')
-        emb = _make_embedding(512)
+        emb = _make_embedding(384)
         vec.store_embedding(mem.id, emb)
         retrieved = vec.get_embedding(mem.id)
         assert retrieved == emb
@@ -621,8 +608,8 @@ class TestVecEnabled:
 
     def test_store_embedding_overwrite(self, vec):
         mem = _create_memory(content='Overwrite test')
-        emb1 = _make_embedding(512)
-        emb2 = struct.pack("512f", *([0.99] * 512))
+        emb1 = _make_embedding(384)
+        emb2 = struct.pack("384f", *([0.99] * 384))
         vec.store_embedding(mem.id, emb1)
         vec.store_embedding(mem.id, emb2)
         retrieved = vec.get_embedding(mem.id)
@@ -630,14 +617,14 @@ class TestVecEnabled:
 
     def test_search_vector_returns_list(self, vec):
         mem = _create_memory(content='Search test content')
-        emb = _make_embedding(512)
+        emb = _make_embedding(384)
         vec.store_embedding(mem.id, emb)
         results = vec.search_vector(emb, k=5)
         assert isinstance(results, list)
 
     def test_search_vector_result_has_distance_key(self, vec):
         mem = _create_memory(content='Distance key test')
-        emb = _make_embedding(512)
+        emb = _make_embedding(384)
         vec.store_embedding(mem.id, emb)
         results = vec.search_vector(emb, k=5)
         assert len(results) >= 1
@@ -904,7 +891,7 @@ class TestHardDelete:
         if vec is None or not vec.available:
             pytest.skip("VecStore not available")
         mem = _create_memory(content='vec cascade check')
-        emb = struct.pack("512f", *([0.1] * 512))
+        emb = struct.pack("384f", *([0.1] * 384))
         vec.store_embedding(mem.id, emb)
         assert vec.get_embedding(mem.id) is not None
         Memory.hard_delete(mem.id)

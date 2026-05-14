@@ -12,6 +12,7 @@ import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -333,10 +334,12 @@ def test_active_search_result_fields(base, engine):
 
 
 def test_active_search_no_results(base, engine):
-    """Active search returns empty list when no FTS matches."""
+    """Active search returns empty list when no FTS matches and no vector path."""
     _make_memory("Completely unrelated", "crystallized", "Unrelated")
 
-    results = engine.active_search("xyzzy_nonexistent_term_42", session_id="s")
+    # Disable vector path so we exercise the FTS-only invariant.
+    with patch("core.embeddings.embed_text", return_value=None):
+        results = engine.active_search("xyzzy_nonexistent_term_42", session_id="s")
     assert results == []
 
 

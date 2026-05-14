@@ -41,6 +41,15 @@ class TestSaturationDecay:
         assert score > 0.3
 
     def test_heavy_penalty_for_unused(self, store, engine):
+        """RISK-09: lifetime injection_count is decoupled from relevance.
+
+        Both memories have usage_count=0, so both incur the same saturation
+        penalty regardless of injection_count. Originally this test asserted
+        that injection_count==10 with no use scored *lower* than a fresh
+        memory, but that contracts the RISK-09 decoupling guarantee enforced
+        by `tests/test_feedback.py::TestInjectionCountDecoupling`. Penalizing
+        injected-but-unused requires a session-windowed signal (out of scope).
+        """
         mem_unused = Memory.create(
             stage="crystallized", title="Never used",
             injection_count=10, usage_count=0, importance=0.7,
@@ -55,8 +64,7 @@ class TestSaturationDecay:
         )
         score_unused = engine.compute_relevance(mem_unused)
         score_fresh = engine.compute_relevance(mem_fresh)
-        # SC2: unused memory should score lower than fresh one
-        assert score_unused < score_fresh
+        assert abs(score_unused - score_fresh) < 1e-9
 
     def test_penalty_caps_at_0_3(self, store, engine):
         mem = Memory.create(
