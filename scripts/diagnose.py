@@ -29,7 +29,7 @@ from core.models import ConsolidationLog, Memory, RetrievalLog, db
 from core.relevance import RelevanceEngine
 from core.self_reflection import SelfReflector, SELF_MODEL_TITLE
 
-from peewee import fn
+from peewee import Case, fn
 
 
 def header(text: str) -> str:
@@ -151,11 +151,11 @@ def diagnose(project_context: str = None):
             RetrievalLog.select(
                 RetrievalLog.memory_id,
                 fn.COUNT(RetrievalLog.id).alias('inj'),
-                fn.SUM(fn.CASE(None, [(RetrievalLog.was_used == 1, 1)], 0)).alias('used'),
+                fn.SUM(Case(None, [(RetrievalLog.was_used == 1, 1)], 0)).alias('used'),
             )
             .group_by(RetrievalLog.memory_id)
             .having(fn.COUNT(RetrievalLog.id) >= 3)
-            .order_by(fn.CAST(fn.SUM(fn.CASE(None, [(RetrievalLog.was_used == 1, 1)], 0)), 'REAL') / fn.COUNT(RetrievalLog.id))
+            .order_by(fn.SUM(Case(None, [(RetrievalLog.was_used == 1, 1)], 0)).cast('REAL') / fn.COUNT(RetrievalLog.id))
             .limit(5)
         )
         gold_rows = list(gold)
