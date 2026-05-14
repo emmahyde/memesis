@@ -147,7 +147,7 @@ _Last updated: 2026-05-06. Prior version dated 2026-04-10._
 │   ├── stats/                    # /memesis:stats
 │   ├── teach/                    # /memesis:teach
 │   ├── threads/                  # /memesis:threads
-│   └── usage/                    # /memesis:usage
+│   └── retrieval/                # /memesis:retrieval
 │
 ├── docs/                         # Design documents and specs
 │   └── relationship-engine-spec.md

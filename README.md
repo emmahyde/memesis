@@ -94,8 +94,8 @@ Ten skills are available as slash commands:
 | `/memesis:threads` | View narrative thread visualization with member memories and evolution arcs.           |
 | `/memesis:stats`  | High-level memory statistics: counts by stage, importance distribution.                |
 | `/memesis:health` | Memory health diagnostics: archival candidates, relevance decay, stale memories.       |
-| `/memesis:usage`  | Usage analytics: injection counts, retrieval rates, most/least used memories.          |
-| `/memesis:dashboard` | Combined memory system overview pulling from stats, health, and usage data.         |
+| `/memesis:retrieval` | Retrieval analytics: injection counts, hit rates, most/least retrieved memories.    |
+| `/memesis:dashboard` | Combined memory system overview pulling from stats, health, and retrieval data.     |
 | `/memesis:backfill` | Seed memory from historical Claude Code transcripts.                                  |
 | `/memesis:ideate` | Autonomous ideation loop — self-driven development for memesis.                        |
 | `/memesis:run-eval` | Run the memesis eval suite (live or synthetic modes).                              |

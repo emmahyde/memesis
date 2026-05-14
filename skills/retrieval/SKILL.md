@@ -1,19 +1,19 @@
 ---
-name: usage
-description: Use when the user asks about memory injection patterns, retrieval hit rates, which memories get injected most, or "what memories are being used". Shows injection frequency, last-used timestamps, zombie detection, and retrieval hit/miss analysis. Does NOT overlap with /stats (memory counts/distribution) or /health (archival/relevance diagnostics).
+name: retrieval
+description: Use when the user asks about memory injection patterns, retrieval hit rates, which memories get injected most, or "what memories are being retrieved". Shows injection frequency, last-used timestamps, zombie detection, and retrieval hit/miss analysis. Does NOT overlap with /stats (memory counts/distribution) or /health (archival/relevance diagnostics).
 ---
 
-# Usage — Memory Injection and Retrieval Tracking
+# Retrieval — Memory Injection and Retrieval Tracking
 
-View how memories are being used: which ones are injected most, when they were last seen, and which may have gone stale (zombies — stored but never retrieved).
+View how memories are being retrieved and injected: which ones surface most, when they were last seen, and which may have gone stale (zombies — stored but never retrieved).
 
 ## Usage
 
 ```
-/memesis:usage                    # Show injection stats for current project
-/memesis:usage --global           # Across all projects
-/memesis:usage --zombies          # Only show memories never injected (injection_count=0)
-/memesis:usage --top N            # Top N by injection count (default 20)
+/memesis:retrieval                    # Show injection stats for current project
+/memesis:retrieval --global           # Across all projects
+/memesis:retrieval --zombies          # Only show memories never injected (injection_count=0)
+/memesis:retrieval --top N            # Top N by injection count (default 20)
 ```
 
 ## Procedure
