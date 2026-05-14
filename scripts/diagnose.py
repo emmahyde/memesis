@@ -23,11 +23,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.database import close_db, get_base_dir, get_db_path, init_db
+from core.database import close_db, init_db
 from core.manifest import ManifestGenerator
-from core.models import ConsolidationLog, Memory, RetrievalLog, db
+from core.models import ConsolidationLog, Memory, RetrievalLog
 from core.relevance import RelevanceEngine
-from core.self_reflection import SelfReflector, SELF_MODEL_TITLE
+from core.self_reflection import SelfReflector
 
 from peewee import Case, fn
 
@@ -64,6 +64,48 @@ def diagnose(project_context: str = None):
     archived_count = Memory.select().where(Memory.archived_at.is_null(False)).count()
     print(f"  {'archived':14s}  {archived_count:4d} total")
     print(f"  {'TOTAL':14s}  {total:4d} active")
+    print(f"\n  Note: crystallized memories show rc=0 by design — they're new")
+    print(f"  records subsuming archived sources whose rc was retired at promotion.")
+
+    # -- Crystallization Proximity --
+    from core.lifecycle import LifecycleManager
+    print(header("Crystallization Proximity"))
+    rc_gate = 3
+    span_gate = LifecycleManager.MIN_REINFORCEMENT_SPAN_DAYS
+    consolidated_mems = list(Memory.by_stage("consolidated"))
+    if consolidated_mems:
+        # Sort by rc desc, then by recency (updated_at desc as tiebreaker)
+        consolidated_mems.sort(
+            key=lambda m: (-(m.reinforcement_count or 0), -(len(m.updated_at or ""))),
+        )
+        # Per-memory days spanned by reinforcement events from ConsolidationLog
+        # action='reinforced' or action='promoted'.
+        from collections import defaultdict
+        days_by_mem: dict[str, set] = defaultdict(set)
+        rein_rows = list(
+            ConsolidationLog.select()
+            .where(ConsolidationLog.action.in_(["promoted", "reinforced", "kept"]))
+        )
+        for r in rein_rows:
+            mid = r.memory_id
+            ts = r.timestamp or ""
+            if mid and len(ts) >= 10:
+                days_by_mem[mid].add(ts[:10])
+
+        print(f"  rc/{rc_gate}  days/{span_gate}  memory")
+        for m in consolidated_mems[:15]:
+            rc = m.reinforcement_count or 0
+            ndays = len(days_by_mem.get(m.id, set()))
+            title = (m.title or "(untitled)")[:70]
+            print(f"   {rc}/{rc_gate}    {ndays}/{span_gate}    {title}")
+        promoted_count = ConsolidationLog.select().where(
+            ConsolidationLog.action == "promoted"
+        ).count()
+        gate_desc = f"spacing>={span_gate}d" + (" (DISABLED)" if span_gate == 0 else "")
+        print(f"\n  Promotion gate: rc>={rc_gate}, {gate_desc}")
+        print(f"  ConsolidationLog 'promoted' rows: {promoted_count}")
+    else:
+        print("  (no consolidated memories yet)")
 
     # -- Token budget --
     print(header("Token Budget"))

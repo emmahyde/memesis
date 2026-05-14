@@ -21,19 +21,18 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 from datetime import datetime
 from pathlib import Path
 
 from .compression import compress_memory_for_stage, compression_ratio, get_stage_depth
 
-from .database import get_base_dir, get_vec_store
+from .database import get_base_dir
 from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
-from .linking import link_memory as _link_memory
+from .linking import link_memory as _link_memory, auto_promote_if_dupe
 from .llm import call_llm as _call_llm_transport
-from .models import ConsolidationLog, Memory, Observation, db
+from .models import ConsolidationLog, Memory, Observation
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
 from .question_lifecycle import (
@@ -197,6 +196,14 @@ class Consolidator:
                     try:
                         mem = Memory.get_by_id(memory_id)
                         _link_memory(mem)
+                        # Auto-promote: if this KEEP is a near-duplicate of an existing
+                        # memory, subsume it instead of leaving both. Drives crystallization
+                        # via embedding similarity rather than waiting on LLM PROMOTE.
+                        survivor_id = auto_promote_if_dupe(mem)
+                        if survivor_id:
+                            kept.remove(memory_id)
+                            promoted.append(survivor_id)
+                            self._mark_observations(refs, "promoted", survivor_id)
                     except Exception as _link_exc:
                         logger.debug("Linking skipped for %s: %s", memory_id, _link_exc)
                     # WS-H: open_question lifecycle hook
@@ -690,10 +697,10 @@ class Consolidator:
             or ""
         )
 
-        # Tag observation type if the consolidator classified it
-        obs_type = decision.get("observation_type")
-        if obs_type and obs_type != "null" and f"type:{obs_type}" not in tags:
-            tags.append(f"type:{obs_type}")
+        # Tag observation kind for retrieval filtering (replaces dead observation_type read).
+        obs_kind = decision.get("kind")
+        if obs_kind and obs_kind != "null" and f"kind:{obs_kind}" not in tags:
+            tags.append(f"kind:{obs_kind}")
 
         # Somatic marker — classify valence and boost importance
         from .somatic import classify_valence
@@ -802,6 +809,7 @@ class Consolidator:
                 criterion_weights=json.dumps(card_fields.get("criterion_weights")) if card_fields.get("criterion_weights") else None,
                 rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
                 # Stage 2 enrichment fields from consolidation prompt
+                kind=decision.get("kind"),
                 subject=decision.get("subject"),
                 work_event=decision.get("work_event"),
                 knowledge_type=decision.get("knowledge_type"),

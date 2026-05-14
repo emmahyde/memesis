@@ -144,6 +144,35 @@ KEEP gates (in priority order):
    any AI.
 4. WORKFLOW PATTERNS — How this specific person works in ways you wouldn't guess.
 
+PROMOTE gates (CHECK BEFORE KEEP):
+Before deciding KEEP, scan the EXISTING MEMORY MANIFEST above. If a new observation
+restates, refines, adds evidence to, or operationalizes an existing memory, you MUST:
+  - set `action` = "promote"
+  - set `reinforces` = that memory's id (the [uuid] from the manifest)
+  - do NOT also create a duplicate KEEP for the same fact
+A promote is a vote that the existing memory was correct and is recurring. This is
+how memories accumulate enough reinforcement to crystallize. Defaulting to KEEP when
+a manifest match exists fragments the memory store and prevents crystallization.
+
+Examples of promote-worthy overlap:
+  - New: "Emma wants ELK renderer for mermaid"  + Manifest: "Mermaid diagram style — ELK renderer..."  → promote
+  - New: "Skip articles in caveman lite mode"   + Manifest: "Caveman mode lite formatting rules"        → promote
+  - New: "Use uv run, not bare python3"         + Manifest: "Python: prefer uv run for uv.lock projects" → promote
+
+ARCHIVE gates:
+If a new observation CONTRADICTS or SUPERSEDES an existing memory (event happened
+that invalidates the prior fact — provider switched, library replaced, decision
+reversed, scope narrowed), you MUST:
+  - set `action` = "archive"
+  - set `contradicts` = the obsolete memory's id (the [uuid] from the manifest)
+  - additionally emit a separate KEEP decision capturing the new corrected fact
+A contradiction without archiving leaves stale facts in the store. Archive is for
+factual obsolescence; PROMOTE is for reinforcement. Do not conflate.
+
+Examples of archive-worthy contradiction:
+  - New: "Switched embeddings to local fastembed bge-small" + Manifest: "Embeddings provider: OpenRouter openai/text-embedding-3-small" → archive old, keep new
+  - New: "Daemon now auto-managed by plugin"                + Manifest: "Run daemon manually with start.sh"                              → archive old, keep new
+
 PRUNE if:
 - Re-derivable from code, git log, docs, or codebase reading
 - One-time task mechanics, file paths, commit hashes, test output
@@ -238,12 +267,14 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "cwd": "/abs/path/or/null",
       "subject": "self|user|system|collaboration|workflow|aesthetic|domain",
       "work_event": "bugfix|feature|refactor|discovery|change|null",
+      "title": "≤8-word headline naming the durable lesson (no pronouns, action-oriented)",
+      "summary": "1–2 sentence elaboration explaining the rule, the trigger, and the corrective behavior — distinct from title, used as retrieval body",
       "subtitle": "retrieval card no longer than twenty-four words",
-      "action": "keep|prune|promote",
+      "action": "keep|prune|promote|archive",
       "rationale": "why this decision",
       "target_path": "category/filename.md (keep only)",
-      "reinforces": "memory_id or null",
-      "contradicts": "memory_id or null",
+      "reinforces": "memory_id or null (required when action=promote)",
+      "contradicts": "memory_id or null (required when action=archive)",
       "resolves_question_id": "memory_id of the open_question this resolves, or null"
     }}
   ]

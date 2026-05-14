@@ -18,17 +18,26 @@ import os
 import struct
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 from .models import Memory
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration — OD-D: threshold parameterized via env var (default 0.90)
+# Configuration — OD-D: threshold parameterized via env var.
+# Recalibrated 2026-05-13 for bge-small-en-v1.5 @ 384d (was 0.90 for Titan @ 1024d).
+# Empirical distribution on N=300 pairs from this corpus: mean=0.645, stdev=0.046,
+# max=0.927. 0.72 ≈ mean + 1.5σ — captures genuine semantic neighbors while staying
+# clear of the dense background-similarity floor.
 # ---------------------------------------------------------------------------
 
-LINK_COSINE_THRESHOLD: float = float(os.environ.get("MEMESIS_LINK_THRESHOLD", "0.90"))
+LINK_COSINE_THRESHOLD: float = float(os.environ.get("MEMESIS_LINK_THRESHOLD", "0.72"))
+# Auto-promote: when a newly KEPT memory is this close to an existing one,
+# treat it as a duplicate. Bump the existing memory's reinforcement_count and
+# archive the new dupe instead of leaving both in the store. Tighter than the
+# link threshold because the action is destructive (subsumes the new memory).
+LINK_AUTO_PROMOTE_THRESHOLD: float = float(os.environ.get("MEMESIS_AUTO_PROMOTE_THRESHOLD", "0.85"))
 LINK_MAX_NEIGHBORS: int = 3
 LINK_MIN_NEIGHBORS: int = 0  # may return empty list
 
@@ -173,6 +182,56 @@ def detect_topic_drift(new_memory, linked_memory) -> bool:
         return False
 
     return new_kind != lnk_kind and new_subject != lnk_subject and new_kt != lnk_kt
+
+
+def auto_promote_if_dupe(memory) -> Optional[str]:
+    """
+    If a newly created memory is near-identical (cosine >= LINK_AUTO_PROMOTE_THRESHOLD)
+    to an existing non-archived memory, treat it as a duplicate KEEP:
+      - bump the existing memory's reinforcement_count
+      - archive the new memory and set subsumed_by to the survivor
+    Returns the survivor's id if subsumption occurred, else None.
+
+    Called from the consolidator after link_memory() to collapse semantic dupes
+    that the LLM didn't recognize as PROMOTE-worthy.
+    """
+    from datetime import datetime
+    try:
+        candidates = list(
+            Memory.select().where(
+                Memory.archived_at.is_null(),
+                Memory.id != str(memory.id),
+            )
+        )
+    except Exception as exc:
+        logger.warning("auto_promote_if_dupe: candidate load failed for %s: %s", memory.id, exc)
+        return None
+    if not candidates:
+        return None
+    neighbors = find_links_for_observation(
+        memory,
+        candidates,
+        threshold=LINK_AUTO_PROMOTE_THRESHOLD,
+        top_k=1,
+    )
+    if not neighbors:
+        return None
+    target_id, score = neighbors[0]
+    try:
+        target = Memory.get_by_id(target_id)
+    except Memory.DoesNotExist:
+        return None
+    target.reinforcement_count = (target.reinforcement_count or 0) + 1
+    target.save()
+    Memory.update(
+        archived_at=datetime.now().isoformat(),
+        subsumed_by=target_id,
+    ).where(Memory.id == str(memory.id)).execute()
+    logger.info(
+        "AUTO-PROMOTE: %s subsumed by %s (cosine=%.3f, target rc=%d)",
+        str(memory.id)[:8], str(target_id)[:8], score, target.reinforcement_count,
+    )
+    return target_id
 
 
 def link_memory(memory, db_session=None) -> list[str]:
