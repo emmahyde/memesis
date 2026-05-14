@@ -6,3 +6,21 @@ reduce.db
 eval/transcripts/
 eval/eval-observations.db
 eval/reports/
+
+# Python venv
+.venv/
+
+# Headroom runtime DBs
+.headroom/
+
+# Node modules anywhere under the tree
+node_modules/
+
+# Planning artifacts (RFCs are tracked individually; baselines are runtime)
+.planning/eval-baseline-*.json
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
