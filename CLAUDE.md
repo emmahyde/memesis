@@ -1,6 +1,6 @@
 ## Rules
 
-1. **All persistence through `MemoryStore` or `database.py`.** Never write memory markdown files or SQLite rows directly. Atomic writes use `tempfile.mkstemp` + `shutil.move`. **CRITICAL: Never use raw `sqlite3.connect()` on the plugin's `index.db`** — it is managed by `apsw` in WAL mode. Direct stdlib sqlite3 connections corrupt the WAL and make the DB unreadable. Always use `init_db()`, Peewee models, or `db.execute_sql()` for any DB access.
+1. **All persistence through `MemoryStore` or `database.py`.** Never write memory markdown files or SQLite rows directly. Atomic writes use `tempfile.mkstemp` + `shutil.move`. **CRITICAL: Do not open separate `sqlite3.connect()` connections to `index.db`.** The Peewee `db` singleton manages WAL mode and `busy_timeout=5000`; bypassing it creates concurrent-writer races. Always use `init_db()`, Peewee models, or `db.execute_sql()` for any DB access.
 
 2. **All LLM calls through `core.llm.call_llm()`.** Do not create `anthropic.Anthropic()` clients in service modules.
 

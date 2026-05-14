@@ -847,7 +847,7 @@ class TestReframeA:
     """Tests for REFRAME_A_ENABLED flag and in-session vector index behavior.
 
     All tests mock core.embeddings.embed_text — no real Bedrock calls.
-    Mock vectors use small deterministic bytes matching _DIM=512 floats.
+    Mock vectors use small deterministic bytes matching _DIM=384 floats.
     """
 
     def _make_fake_affect(self, max_boost: float = 0.0, valence: str = "neutral"):
@@ -865,16 +865,16 @@ class TestReframeA:
         return a
 
     def _embed_a(self) -> bytes:
-        """Deterministic 512-float embedding bytes for 'topic A'."""
+        """Deterministic 384-float embedding bytes for 'topic A'."""
         import struct
-        floats = [1.0] + [0.0] * 511
-        return struct.pack(f"512f", *floats)
+        floats = [1.0] + [0.0] * 383
+        return struct.pack("384f", *floats)
 
     def _embed_b(self) -> bytes:
-        """Deterministic 512-float embedding bytes for 'topic B' — orthogonal to A."""
+        """Deterministic 384-float embedding bytes for 'topic B' — orthogonal to A."""
         import struct
-        floats = [0.0, 1.0] + [0.0] * 510
-        return struct.pack(f"512f", *floats)
+        floats = [0.0, 1.0] + [0.0] * 382
+        return struct.pack("384f", *floats)
 
     def test_disabled_default_no_change(self, tmp_path):
         """REFRAME_A_ENABLED=False (default) → cross_window_dedup_hits==0, no embed calls."""
@@ -941,10 +941,6 @@ class TestReframeA:
         from core.transcript_ingest import extract_observations_hierarchical
         import core.transcript_ingest as ti
 
-        try:
-            import sqlite_vec  # noqa: F401
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
 
         from core.database import init_db, close_db
         init_db(base_dir=str(tmp_path))
@@ -989,10 +985,6 @@ class TestReframeA:
         from core.transcript_ingest import extract_observations_hierarchical
         import core.transcript_ingest as ti
 
-        try:
-            import sqlite_vec  # noqa: F401
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
 
         from core.database import init_db, close_db
         init_db(base_dir=str(tmp_path))
@@ -1046,13 +1038,9 @@ class TestReframeA:
         import struct
         from unittest.mock import patch
         from core.transcript_ingest import extract_observations_hierarchical
-        from core.session_vec import SessionVecStore, _slug
+        from core.session_vec import SessionVecStore
         import core.transcript_ingest as ti
 
-        try:
-            import sqlite_vec  # noqa: F401
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
 
         from core.database import init_db, close_db
         init_db(base_dir=str(tmp_path))

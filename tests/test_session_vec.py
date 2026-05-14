@@ -1,10 +1,9 @@
 """
 Tests for core.session_vec.SessionVecStore.
 
-Uses deterministic small float vectors (4-dim rather than 512) — BUT sqlite-vec
-requires the declared dimension to match the actual bytes. So we use 512-dim
-zero-padded vectors: the test helper produces a 512-float bytes object where
-only the first few values differ between "similar" and "dissimilar" vectors.
+Uses deterministic small float vectors zero-padded to the embedding dim. The test
+helper produces a `_DIM`-float bytes object where only the first few values differ
+between "similar" and "dissimilar" vectors.
 
 All tests use tmp_path for isolation — no real ~/.claude/memory access.
 """
@@ -21,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Helpers
 # ---------------------------------------------------------------------------
 
-_DIM = 512
+_DIM = 384
 
 
 def _make_embedding(values: list[float]) -> bytes:
@@ -31,24 +30,9 @@ def _make_embedding(values: list[float]) -> bytes:
     return struct.pack(f"{_DIM}f", *floats)
 
 
-# Two "orthogonal" unit vectors in 512-d space (well, just the first component differs).
+# Two "orthogonal" unit vectors (just the first component differs).
 EMBED_A = _make_embedding([1.0, 0.0])   # "topic A"
 EMBED_B = _make_embedding([0.0, 1.0])   # "topic B" — orthogonal to A
-
-
-# ---------------------------------------------------------------------------
-# Skip all tests if sqlite-vec is unavailable (CI without the extension)
-# ---------------------------------------------------------------------------
-
-try:
-    import sqlite_vec  # noqa: F401
-    _VEC_AVAILABLE = True
-except ImportError:
-    _VEC_AVAILABLE = False
-
-pytestmark = pytest.mark.skipif(
-    not _VEC_AVAILABLE, reason="sqlite-vec not installed"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +115,8 @@ class TestSessionVecIndex:
         store_a = make_store(session_id="session-alpha")
         store_b = make_store(session_id="session-beta")
 
-        assert store_a._table != store_b._table
+        assert store_a._embeddings is not store_b._embeddings
+        assert store_a._session_id != store_b._session_id
 
         store_a.add(obs_idx=0, embedding=EMBED_A)
 

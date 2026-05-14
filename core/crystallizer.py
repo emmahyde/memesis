@@ -173,6 +173,9 @@ class Crystallizer:
         embeddings = _get_embeddings(candidates) if min_text_len >= 10 else None
 
         if embeddings is not None:
+            # Static 0.75 acts as the hard floor; _group_by_embeddings raises
+            # the effective threshold via P75 of the batch's pairwise sims if
+            # the active embedding model produces a tighter distribution.
             return self._group_by_embeddings(candidates, embeddings, threshold=0.75)
 
         # Phase 2: Fall back to tag-overlap (original logic)
@@ -247,20 +250,33 @@ class Crystallizer:
     def _group_by_embeddings(
         self,
         candidates: list,
-        embeddings,  # numpy array (N, 512)
+        embeddings,  # numpy array (N, dim)
         threshold: float,
     ) -> list[list]:
         """
         Group candidates by embedding cosine similarity using union-find.
 
-        Pairs with cosine similarity >= threshold are merged into the same group.
+        Effective threshold is `max(static_threshold, P75_off_diagonal_sims)`,
+        capped at 0.85. The percentile floor adapts to the embedding model's
+        similarity scale: if a model produces a tight distribution where most
+        pairs sit above the static cutoff, the floor lifts the bar so we don't
+        merge everything. Static threshold remains a hard minimum so we never
+        over-cluster on a sparse batch.
         """
         import numpy as np
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         normed = embeddings / np.maximum(norms, 1e-9)
-        sims = normed @ normed.T  # (N, N) cosine similarity matrix
+        sims = normed @ normed.T
 
         n = len(candidates)
+        if n >= 2:
+            iu = np.triu_indices(n, k=1)
+            off_diag = sims[iu]
+            adaptive = float(np.percentile(off_diag, 75)) if off_diag.size else threshold
+            effective = min(0.85, max(threshold, adaptive))
+        else:
+            effective = threshold
+
         parent = list(range(n))
 
         def find(x):
@@ -271,7 +287,7 @@ class Crystallizer:
 
         for i in range(n):
             for j in range(i + 1, n):
-                if sims[i, j] >= threshold:
+                if sims[i, j] >= effective:
                     ri, rj = find(i), find(j)
                     if ri != rj:
                         parent[ri] = rj

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from peewee import (
     AutoField,
+    BlobField,
     CompositeKey,
     DateTimeField,
     FloatField,
@@ -26,27 +27,9 @@ from peewee import (
 
 logger = logging.getLogger(__name__)
 
-try:
-    import sqlite_vec as _sqlite_vec
-    _VEC_AVAILABLE = True
-except ImportError:
-    _VEC_AVAILABLE = False
-
-
-class VecSqliteDatabase(SqliteDatabase):
-    """SqliteDatabase that loads sqlite-vec on every connection."""
-
-    def _connect(self):
-        conn = super()._connect()
-        if _VEC_AVAILABLE:
-            conn.enable_load_extension(True)
-            _sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        return conn
-
 
 # Deferred database — bound by init_db()
-db = VecSqliteDatabase(None)
+db = SqliteDatabase(None)
 
 _FTS_STOP_WORDS = frozenset({
     "a", "an", "the", "is", "are", "was", "were", "be", "been",
@@ -214,13 +197,12 @@ class Memory(BaseModel):
 
     @classmethod
     def hard_delete(cls, memory_id: str) -> None:
-        """Hard-delete a memory with cascade to FTS5 and vec_memories.
+        """Hard-delete a memory with cascade to FTS5 and memory_embeddings.
 
         All three DELETE statements run inside a single db.atomic() block.
         This is the ONLY sanctioned path for raw deletion — no app code
         should issue raw DELETE FROM memories outside this method.
         """
-        from .database import get_vec_store
         with db.atomic():
             # FTS5 cascade: fetch current DB values first (same as _fts_delete_from_db)
             cursor = db.execute_sql(
@@ -235,16 +217,8 @@ class Memory(BaseModel):
                     "VALUES('delete', ?, ?, ?, ?, ?)",
                     (rowid, title or "", summary or "", tags or "", content or ""),
                 )
-            # vec_memories cascade (no-op when VecStore unavailable)
-            vec_store = get_vec_store()
-            if vec_store is not None and vec_store.available:
-                try:
-                    db.execute_sql(
-                        "DELETE FROM vec_memories WHERE memory_id = ?",
-                        (memory_id,),
-                    )
-                except Exception:
-                    pass
+            # memory_embeddings cascade
+            MemoryEmbedding.delete().where(MemoryEmbedding.memory_id == memory_id).execute()
             # Primary row
             db.execute_sql("DELETE FROM memories WHERE id = ?", (memory_id,))
 
@@ -339,19 +313,58 @@ class Memory(BaseModel):
     # -- Save / Delete with FTS sync -----------------------------------
 
     def save(self, force_insert=False, only=None):
-        """Override save to keep FTS index in sync (atomic)."""
+        """Override save to keep FTS index and embeddings in sync (atomic)."""
         self.updated_at = datetime.now().isoformat()
-        if self.content:
-            self.content_hash = self.compute_hash(self.content)
+        new_hash = self.compute_hash(self.content) if self.content else None
 
         is_update = not force_insert and self.id and self._pk_exists()
+
+        # Detect content change → embedding refresh required.
+        embedding_stale = bool(new_hash)
+        if is_update and new_hash:
+            try:
+                old_hash = (
+                    Memory
+                    .select(Memory.content_hash)
+                    .where(Memory.id == self.id)
+                    .scalar()
+                )
+                embedding_stale = old_hash != new_hash
+            except Exception:
+                embedding_stale = True
+
+        if new_hash:
+            self.content_hash = new_hash
 
         with db.atomic():
             if is_update:
                 self._fts_delete_from_db()
             result = super().save(force_insert=force_insert, only=only)
             self._fts_insert()
+            if embedding_stale:
+                self._refresh_embedding()
         return result
+
+    def _refresh_embedding(self):
+        """Compute and store an embedding for current content. Failures non-fatal."""
+        try:
+            from .embeddings import embed_for_memory
+            from .database import get_vec_store
+            emb = embed_for_memory(
+                self.title or "",
+                self.summary or "",
+                self.content or "",
+                tags=self.tag_list,
+            )
+            if emb is None:
+                return
+            vec_store = get_vec_store()
+            if vec_store is not None and vec_store.available:
+                vec_store.store_embedding(self.id, emb)
+        except Exception as exc:
+            logger.warning(
+                "Embedding refresh failed for memory %s: %s", self.id, exc
+            )
 
     def delete_instance(self, recursive=False, delete_nullable=False):
         """Override delete to remove FTS entry."""
@@ -661,3 +674,24 @@ class EvalRun(BaseModel):
 
     class Meta:
         table_name = "eval_runs"
+
+
+class MemoryEmbedding(BaseModel):
+    """Vector embedding for a memory.
+
+    Replaces the prior sqlite-vec `vec_memories` virtual table + companion
+    metadata table. Embeddings are float32 BLOBs; metadata fields live on the
+    same row, eliminating the dual-table join.
+
+    Lookup is by memory_id (1:1 with Memory.id).
+    """
+
+    memory_id = TextField(primary_key=True)
+    embedding = BlobField()
+    embedding_model = TextField(default="")
+    embedding_version = TextField(default="")
+    embedding_dim = IntegerField(default=0)
+    updated_at = DateTimeField(default=lambda: datetime.now(timezone.utc))
+
+    class Meta:
+        table_name = "memory_embeddings"
