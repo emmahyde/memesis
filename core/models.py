@@ -67,6 +67,7 @@ class Memory(BaseModel):
     content = TextField(null=True)
     tags = TextField(null=True)  # JSON string
     importance = FloatField(default=0.5, null=True)
+    raw_importance = FloatField(null=True)          # Stage 1 score before Stage 2 re-scoring (C7)
     reinforcement_count = IntegerField(default=0, null=True)
     created_at = TextField(null=True)
     updated_at = TextField(null=True)

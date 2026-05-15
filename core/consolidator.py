@@ -192,6 +192,18 @@ class Consolidator:
                 refs = self._refs_for_observation(observation, observation_refs)
             decision["_observer_refs"] = refs
 
+            # C7: capture Stage 1 importance from referenced Observation rows
+            # so _execute_keep can store it as raw_importance for calibration audits.
+            if refs:
+                s1_imps = []
+                for ref_id in refs:
+                    try:
+                        s1_imps.append(float(Observation.get_by_id(ref_id).importance or 0.5))
+                    except Exception:  # noqa: BLE001
+                        pass
+                if s1_imps:
+                    decision["_raw_stage1_importance"] = sum(s1_imps) / len(s1_imps)
+
             # Idempotency check: skip if this exact decision was already processed
             # in this Consolidator instance's lifetime.  Key = hash(session_id +
             # target_id_or_obs_hash, model) so the same decision sent twice in the
@@ -938,6 +950,7 @@ class Consolidator:
                 work_event=decision.get("work_event"),
                 knowledge_type=decision.get("knowledge_type"),
                 knowledge_type_confidence=decision.get("knowledge_type_confidence"),
+                raw_importance=decision.get("_raw_stage1_importance"),
             )
             memory_id = mem.id
 
