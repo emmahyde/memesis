@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -46,14 +47,25 @@ logger = logging.getLogger(__name__)
 
 
 class PromptsPatcher(Autoresearcher):
+    def __init__(self, *args, replay_store: str | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._replay_store = replay_store
+
     def _select_mutation_target(self) -> Path:
         return self._project_root / "core" / "prompts.py"
 
+    def _guard_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        if self._replay_store:
+            env["MEMESIS_REPLAY_STORE"] = self._replay_store
+        return env
+
     def _run_guard_suite(self) -> bool:
         cwd = str(self._project_root)
+        env = self._guard_env()
         unit = subprocess.run(
             ["python3", "-m", "pytest", "tests/", "--exitfirst", "-q"],
-            capture_output=True, text=True, cwd=cwd, check=False,
+            capture_output=True, text=True, cwd=cwd, check=False, env=env,
         )
         if unit.returncode != 0:
             logger.warning("unit suite FAILED\n%s", unit.stdout[-2000:])
@@ -64,7 +76,7 @@ class PromptsPatcher(Autoresearcher):
             return False
         ev = subprocess.run(
             ["python3", "-m", "pytest", str(target_eval), "--tb=short", "-q"],
-            capture_output=True, text=True, cwd=cwd, check=False,
+            capture_output=True, text=True, cwd=cwd, check=False, env=env,
         )
         if ev.returncode != 0:
             logger.warning("target eval FAILED\n%s", ev.stdout[-2000:])
@@ -84,11 +96,18 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--session-path", required=True, type=Path)
     parser.add_argument("--eval-slug", required=True)
+    parser.add_argument(
+        "--replay-store",
+        default=None,
+        help="Path to a kept ReplayDB tempdir (from `evolve --keep-store`). "
+             "Exported as MEMESIS_REPLAY_STORE for the guard suite.",
+    )
     args = parser.parse_args()
 
     researcher = PromptsPatcher(
         session_path=args.session_path,
         eval_slug=args.eval_slug,
+        replay_store=args.replay_store,
     )
     result = researcher.run()
     print(f"halt_reason={result.halt_reason}")

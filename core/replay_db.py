@@ -43,13 +43,14 @@ class ReplayDB:
         ``ValueError`` immediately — see module docstring for rationale.
     """
 
-    def __init__(self, db_path: str | None = None) -> None:
+    def __init__(self, db_path: str | None = None, keep: bool = False) -> None:
         if db_path == ":memory:":
             raise ValueError(
                 "ReplayDB rejects ':memory:': in-memory SQLite bypasses WAL "
                 "pragmas; use the default tempfile path for replay fidelity."
             )
         self._db_path = db_path
+        self._keep = keep
         self._tempdir: str | None = None
 
     def __enter__(self) -> str:
@@ -63,7 +64,10 @@ class ReplayDB:
         except Exception as exc:
             logger.warning("ReplayDB close_db() failed during teardown: %s", exc)
         if self._tempdir is not None:
-            shutil.rmtree(self._tempdir, ignore_errors=True)
+            if self._keep:
+                logger.info("ReplayDB keep=True; preserving %s", self._tempdir)
+            else:
+                shutil.rmtree(self._tempdir, ignore_errors=True)
             self._tempdir = None
         # Do not suppress exceptions
         return False

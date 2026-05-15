@@ -601,6 +601,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="Hard token halt budget for autoresearch (default: 100000).",
     )
+    parser.add_argument(
+        "--keep-store",
+        action="store_true",
+        default=False,
+        help="Skip ReplayDB teardown; print the tempdir path so a separate "
+             "autoresearch_run.py invocation can point MEMESIS_REPLAY_STORE at it.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -646,8 +653,10 @@ def main(argv: list[str] | None = None) -> int:
     results: dict[str, bool] = {}
 
     try:
-        with ReplayDB() as base_dir:
+        with ReplayDB(keep=args.keep_store) as base_dir:
             print(f"[evolve] Replay DB:        {base_dir}")
+            if args.keep_store:
+                print(f"[evolve] --keep-store:     preserving tempdir after exit")
             print()
 
             # Emit trace stage boundary
@@ -684,6 +693,11 @@ def main(argv: list[str] | None = None) -> int:
 
         # Diagnostic delta (after ReplayDB cleanup — eval files still exist on disk)
         _emit_diagnostic_delta(specs, eval_paths, results, replay_session_id)
+
+        if args.keep_store:
+            print()
+            print(f"[evolve] kept replay store: {base_dir}")
+            print(f"[evolve] export MEMESIS_REPLAY_STORE={base_dir}")
 
         # --autoresearch: trigger mutation loop if any evals failed
         if args.autoresearch:
