@@ -17,6 +17,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from core.validators import KIND_VALUES
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -239,6 +241,40 @@ class ConsolidationDecision(BaseModel):
                 "action='promote' requires a non-null 'reinforces' (target memory id)"
             )
         return self
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def validate_kind(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        normalised = str(v).strip().lower()
+        if normalised not in KIND_VALUES:
+            raise ValueError(
+                f"invalid kind {v!r}; expected one of {sorted(KIND_VALUES)}"
+            )
+        return normalised
+
+    @field_validator("subtitle", mode="before")
+    @classmethod
+    def validate_subtitle(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        v = str(v).strip()
+        if len(v.split()) > 24:
+            raise ValueError(
+                f"subtitle exceeds 24 words ({len(v.split())} words): {v!r}"
+            )
+        return v or None
+
+    @field_validator("cwd", mode="before")
+    @classmethod
+    def validate_cwd(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        v = str(v).strip()
+        if "\x00" in v:
+            raise ValueError("cwd contains null byte")
+        return v or None
 
 
 # ---------------------------------------------------------------------------

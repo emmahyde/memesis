@@ -19,6 +19,7 @@ dependencies = [
     "flask>=3.0",
     "mcp>=1.8.0",
     "pydantic>=2.0",
+    "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]
@@ -51,4 +52,7 @@ reportOptionalOperand = "none"
 reportOptionalMemberAccess = "none"
 reportIncompatibleVariableOverride = "none"
 reportUnusedVariable = "none"
-reportUnusedImport = "none"
+reportUnusedImport = "warning"
+reportUnusedParameter = "none"
+reportUnusedFunction = "warning"
+reportPrivateUsage = "none"
