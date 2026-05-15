@@ -12,6 +12,13 @@ eval/reports/
 
 # Headroom runtime DBs
 .headroom/
+headroom_memory.db
+
+# Local Codex CLI config
+.codex/
+
+# Eval run artifacts
+evals/*/.results/
 
 # Node modules anywhere under the tree
 node_modules/
