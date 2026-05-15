@@ -608,6 +608,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip ReplayDB teardown; print the tempdir path so a separate "
              "autoresearch_run.py invocation can point MEMESIS_REPLAY_STORE at it.",
     )
+    parser.add_argument(
+        "--regenerate-evals",
+        action="store_true",
+        default=False,
+        help="Before compiling, delete any eval/recall/<orig_session_id>_*.py "
+             "files (tracked or untracked) belonging to this transcript. Use to "
+             "purge stale evals that point at dead tempdirs from prior runs.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -643,6 +651,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[evolve] Slug:             {slug}")
     print(f"[evolve] Force live LLM:   {args.live}")
     print()
+
+    if args.regenerate_evals:
+        eval_dir = _PROJECT_ROOT / "eval" / "recall"
+        stale = sorted(eval_dir.glob(f"{orig_session_id}_*.py"))
+        if stale:
+            print(f"[evolve] --regenerate-evals: removing {len(stale)} stale eval(s)")
+            for p in stale:
+                p.unlink()
+                print(f"[evolve]   rm {p.relative_to(_PROJECT_ROOT)}")
+            print()
 
     # TraceWriter for this replay session
     trace_writer = TraceWriter(session_id=replay_session_id)

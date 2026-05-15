@@ -30,7 +30,15 @@ score breakdowns, themes, and rationale; you choose by number.
 |----------|----------|-------------|
 | `--transcript PATH` | yes | Path to the `.jsonl` transcript file to replay |
 | `--live` | no | Force live LLM calls; bypass the replay LLM cache |
+| `--keep-store` | no | Skip ReplayDB teardown; print the tempdir path for handoff to `autoresearch_run.py --replay-store <path>` |
+| `--regenerate-evals` | no | Delete any `eval/recall/<orig_session_id>_*.py` before compiling. Use to purge stale evals pointing at dead tempdirs |
 | `--autoresearch` | no | *(Stub — wires in Task 4.2)* Trigger the autoresearch mutation loop after eval compilation |
+
+> **Ephemeral evals.** `eval/recall/<orig_session_id>_*.py` files embed the
+> ReplayDB tempdir path at compile time. They're useful only against the
+> matching live store (`MEMESIS_REPLAY_STORE` env). Treat them as artifacts
+> of a single replay session — regenerate via `--regenerate-evals` rather
+> than committing them long-term.
 
 ## What It Does
 
