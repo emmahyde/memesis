@@ -27,6 +27,7 @@ via `call_llm_batch`.
 import asyncio
 import hashlib
 import os
+import sys
 import shutil
 import subprocess
 from typing import Optional
@@ -275,10 +276,15 @@ async def _call_via_agent_sdk(prompt: str) -> str:
     for k in saved:
         os.environ.pop(k, None)
 
+    def _stderr_sink(line: str) -> None:
+        sys.stderr.write(f"[claude-cli-stderr] {line}")
+        sys.stderr.flush()
+
     options = ClaudeAgentOptions(
         allowed_tools=[],
         permission_mode="bypassPermissions",
         max_turns=1,
+        stderr=_stderr_sink if os.environ.get("MEMESIS_SDK_STDERR") else None,
     )
     try:
         result_text = ""
