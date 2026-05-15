@@ -21,13 +21,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
 
 from .compression import compress_memory_for_stage, compression_ratio, get_stage_depth
 
-from .database import get_base_dir
+from .database import db, get_base_dir
 from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
 from .linking import link_memory as _link_memory, auto_promote_if_dupe
@@ -45,6 +46,14 @@ from .relevance import RelevanceEngine
 from .trace import get_active_writer
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of memories included in the manifest summary sent to the LLM.
+# Prevents prompt bloat as the corpus grows; increase only with deliberate prompt-cost analysis.
+MANIFEST_MAX_MEMORIES = 50
+
+# Compiled regex that matches observation block headers produced by format_observation.
+# Anchored to start-of-line; requires `## [` to avoid false positives on body subheadings.
+_BLOCK_HEADER_RE = re.compile(r"^## \[")
 
 
 class Consolidator:
@@ -134,8 +143,12 @@ class Consolidator:
         # leak as 'pending' forever (see cycle-11 production audit). Mark
         # them 'failed' so the backlog reflects reality and operators can see
         # which sessions had broken consolidation runs.
+        #
+        # Inject OBSERVATION_ID: N prefix per block so the LLM can echo back
+        # stable ordinal keys (obs_ids) instead of paraphrased text.
+        numbered_content = self._inject_observation_ids(filtered_content, observation_refs)
         prompt = CONSOLIDATION_PROMPT.format(
-            ephemeral_content=filtered_content,
+            ephemeral_content=numbered_content,
             manifest_summary=manifest_summary,
             open_questions_block=open_questions_block,
         )
@@ -164,7 +177,19 @@ class Consolidator:
             observation = decision.get("observation", "")
             rationale = decision.get("rationale", "")
             contradicts = decision.get("contradicts")
-            refs = self._refs_for_observation(observation, observation_refs)
+            # Prefer stable ordinal back-reference; fall back to substring matching for
+            # back-compat with callers or LLM responses that omit obs_ids.
+            obs_ids = decision.get("obs_ids") or []
+            if obs_ids:
+                refs = self._refs_for_obs_ids(obs_ids, observation_refs)
+            else:
+                logger.info(
+                    "obs_ids missing for decision (action=%r); falling back to substring match. "
+                    "session_id=%r",
+                    decision.get("action"),
+                    getattr(self, "session_id", None),
+                )
+                refs = self._refs_for_observation(observation, observation_refs)
             decision["_observer_refs"] = refs
 
             # Idempotency check: skip if this exact decision was already processed
@@ -230,7 +255,9 @@ class Consolidator:
                 self._mark_observations(refs, "pruned")
 
             elif action == "archive":
-                # Archive action: mark an existing memory as pending_delete (two-phase delete)
+                # Archive action: mark an existing memory as pending_delete (two-phase delete).
+                # Note: SUPERSEDE (below) is preferred when there's a replacement fact —
+                # ARCHIVE is now reserved for pure obsolescence with no replacement.
                 target_id = decision.get("contradicts") or decision.get("reinforces")
                 if target_id and target_id != "null":
                     self._execute_archive(target_id, rationale, session_id, decision)
@@ -242,6 +269,29 @@ class Consolidator:
                     self._execute_prune(observation, rationale, session_id, decision)
                 pruned.append({"observation": observation, "rationale": rationale})
                 self._mark_observations(refs, "pruned")
+
+            elif action == "supersede":
+                # SUPERSEDE: atomic archive-of-old + keep-of-new in one transaction.
+                # Replaces the prior two-decision ARCHIVE+companion-KEEP pattern.
+                target_id = decision.get("contradicts")
+                if not target_id or target_id == "null":
+                    logger.warning(
+                        "SUPERSEDE decision missing contradicts id; treating as KEEP"
+                    )
+                    memory_id = self._execute_keep(decision, session_id)
+                    if memory_id:
+                        kept.append(memory_id)
+                        self._mark_observations(refs, "kept", memory_id)
+                else:
+                    new_id = self._execute_supersede(decision, target_id, session_id)
+                    if new_id:
+                        kept.append(new_id)
+                        self._mark_observations(refs, "kept", new_id)
+                        # Note: pruned list gets the old archived target for symmetry
+                        pruned.append({
+                            "observation": f"<superseded by {new_id}>",
+                            "rationale": rationale,
+                        })
 
             elif action == "promote":
                 memory_id = self._execute_promote(decision, session_id)
@@ -331,7 +381,7 @@ class Consolidator:
                 observation = Observation.create(
                     session_id=session_id,
                     source_path=source_path,
-                    ordinal=index,
+                    ordinal=index,  # 0-indexed (see Observation docstring); refs use index+1 below
                     content=raw,
                     filtered_content=content,
                     content_hash=content_hash,
@@ -342,14 +392,69 @@ class Consolidator:
                     "id": observation.id,
                     "content": content,
                     "hash": content_hash,
+                    "ordinal": index + 1,  # 1-indexed stable key for LLM obs_ids pairing; DB stores index (0-indexed)
                 })
             except Exception as exc:
                 logger.debug("Observation instrumentation skipped: %s", exc)
 
         return refs
 
+    def _refs_for_obs_ids(self, obs_ids: list[int], refs: list[dict]) -> list[int]:
+        """Map stable OBSERVATION_ID ordinals back to captured observation row IDs.
+
+        The LLM echoes back obs_ids (1-indexed ordinals) from the numbered
+        prompt blocks.  This resolves them directly by ordinal without any
+        text matching, eliminating paraphrase-induced mismatches.
+
+        Unknown ordinals are silently skipped (tolerates off-by-one LLM errors).
+        """
+        ordinal_to_id = {r["ordinal"]: r["id"] for r in refs if "ordinal" in r}
+        resolved = []
+        for oid in obs_ids:
+            if oid in ordinal_to_id:
+                resolved.append(ordinal_to_id[oid])
+            else:
+                logger.warning(
+                    "_refs_for_obs_ids: ordinal %r not found in observation_refs (known ordinals: %s)",
+                    oid,
+                    sorted(ordinal_to_id.keys()),
+                )
+        return resolved
+
+    def _inject_observation_ids(self, content: str, refs: list[dict]) -> str:
+        """Prepend OBSERVATION_ID: N to each observation block in content.
+
+        Splits the content into blocks (same logic as _split_observation_blocks),
+        prepends the stable ordinal key the LLM should echo back in obs_ids, then
+        re-joins.  If refs has no ordinal info, content is returned unchanged.
+        """
+        blocks = _split_observation_blocks(content)
+        if not blocks or not refs:
+            return content
+
+        if len(blocks) != len(refs):
+            logger.warning(
+                "_inject_observation_ids: block count (%d) != refs count (%d); "
+                "ordinal skew possible. session_id=%r",
+                len(blocks),
+                len(refs),
+                getattr(self, "session_id", None),
+            )
+
+        numbered = []
+        for i, block in enumerate(blocks):
+            ordinal = i + 1
+            numbered.append(f"OBSERVATION_ID: {ordinal}\n{block}")
+
+        return "\n\n---\n\n".join(numbered)
+
     def _refs_for_observation(self, observation: str, refs: list[dict]) -> list[int]:
-        """Best-effort map from an LLM decision observation back to captured rows."""
+        """Best-effort map from an LLM decision observation back to captured rows.
+
+        Legacy fallback for decisions that omit obs_ids.  Uses substring matching
+        against block content, which is fragile when the LLM paraphrases.
+        Prefer _refs_for_obs_ids when obs_ids is available.
+        """
         if not observation or not refs:
             return []
 
@@ -441,12 +546,19 @@ class Consolidator:
         Build a text summary of existing memories for prompt context.
 
         Lists title + summary for each memory in every non-ephemeral stage.
+        Capped at MANIFEST_MAX_MEMORIES total entries to prevent prompt bloat;
+        increase the constant only after deliberate prompt-cost analysis.
         """
         sections = []
+        total = 0
         for stage in ("consolidated", "crystallized", "instinctive"):
-            memories = list(Memory.by_stage(stage))
+            remaining = MANIFEST_MAX_MEMORIES - total
+            if remaining <= 0:
+                break
+            memories = list(Memory.by_stage(stage).limit(remaining))
             if not memories:
                 continue
+            total += len(memories)
             lines = [f"## {stage.capitalize()} ({len(memories)} memories)"]
             for m in memories:
                 title = m.title or "(untitled)"
@@ -596,13 +708,15 @@ class Consolidator:
         # Validate each decision individually via Pydantic; skip invalid ones with a warning.
         from pydantic import ValidationError as PydanticValidationError
         validated_decisions = []
-        for rd in valid_decisions:
+        for _di, rd in enumerate(valid_decisions):
             try:
                 validated = _ConsolidationDecisionSchema(**rd)
                 validated_decisions.append(validated.model_dump(exclude_unset=True))
             except PydanticValidationError as exc:
                 logger.warning(
-                    "Skipping invalid decision (Pydantic): action=%r reason=%s",
+                    "Skipping invalid decision (Pydantic): session_id=%r decision_index=%d action=%r reason=%s",
+                    getattr(self, "session_id", None),
+                    _di,
                     rd.get("action"),
                     exc.errors()[0]["msg"] if exc.errors() else str(exc),
                 )
@@ -689,11 +803,19 @@ class Consolidator:
         """
         target_path = decision.get("target_path") or "general/observation.md"
         title = decision.get("title") or decision.get("subtitle") or "Untitled"
-        summary = decision.get("summary") or decision.get("subtitle") or ""
+        _raw_summary = decision.get("summary")
+        _facts_text = " ".join(decision.get("facts") or [])
+        # Use summary only if it's distinct from the title; otherwise fall back to facts
+        if _raw_summary and _raw_summary.strip() != title.strip():
+            summary = _raw_summary
+        elif _facts_text:
+            summary = _facts_text
+        else:
+            summary = decision.get("subtitle") or ""
         tags = list(decision.get("tags") or [])
         observation = (
             decision.get("observation")
-            or " ".join(decision.get("facts") or [])
+            or _facts_text
             or ""
         )
 
@@ -810,6 +932,8 @@ class Consolidator:
                 rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
                 # Stage 2 enrichment fields from consolidation prompt
                 kind=decision.get("kind"),
+                subtitle=decision.get("subtitle"),
+                cwd=decision.get("cwd"),
                 subject=decision.get("subject"),
                 work_event=decision.get("work_event"),
                 knowledge_type=decision.get("knowledge_type"),
@@ -936,6 +1060,66 @@ class Consolidator:
             rationale[:80],
         )
 
+    def _execute_supersede(
+        self,
+        decision: dict,
+        target_id: str,
+        session_id: str,
+    ) -> str | None:
+        """
+        Execute a SUPERSEDE decision atomically: archive the target and create
+        a replacement memory in a single transaction.
+
+        Replaces the prior ARCHIVE+companion-KEEP two-decision pattern.
+        The LLM emits one SUPERSEDE decision carrying both `contradicts` (old id)
+        and the full KEEP payload (title, summary, kind, etc.).
+
+        Returns the new memory id, or None on failure.
+        """
+        try:
+            target = Memory.get_by_id(target_id)
+        except Memory.DoesNotExist:
+            logger.warning(
+                "SUPERSEDE target memory not found: %s — proceeding as plain KEEP",
+                target_id,
+            )
+            return self._execute_keep(decision, session_id)
+
+        rationale = decision.get("rationale", "")
+        with db.atomic():
+            from_stage = target.stage
+            target.stage = "pending_delete"
+            target.updated_at = datetime.now().isoformat()
+            target.save()
+
+            ConsolidationLog.create(
+                timestamp=datetime.now().isoformat(),
+                session_id=session_id,
+                action="archived",
+                memory_id=target_id,
+                from_stage=from_stage,
+                to_stage="pending_delete",
+                rationale=f"superseded: {rationale}",
+                **self._consolidation_metadata(decision),
+            )
+
+            new_id = self._execute_keep(decision, session_id)
+
+        if new_id:
+            _tw = get_active_writer()
+            if _tw is not None:
+                _tw.emit("consolidate", "supersede", {
+                    "old_memory_id": str(target_id),
+                    "new_memory_id": str(new_id),
+                    "from_stage": from_stage,
+                    "reason": rationale,
+                })
+            logger.info(
+                "SUPERSEDE: memory %s (%s) → pending_delete; replacement %s — %s",
+                target_id, from_stage, new_id, rationale[:80],
+            )
+        return new_id
+
     def _idempotency_key(self, memory_id: str, prompt_version: str = "v1") -> str:
         """Compute a hash key for idempotency tracking.
 
@@ -1024,6 +1208,27 @@ class Consolidator:
         from_stage = memory.stage
         current_count = memory.reinforcement_count or 0
         memory.reinforcement_count = current_count + 1
+
+        # Opportunistic enrichment: patch NULL fields from the PROMOTE decision.
+        # The LLM is asked to include Stage 2 fields on PROMOTE decisions so we
+        # can backfill memories that were created before the enrichment fix.
+        _enrichment_patched = []
+        for _field in (
+            "kind", "subtitle", "cwd",
+            "subject", "knowledge_type", "knowledge_type_confidence",
+            "work_event",
+        ):
+            if getattr(memory, _field, None) is None:
+                _val = decision.get(_field)
+                if _val is not None:
+                    setattr(memory, _field, _val)
+                    _enrichment_patched.append(_field)
+        if _enrichment_patched:
+            logger.info(
+                "PROMOTE patched NULL fields on %s: %s",
+                memory_id, ", ".join(_enrichment_patched),
+            )
+
         memory.save()
 
         # Log the promotion attempt
@@ -1055,12 +1260,17 @@ class Consolidator:
                 logger.info("Hypothesis %s does not yet meet promotion gate", memory_id)
             return memory_id
 
-        # Check if memory now qualifies for lifecycle stage advancement
         can_advance, reason = self.lifecycle.can_promote(memory_id)
         if can_advance:
-            logger.info(
-                "Memory %s qualifies for stage promotion: %s", memory_id, reason
-            )
+            try:
+                self.lifecycle.promote(memory_id, rationale=reason)
+                logger.info(
+                    "Memory %s stage-advanced via PROMOTE: %s", memory_id, reason
+                )
+            except (ValueError, Memory.DoesNotExist) as exc:
+                logger.warning(
+                    "Memory %s failed stage advancement: %s", memory_id, exc
+                )
 
         return memory_id
 
@@ -1274,18 +1484,29 @@ def _format_markdown(metadata: dict, content: str) -> str:
 
 
 def _split_observation_blocks(content: str) -> list[str]:
-    """Split a markdown-ish ephemeral file into durable observation blocks."""
+    """Split a markdown-ish ephemeral file into durable observation blocks.
+
+    Each observation starts with a `## [timestamp] type` header (see
+    `format_observation`). Blocks run from one such header to the next.
+    Blank lines and `---` separators inside a block are preserved verbatim;
+    only `## ` headers (and `---` divider when no header is seen yet) open
+    a new block.
+    """
     blocks = []
-    current = []
+    current: list[str] = []
+    saw_header = False
 
     for line in content.splitlines():
         stripped = line.strip()
-        if not stripped:
+        is_header = bool(_BLOCK_HEADER_RE.match(stripped))
+        if is_header:
             if current:
                 blocks.append('\n'.join(current).strip())
-                current = []
+            current = [line.rstrip()]
+            saw_header = True
             continue
-        if stripped.startswith('---') and current:
+        # Pre-header `---` divider (legacy front-matter style) flushes once
+        if not saw_header and stripped.startswith('---') and current:
             blocks.append('\n'.join(current).strip())
             current = []
             continue

@@ -9,7 +9,7 @@ Token budget guidance (per panel LLME-F8):
 - Stage 1 lean schema: ~150 tokens per observation
   (kind + knowledge_type + confidence + importance + facts + cwd)
 - Stage 2 full schema: ~280 tokens per decision
-  (all Stage 1 fields + subject + work_event + subtitle + raw_importance + action + rationale + links)
+  (all Stage 1 fields + subject + work_event + subtitle + action + rationale + links)
 
 Stage 1 runs on the 15-minute cron (high frequency — keep it lean).
 Stage 2 runs on the hourly cron / PreCompact hook (lower frequency — full enrichment is fine).
@@ -110,12 +110,14 @@ def format_observation(text: str, obs_type: str | None = None, context: str | No
 
 CONSOLIDATION_PROMPT = """You are reviewing a buffer of Stage 1 observations captured during recent work sessions.
 Your job: review each observation with full context, re-score its importance independently, add
-Stage 2 enrichment fields, and decide KEEP / PRUNE / PROMOTE.
+Stage 2 enrichment fields, and decide KEEP / PRUNE / PROMOTE / SUPERSEDE / ARCHIVE.
 
 THE BEHAVIORAL GATE: For each observation, ask — "Would I do something wrong without this?"
 If the code, git log, or common sense would surface it anyway: PRUNE IT.
 
 SESSION OBSERVATIONS (Stage 1 buffer):
+Each block is prefixed with OBSERVATION_ID: N — echo the relevant N value(s) back in the
+"obs_ids" field of each decision. This is required for accurate pairing.
 {ephemeral_content}
 
 EXISTING MEMORY MANIFEST:
@@ -144,34 +146,57 @@ KEEP gates (in priority order):
    any AI.
 4. WORKFLOW PATTERNS — How this specific person works in ways you wouldn't guess.
 
-PROMOTE gates (CHECK BEFORE KEEP):
+PROMOTE gates (use sparingly — only on exact restatement):
 Before deciding KEEP, scan the EXISTING MEMORY MANIFEST above. If a new observation
-restates, refines, adds evidence to, or operationalizes an existing memory, you MUST:
+EXACTLY DUPLICATES an existing memory's core claim (same fact, same subject, same scope),
+you MAY:
   - set `action` = "promote"
   - set `reinforces` = that memory's id (the [uuid] from the manifest)
+  - ALSO populate the Stage 2 enrichment fields (`kind`, `subtitle`, `cwd`,
+    `subject`, `knowledge_type`) from the new observation — these patch any
+    NULL fields on the target memory so reinforcement also enriches.
   - do NOT also create a duplicate KEEP for the same fact
-A promote is a vote that the existing memory was correct and is recurring. This is
-how memories accumulate enough reinforcement to crystallize. Defaulting to KEEP when
-a manifest match exists fragments the memory store and prevents crystallization.
 
-Examples of promote-worthy overlap:
+Observations that merely REFINE, ADD EVIDENCE TO, or EXTEND an existing memory should
+KEEP as new memories — the auto_promote_if_dupe pass and crystallizer handle dedup
+downstream. Defaulting to PROMOTE on partial overlap fragments good memories and
+prevents their enrichment.
+
+Examples of promote-worthy overlap (exact restatement only):
   - New: "Emma wants ELK renderer for mermaid"  + Manifest: "Mermaid diagram style — ELK renderer..."  → promote
   - New: "Skip articles in caveman lite mode"   + Manifest: "Caveman mode lite formatting rules"        → promote
   - New: "Use uv run, not bare python3"         + Manifest: "Python: prefer uv run for uv.lock projects" → promote
 
-ARCHIVE gates:
-If a new observation CONTRADICTS or SUPERSEDES an existing memory (event happened
-that invalidates the prior fact — provider switched, library replaced, decision
-reversed, scope narrowed), you MUST:
-  - set `action` = "archive"
-  - set `contradicts` = the obsolete memory's id (the [uuid] from the manifest)
-  - additionally emit a separate KEEP decision capturing the new corrected fact
-A contradiction without archiving leaves stale facts in the store. Archive is for
-factual obsolescence; PROMOTE is for reinforcement. Do not conflate.
+Examples that should KEEP (adjacent, not exact):
+  - New: "Emma added ELK edge routing config"   + Manifest: "Mermaid diagram style — ELK renderer"     → keep (extends, not restates)
+  - New: "uv run required when uv.lock exists"  + Manifest: "Python: prefer uv run for uv.lock projects" → keep (adds condition)
 
-Examples of archive-worthy contradiction:
-  - New: "Switched embeddings to local fastembed bge-small" + Manifest: "Embeddings provider: OpenRouter openai/text-embedding-3-small" → archive old, keep new
-  - New: "Daemon now auto-managed by plugin"                + Manifest: "Run daemon manually with start.sh"                              → archive old, keep new
+SUPERSEDE gates (preferred for contradictions with a replacement fact):
+If a new observation CONTRADICTS or SUPERSEDES an existing memory AND you have a
+replacement fact to store (event happened that invalidates the prior fact — provider
+switched, library replaced, decision reversed, scope narrowed), you MUST emit ONE
+SUPERSEDE decision:
+  - set `action` = "supersede"
+  - set `contradicts` = the obsolete memory's id (the [uuid] from the manifest)
+  - populate ALL the KEEP fields (title, summary, kind, subtitle, cwd,
+    subject, knowledge_type, facts) — these become the replacement memory
+  - do NOT emit a separate ARCHIVE+KEEP pair; SUPERSEDE is atomic
+SUPERSEDE replaces the obsolete memory and creates the new one in one transaction.
+
+ARCHIVE gates (use only when there is NO replacement fact):
+If an existing memory is no longer true and there is nothing to replace it with,
+emit an ARCHIVE decision:
+  - set `action` = "archive"
+  - set `contradicts` = the obsolete memory's id
+ARCHIVE is for pure obsolescence (deprecation with no successor). If there IS a
+replacement fact, use SUPERSEDE instead — do not emit ARCHIVE+KEEP pairs.
+
+Examples of supersede-worthy contradiction:
+  - New: "Switched embeddings to local fastembed bge-small" + Manifest: "Embeddings provider: OpenRouter openai/text-embedding-3-small" → SUPERSEDE old with new
+  - New: "Daemon now auto-managed by plugin"                + Manifest: "Run daemon manually with start.sh"                              → SUPERSEDE old with new
+
+Example of archive-worthy obsolescence (no replacement):
+  - Manifest: "Use legacy auth flow X for the staging endpoint" + Context: staging endpoint was decommissioned, nothing replaces it → ARCHIVE
 
 PRUNE if:
 - Re-derivable from code, git log, docs, or codebase reading
@@ -180,15 +205,20 @@ PRUNE if:
 - Preferences without the WHY (the reasoning is the only keepable part)
 - "I should have done X" without identifying the underlying PATTERN
 
-SELECTIVITY: Let the behavioral gate decide — not a number. A short session may have 0 keeps.
-A dense collaboration may have 10. Trust the gate: quality, not quota.
+SELECTIVITY: Most observations should KEEP. PRUNE only what is trivially derivable from code or git;
+PROMOTE only on exact restatement of an existing memory's core claim. Let the behavioral gate
+decide — not a number. Trust the gate: quality, not quota.
+
+When BEHAVIORAL GATE and SELECTIVITY conflict, prefer SELECTIVITY — keep the observation and let
+the downstream pipeline dedup. PRUNE only when the content is trivially re-derivable from code or
+git, not when it "feels" optional.
 
 ---
 
 IMPORTANCE RE-SCORING (panel C7):
 You have more context than Stage 1 did. Re-score `importance` independently using the full
-buffer and manifest. Preserve the Stage 1 score as `raw_importance` for audit. Do not just copy
-the Stage 1 score — you should diverge when context justifies it.
+buffer and manifest. Do not just copy the Stage 1 score — you should diverge when context
+justifies it.
 
 Importance anchors:
   0.2  routine finding (re-derivable, low stakes)
@@ -258,7 +288,7 @@ Respond ONLY with valid JSON (no markdown, no explanation):
 {{
   "decisions": [
     {{
-      "raw_importance": 0.0,
+      "obs_ids": [1],
       "importance": 0.0,
       "kind": "decision|finding|preference|constraint|correction|open_question",
       "knowledge_type": "factual|conceptual|procedural|metacognitive",
@@ -268,9 +298,11 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "subject": "self|user|system|collaboration|workflow|aesthetic|domain",
       "work_event": "bugfix|feature|refactor|discovery|change|null",
       "title": "≤8-word headline naming the durable lesson (no pronouns, action-oriented)",
-      "summary": "1–2 sentence elaboration explaining the rule, the trigger, and the corrective behavior — distinct from title, used as retrieval body",
+      "summary": "REQUIRED. 1–2 sentences elaborating the rule, trigger, and corrective behavior. Must NOT repeat the title — write new information. Used as the retrieval body.",
       "subtitle": "retrieval card no longer than twenty-four words",
-      "action": "keep|prune|promote|archive",
+      "tags": ["2-4 lowercase topic tags for retrieval (e.g., 'embeddings', 'workflow', 'consolidation')"],
+      "action": "keep|prune|promote|supersede|archive",
+      "observation": "human-readable summary of the observation (not load-bearing — use obs_ids for pairing)",
       "rationale": "why this decision",
       "target_path": "category/filename.md (keep only)",
       "reinforces": "memory_id or null (required when action=promote)",
