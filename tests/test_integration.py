@@ -133,12 +133,18 @@ class TestFullLifecycleEphemeralToCrystallized:
             ephemeral_dir = get_base_dir() / "ephemeral"
             ephemeral_dir.mkdir(parents=True, exist_ok=True)
 
-            # Session 1: 10 observations -> 2 KEEP, 8 PRUNE
+            # Session 1: 10 observations -> 2 KEEP, 8 PRUNE.
+            # Patch auto_promote_if_dupe to None: the mock observations are
+            # semantically near-identical ("Observation 0" / "Observation 1"),
+            # which correctly triggers the dedup path added in the crystallization
+            # commit.  This test covers lifecycle progression, not dedup; isolate
+            # from embedding-similarity behavior to avoid brittleness.
             session1_file = tmp_path / "session1.md"
             _write_ephemeral(tmp_path, "session1.md", n_obs=10)
 
             with patch("core.consolidator._call_llm_transport",
-                       return_value=json.dumps({"decisions": _mock_decisions(2, 8)})):
+                       return_value=json.dumps({"decisions": _mock_decisions(2, 8)})), \
+                 patch("core.consolidator.auto_promote_if_dupe", return_value=None):
                 result = consolidator.consolidate_session(str(session1_file), "session-1")
 
             assert len(result["kept"]) == 2
@@ -157,7 +163,9 @@ class TestFullLifecycleEphemeralToCrystallized:
                 promote_decisions = _promote_decisions_for(kept_ids)
 
                 with patch("core.consolidator._call_llm_transport",
-                           return_value=json.dumps({"decisions": promote_decisions})):
+                           return_value=json.dumps({"decisions": promote_decisions})), \
+                     patch.object(lifecycle, "can_promote",
+                                  return_value=(False, "skipped — explicit promotion tested below")):
                     result = consolidator.consolidate_session(
                         str(session_file), f"session-{session_num}"
                     )

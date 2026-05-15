@@ -155,8 +155,7 @@ class TestStage2PromptStructure:
         lower = CONSOLIDATION_PROMPT.lower()
         assert "re-score" in lower or "re score" in lower or "independently" in lower
 
-    def test_raw_importance_field(self):
-        assert "raw_importance" in CONSOLIDATION_PROMPT
+    # raw_importance dropped in migration 0007 (write-only, no readers)
 
     def test_importance_field(self):
         assert '"importance"' in CONSOLIDATION_PROMPT

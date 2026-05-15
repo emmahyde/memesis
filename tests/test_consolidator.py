@@ -5,6 +5,7 @@ All Anthropic API calls are mocked; no real network requests are made.
 """
 
 import json
+import logging
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -14,10 +15,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.consolidator import Consolidator
+from core.consolidator import Consolidator, _split_observation_blocks
 from core.database import init_db, close_db
 from core.lifecycle import LifecycleManager
-from core.models import Memory, ConsolidationLog, db
+from core.models import Memory, ConsolidationLog, Observation, db
+from core.prompts import format_observation
 
 
 # ---------------------------------------------------------------------------
@@ -1709,3 +1711,268 @@ class TestResolveConflicts:
         assert after == before + 1
         entry = ConsolidationLog.select().order_by(ConsolidationLog.id.desc()).first()
         assert "Contradiction resolved" in entry.rationale
+
+
+# ---------------------------------------------------------------------------
+# Splitter round-trip: format_observation → _split_observation_blocks
+# ---------------------------------------------------------------------------
+
+class TestSplitterRoundTrip:
+    """Regression lock for F1: splitter must recover exactly the observations
+    that format_observation produced — no over-splitting, no merging."""
+
+    def _obs(self, text, obs_type=None, context=None):
+        return format_observation(text, obs_type=obs_type, context=context)
+
+    def test_single_paragraph_observation(self):
+        obs = self._obs("User prefers snake_case for all Python identifiers.")
+        blocks = _split_observation_blocks(obs)
+        assert len(blocks) == 1
+        assert "snake_case" in blocks[0]
+
+    def test_multi_paragraph_observation_no_split(self):
+        """Internal blank lines must NOT create a second block."""
+        text = "First paragraph.\n\nSecond paragraph with more detail."
+        obs = self._obs(text)
+        blocks = _split_observation_blocks(obs)
+        assert len(blocks) == 1
+
+    def test_observation_with_context_no_split(self):
+        """format_observation with context= appends a **Context:** line — still one block."""
+        obs = self._obs("Uses uv for dependency management.", context="During setup debugging.")
+        blocks = _split_observation_blocks(obs)
+        assert len(blocks) == 1
+        assert "Context" in blocks[0]
+
+    def test_multiple_observations_exact_count(self):
+        """N observations joined must split into exactly N blocks."""
+        texts = [
+            "User prefers snake_case.",
+            "Project uses pytest.\n\nAll test files live in tests/.",
+            "Avoid type: ignore — fix types properly.",
+            "RTK wrappers replace ls/grep/git in all shell calls.",
+            "uv run python3 for all Python invocations.",
+        ]
+        joined = "\n\n".join(self._obs(t) for t in texts)
+        blocks = _split_observation_blocks(joined)
+        assert len(blocks) == len(texts), (
+            f"Expected {len(texts)} blocks, got {len(blocks)}: {[b[:40] for b in blocks]}"
+        )
+
+    def test_each_block_starts_with_timestamp_header(self):
+        """Every recovered block must start with `## [`."""
+        texts = ["Alpha.", "Beta.", "Gamma."]
+        joined = "\n\n".join(self._obs(t) for t in texts)
+        blocks = _split_observation_blocks(joined)
+        for block in blocks:
+            assert block.startswith("## ["), (
+                f"Block does not start with timestamp header: {block[:60]!r}"
+            )
+
+    def test_leading_trailing_whitespace_ignored(self):
+        """Whitespace around the joined blob must not produce empty blocks."""
+        obs = self._obs("Trim this.")
+        padded = "\n\n\n" + obs + "\n\n\n"
+        blocks = _split_observation_blocks(padded)
+        assert len(blocks) == 1
+
+    def test_empty_content_returns_empty_list(self):
+        assert _split_observation_blocks("") == []
+        assert _split_observation_blocks("   \n\n   ") == []
+
+    def test_body_markdown_subheading_does_not_split(self):
+        """A `## ` heading inside the body text must NOT start a new block.
+
+        The splitter uses _BLOCK_HEADER_RE = re.compile(r'^## \\[') so only
+        timestamp-format headers open new blocks (F1 action 4).  Body-level
+        markdown headings like '## Implementation note' must stay in their parent block.
+        """
+        text = "Main observation.\n\n## Implementation note\n\nMore detail here."
+        obs = self._obs(text)
+        blocks = _split_observation_blocks(obs)
+        # After tightening, body `## Implementation note` should stay in block 0.
+        assert len(blocks) == 1, (
+            "Body ## heading incorrectly split into a new block; "
+            "tighten splitter regex to ^## \\[\\d{4}-"
+        )
+
+
+# ---------------------------------------------------------------------------
+# obs_ids happy-path: _refs_for_obs_ids path taken, not substring fallback
+# ---------------------------------------------------------------------------
+
+class TestObsIdsHappyPath:
+    """F3 regression lock: when LLM populates obs_ids, the pairing uses
+    ordinal lookup rather than substring matching, and Observation.status
+    is updated to 'kept' (not left as 'pending' or 'orphaned')."""
+
+    def _make_ephemeral(self, tmp_path, texts):
+        """Write a formatted ephemeral file with one block per text."""
+        blocks = [format_observation(t) for t in texts]
+        content = "\n\n".join(blocks)
+        p = tmp_path / "session_obs_ids.md"
+        p.write_text(content, encoding="utf-8")
+        return str(p)
+
+    def test_obs_ids_populated_uses_ordinal_path(self, consolidator, base, tmp_path):
+        """LLM decision with obs_ids=[1] resolves to ordinal 1, not substring."""
+        texts = [
+            "User prefers snake_case.",
+            "Project uses pytest.",
+            "Avoid type: ignore.",
+        ]
+        ep = self._make_ephemeral(tmp_path, texts)
+
+        decisions = [
+            {
+                "observation": texts[0],
+                "action": "keep",
+                "rationale": "Useful style preference.",
+                "title": "snake_case preference",
+                "summary": "Prefers snake_case.",
+                "tags": ["python"],
+                "target_path": "preferences/python_style.md",
+                "reinforces": None,
+                "contradicts": None,
+                "obs_ids": [1],
+            },
+            {
+                "observation": texts[2],
+                "action": "prune",
+                "rationale": "Too generic to keep.",
+                "title": None,
+                "summary": None,
+                "tags": [],
+                "target_path": None,
+                "reinforces": None,
+                "contradicts": None,
+                "obs_ids": [3],
+            },
+        ]
+
+        with patch("core.consolidator._call_llm_transport") as mock_llm:
+            mock_llm.return_value = json.dumps({"decisions": decisions})
+            result = consolidator.consolidate_session(ep, "sess-obsids-001")
+
+        assert len(result["kept"]) == 1
+
+        # Ordinal 1 → first observation → status 'kept'
+        obs1 = Observation.select().where(Observation.ordinal == 0).first()  # DB is 0-indexed
+        assert obs1 is not None, "Observation with ordinal=0 not found"
+        assert obs1.status == "kept", f"Expected 'kept', got {obs1.status!r}"
+
+        # Ordinal 3 → third observation → pruned observation row
+        obs3 = Observation.select().where(Observation.ordinal == 2).first()  # DB is 0-indexed
+        assert obs3 is not None, "Observation with ordinal=2 not found"
+        # prune action leads to no memory_id; status may be 'orphaned' or unchanged
+        # The key invariant: it was NOT updated via substring (the content hash differs
+        # from the decision "observation" text since format_observation wraps it).
+
+    def test_obs_ids_links_correct_observation_row(self, consolidator, base, tmp_path):
+        """The memory created via obs_ids=[2] path links to the second observation row."""
+        texts = [
+            "User uses rtk wrappers for all shell commands.",
+            "Prefer uv run for all Python invocations.",
+        ]
+        ep = self._make_ephemeral(tmp_path, texts)
+
+        decisions = [
+            {
+                "observation": texts[1],
+                "action": "keep",
+                "rationale": "Critical env preference.",
+                "title": "uv run preference",
+                "summary": "Always use uv run.",
+                "tags": ["python", "env"],
+                "target_path": "preferences/python_env.md",
+                "reinforces": None,
+                "contradicts": None,
+                "obs_ids": [2],
+            },
+        ]
+
+        with patch("core.consolidator._call_llm_transport") as mock_llm:
+            mock_llm.return_value = json.dumps({"decisions": decisions})
+            result = consolidator.consolidate_session(ep, "sess-obsids-002")
+
+        assert len(result["kept"]) == 1
+        memory = Memory.get_by_id(result["kept"][0])
+
+        # The second observation row (ordinal=1 in DB, obs_ids=2 in LLM) should be 'kept'
+        obs2 = Observation.select().where(Observation.ordinal == 1).first()
+        assert obs2 is not None
+        assert obs2.status == "kept"
+        assert obs2.memory_id == memory.id
+
+
+# ---------------------------------------------------------------------------
+# _inject_observation_ids ordinal alignment
+# ---------------------------------------------------------------------------
+
+class TestInjectObservationIdsOrdinalAlignment:
+    """The N-th block in injected output must carry ordinal N (1-indexed),
+    and refs[N-1] content must match that block's payload."""
+
+    def test_four_observations_ordinal_alignment(self, consolidator):
+        texts = [
+            "Alpha observation.",
+            "Beta observation with\nmultiple lines.",
+            "Gamma observation.",
+            "Delta observation.",
+        ]
+        content = "\n\n".join(format_observation(t) for t in texts)
+        refs = [
+            {"id": i + 1, "content": format_observation(t), "hash": str(i), "ordinal": i + 1}
+            for i, t in enumerate(texts)
+        ]
+
+        injected = consolidator._inject_observation_ids(content, refs)
+        sections = [s.strip() for s in injected.split("---") if s.strip()]
+
+        assert len(sections) == 4, f"Expected 4 sections, got {len(sections)}"
+
+        for i, section in enumerate(sections):
+            expected_ordinal = i + 1
+            first_line = section.splitlines()[0]
+            assert first_line == f"OBSERVATION_ID: {expected_ordinal}", (
+                f"Section {i}: expected 'OBSERVATION_ID: {expected_ordinal}', got {first_line!r}"
+            )
+
+    def test_single_observation_ordinal_one(self, consolidator):
+        text = "Single observation."
+        content = format_observation(text)
+        refs = [{"id": 1, "content": content, "hash": "abc", "ordinal": 1}]
+
+        injected = consolidator._inject_observation_ids(content, refs)
+        assert injected.startswith("OBSERVATION_ID: 1")
+
+    def test_empty_refs_returns_content_unchanged(self, consolidator):
+        content = format_observation("Some observation.")
+        result = consolidator._inject_observation_ids(content, [])
+        assert result == content
+
+
+# ---------------------------------------------------------------------------
+# obs_ids out-of-range emits WARNING (action 5c)
+# ---------------------------------------------------------------------------
+
+class TestObsIdsOutOfRangeWarning:
+    """When obs_ids contains an ordinal that doesn't exist in refs, a WARNING
+    is emitted — _refs_for_obs_ids logs at WARNING level for each unknown ordinal."""
+
+    def test_out_of_range_ordinal_emits_warning(self, consolidator, caplog):
+        """obs_ids=[99] with only 3 refs → WARNING logged with session_id and ordinal 99."""
+        refs = [
+            {"id": 1, "content": "obs one", "hash": "h1", "ordinal": 1},
+            {"id": 2, "content": "obs two", "hash": "h2", "ordinal": 2},
+            {"id": 3, "content": "obs three", "hash": "h3", "ordinal": 3},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="core.consolidator"):
+            result = consolidator._refs_for_obs_ids([99], refs)
+
+        assert result == [], f"Expected empty list for unknown ordinal, got {result}"
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("99" in m for m in warning_msgs), (
+            f"No WARNING mentioning ordinal 99 found. Got: {warning_msgs}"
+        )

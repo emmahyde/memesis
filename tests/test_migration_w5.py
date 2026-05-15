@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.database import init_db, close_db
-from core.models import db, Memory
+from core.models import db
 from scripts.migrate_w5_schema import (
     derive_from_observation_type,
     derive_from_concept_tags,
@@ -28,7 +28,7 @@ from scripts.migrate_w5_schema import (
 
 @pytest.fixture
 def store(tmp_path):
-    base_dir = init_db(base_dir=str(tmp_path / "memory"))
+    init_db(base_dir=str(tmp_path / "memory"))
     yield tmp_path / "memory"
     close_db()
 
@@ -175,7 +175,11 @@ class TestObservationTypeBackDerivation:
 class TestRunMigration:
     @pytest.fixture(autouse=True)
     def _add_legacy_columns(self, store):
-        """Add legacy columns (mode, observation_type, concept_tags) to fresh test DB."""
+        """Add legacy columns (mode, observation_type, concept_tags) to fresh test DB.
+
+        `store` is required for fixture ordering (ensures DB init runs first).
+        """
+        assert store is not None
         for col, typ in [("mode", "TEXT"), ("observation_type", "TEXT"), ("concept_tags", "TEXT")]:
             try:
                 db.execute_sql(f"ALTER TABLE memories ADD COLUMN {col} {typ}")
@@ -186,13 +190,13 @@ class TestRunMigration:
         """Insert a row with legacy fields via raw SQL (bypasses model field constraints)."""
         db.execute_sql(
             "INSERT INTO memories (id, stage, title, content, source, created_at, updated_at, "
-            "access_count, mode, observation_type, concept_tags) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "mode, observation_type, concept_tags) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (memory_id, "ephemeral", "test", "content", "test", _now(), _now(),
-             0, mode, observation_type, concept_tags),
+             mode, observation_type, concept_tags),
         )
 
-    def test_mode_to_kind_backfill(self, store, tmp_path):
+    def test_mode_to_kind_backfill(self, store):
         """Rows with mode= get kind= populated."""
         # Insert with a legacy mode field
         self._insert_raw("row-1", mode="decision")
@@ -207,7 +211,7 @@ class TestRunMigration:
         ).fetchone()
         assert result[0] == "decision"
 
-    def test_observation_type_backfill(self, store, tmp_path):
+    def test_observation_type_backfill(self, store):
         """Rows with observation_type= get kind/subject/knowledge_type populated."""
         self._insert_raw("row-obs", observation_type="workflow_pattern")
 

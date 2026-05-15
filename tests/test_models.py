@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.database import init_db, close_db, get_base_dir, get_db_path, get_vec_store
+from core.database import init_db, close_db, get_db_path, get_vec_store
 from core.models import Memory, ConsolidationLog, RetrievalLog, db
 
 
@@ -58,6 +58,7 @@ def _create_memory(stage='ephemeral', title='Test', content='Content', tags=None
     return mem
 
 
+@pytest.mark.usefixtures("store")
 class TestDatabaseInit:
     """Test database initialization."""
 
@@ -94,7 +95,7 @@ class TestDatabaseInit:
         assert base_dir.exists()
         assert (base_dir / 'index.db').exists()
 
-    def test_database_initialized(self, store):
+    def test_database_initialized(self):
         """Test SQLite database is initialized with correct schema."""
         db_path = get_db_path()
         assert db_path.exists()
@@ -110,10 +111,11 @@ class TestDatabaseInit:
         assert cursor.fetchone()[0] == 'wal'
 
 
+@pytest.mark.usefixtures("store")
 class TestMemoryCRUD:
     """Test CRUD operations."""
 
-    def test_create_memory(self, store):
+    def test_create_memory(self):
         """Test creating a new memory."""
         mem = _create_memory(
             stage='ephemeral',
@@ -135,7 +137,7 @@ class TestMemoryCRUD:
         assert retrieved.importance == 0.7
         assert retrieved.content_hash is not None
 
-    def test_get_memory(self, store):
+    def test_get_memory(self):
         """Test retrieving a memory."""
         mem = _create_memory(
             stage='ephemeral',
@@ -153,12 +155,12 @@ class TestMemoryCRUD:
         assert result.tag_list == ['tag1']
         assert 'Test content' in result.content
 
-    def test_get_nonexistent_memory(self, store):
+    def test_get_nonexistent_memory(self):
         """Test getting nonexistent memory raises DoesNotExist."""
         with pytest.raises(Memory.DoesNotExist):
             Memory.get_by_id('00000000-0000-0000-0000-000000000000')
 
-    def test_update_memory_content(self, store):
+    def test_update_memory_content(self):
         """Test updating memory content."""
         mem = _create_memory(content='Original content')
         mem.content = 'Updated content'
@@ -167,7 +169,7 @@ class TestMemoryCRUD:
         result = Memory.get_by_id(mem.id)
         assert 'Updated content' in result.content
 
-    def test_update_memory_metadata(self, store):
+    def test_update_memory_metadata(self):
         """Test updating memory metadata."""
         mem = _create_memory(title='Original', importance=0.5)
         mem.title = 'Updated'
@@ -178,7 +180,7 @@ class TestMemoryCRUD:
         assert result.title == 'Updated'
         assert result.importance == 0.8
 
-    def test_update_memory_stage(self, store):
+    def test_update_memory_stage(self):
         """Test updating memory stage."""
         mem = _create_memory(stage='ephemeral')
         mem.stage = 'consolidated'
@@ -187,7 +189,7 @@ class TestMemoryCRUD:
         result = Memory.get_by_id(mem.id)
         assert result.stage == 'consolidated'
 
-    def test_delete_memory(self, store):
+    def test_delete_memory(self):
         """Test deleting a memory."""
         mem = _create_memory()
         mem_id = mem.id
@@ -196,7 +198,7 @@ class TestMemoryCRUD:
         with pytest.raises(Memory.DoesNotExist):
             Memory.get_by_id(mem_id)
 
-    def test_list_by_stage(self, store):
+    def test_list_by_stage(self):
         """Test listing memories by stage."""
         m1 = _create_memory(stage='ephemeral', title='Test 1', content='Content 1')
         m2 = _create_memory(stage='ephemeral', title='Test 2', content='Content 2')
@@ -211,10 +213,11 @@ class TestMemoryCRUD:
         assert consolidated[0].id == m3.id
 
 
+@pytest.mark.usefixtures("store")
 class TestMemorySearch:
     """Test search operations."""
 
-    def test_search_fts_by_title(self, store):
+    def test_search_fts_by_title(self):
         """Test FTS search by title."""
         _create_memory(title='Python Best Practices', content='Python tips')
         _create_memory(title='Ruby Style Guide', content='Ruby tips')
@@ -223,7 +226,7 @@ class TestMemorySearch:
         assert len(results) >= 1
         assert any('Python' in r.title for r in results)
 
-    def test_search_fts_by_content(self, store):
+    def test_search_fts_by_content(self):
         """Test FTS search by content."""
         _create_memory(
             title='Async',
@@ -232,7 +235,7 @@ class TestMemorySearch:
         results = Memory.search_fts('"async programming"')
         assert len(results) >= 1
 
-    def test_search_fts_limit(self, store):
+    def test_search_fts_limit(self):
         """Test FTS search respects limit."""
         for i in range(10):
             _create_memory(title=f'Test {i}', content=f'Common content item {i}')
@@ -241,10 +244,11 @@ class TestMemorySearch:
         assert len(results) == 5
 
 
+@pytest.mark.usefixtures("store")
 class TestMetadataAndLogging:
     """Test metadata and logging operations."""
 
-    def test_record_injection(self, store):
+    def test_record_injection(self):
         """Test recording memory injection."""
         mem = _create_memory()
         now = datetime.now().isoformat()
@@ -270,7 +274,7 @@ class TestMetadataAndLogging:
         assert logs[0].session_id == 'session-123'
         assert logs[0].retrieval_type == 'injected'
 
-    def test_record_injection_stores_project_context(self, store):
+    def test_record_injection_stores_project_context(self):
         """project_context is stored in retrieval_log."""
         mem = _create_memory(stage='crystallized')
         now = datetime.now().isoformat()
@@ -286,7 +290,7 @@ class TestMetadataAndLogging:
         log = RetrievalLog.get(RetrievalLog.memory_id == mem.id)
         assert log.project_context == '/Users/test/proj-a'
 
-    def test_log_consolidation(self, store):
+    def test_log_consolidation(self):
         """Test logging consolidation actions."""
         mem = _create_memory()
 
@@ -308,16 +312,17 @@ class TestMetadataAndLogging:
         assert log.session_id == 'session-123'
 
 
+@pytest.mark.usefixtures("store")
 class TestFTS:
     """Test FTS5 sync."""
 
-    def test_fts_synced_on_create(self, store):
+    def test_fts_synced_on_create(self):
         mem = _create_memory(content='Unique search term xyz123')
         results = Memory.search_fts('xyz123')
         assert len(results) == 1
         assert results[0].id == mem.id
 
-    def test_fts_synced_on_update(self, store):
+    def test_fts_synced_on_update(self):
         mem = _create_memory(content='Original content')
         mem.content = 'Updated with newterm456'
         mem.save()
@@ -328,7 +333,7 @@ class TestFTS:
         results = Memory.search_fts('"Original content"')
         assert len(results) == 0
 
-    def test_fts_synced_on_delete(self, store):
+    def test_fts_synced_on_delete(self):
         mem = _create_memory(content='Content to delete abc789')
         results = Memory.search_fts('abc789')
         assert len(results) == 1
@@ -338,6 +343,7 @@ class TestFTS:
         assert len(results) == 0
 
 
+@pytest.mark.usefixtures("store")
 class TestSanitizeFtsTerm:
     """Test FTS5 term sanitization."""
 
@@ -365,7 +371,7 @@ class TestSanitizeFtsTerm:
     def test_empty_string(self):
         assert Memory.sanitize_fts_term("") == '""'
 
-    def test_sanitized_query_executes(self, store):
+    def test_sanitized_query_executes(self):
         """Sanitized FTS operators don't crash search_fts."""
         _create_memory(
             stage='consolidated',
@@ -378,16 +384,17 @@ class TestSanitizeFtsTerm:
             Memory.search_fts(query, limit=5)
 
 
+@pytest.mark.usefixtures("store")
 class TestContentHash:
     """Test content hash deduplication."""
 
-    def test_content_hash_computed(self, store):
+    def test_content_hash_computed(self):
         mem = _create_memory()
         result = Memory.get_by_id(mem.id)
         assert result.content_hash is not None
         assert len(result.content_hash) == 32
 
-    def test_content_hash_updated_on_change(self, store):
+    def test_content_hash_updated_on_change(self):
         mem = _create_memory(content='Original')
         original_hash = Memory.get_by_id(mem.id).content_hash
 
@@ -403,10 +410,11 @@ class TestContentHash:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("store")
 class TestW2SchemaFields:
     """Round-trip tests for Wave 2 Memory schema additions."""
 
-    def test_all_new_fields_persist(self, store):
+    def test_all_new_fields_persist(self):
         """All W2 fields can be written and read back."""
         now = datetime.now().isoformat()
         mem = Memory.create(
@@ -423,9 +431,7 @@ class TestW2SchemaFields:
             subtitle="Short retrieval subtitle here",
             cwd="/Users/test/myproject",
             session_type="code",
-            raw_importance=0.7,
             linked_observation_ids=json.dumps(["abc-123", "def-456"]),
-            access_count=3,
         )
         result = Memory.get_by_id(mem.id)
         assert result.kind == "decision"
@@ -436,10 +442,8 @@ class TestW2SchemaFields:
         assert result.subtitle == "Short retrieval subtitle here"
         assert result.cwd == "/Users/test/myproject"
         assert result.session_type == "code"
-        assert result.raw_importance == pytest.approx(0.7)
-        assert result.access_count == 3
 
-    def test_linked_observations_accessor_parses_json(self, store):
+    def test_linked_observations_accessor_parses_json(self):
         """linked_observations property returns list from JSON text."""
         now = datetime.now().isoformat()
         mem = Memory.create(
@@ -453,7 +457,7 @@ class TestW2SchemaFields:
         result = Memory.get_by_id(mem.id)
         assert result.linked_observations == ["id-1", "id-2", "id-3"]
 
-    def test_linked_observations_accessor_returns_empty_for_null(self, store):
+    def test_linked_observations_accessor_returns_empty_for_null(self):
         """linked_observations returns [] when field is null."""
         now = datetime.now().isoformat()
         mem = Memory.create(
@@ -467,7 +471,7 @@ class TestW2SchemaFields:
         result = Memory.get_by_id(mem.id)
         assert result.linked_observations == []
 
-    def test_linked_observations_accessor_returns_empty_for_missing(self, store):
+    def test_linked_observations_accessor_returns_empty_for_missing(self):
         """linked_observations returns [] when field is empty string."""
         now = datetime.now().isoformat()
         mem = Memory.create(
@@ -481,7 +485,7 @@ class TestW2SchemaFields:
         result = Memory.get_by_id(mem.id)
         assert result.linked_observations == []
 
-    def test_session_type_accepts_valid_values(self, store):
+    def test_session_type_accepts_valid_values(self):
         """session_type stores code|writing|research values."""
         now = datetime.now().isoformat()
         for val in ("code", "writing", "research"):
@@ -496,7 +500,7 @@ class TestW2SchemaFields:
             result = Memory.get_by_id(mem.id)
             assert result.session_type == val
 
-    def test_session_type_accepts_null(self, store):
+    def test_session_type_accepts_null(self):
         """session_type can be null."""
         now = datetime.now().isoformat()
         mem = Memory.create(
@@ -510,45 +514,7 @@ class TestW2SchemaFields:
         result = Memory.get_by_id(mem.id)
         assert result.session_type is None
 
-    def test_w2_created_at_default_is_set(self, store):
-        """w2_created_at gets a default value on creation."""
-        now = datetime.now().isoformat()
-        mem = Memory.create(
-            stage="ephemeral",
-            title="created_at test",
-            content="c",
-            created_at=now,
-            updated_at=now,
-        )
-        result = Memory.get_by_id(mem.id)
-        # w2_created_at should be set (not null)
-        assert result.w2_created_at is not None
-
-    def test_access_count_defaults_to_zero(self, store):
-        """access_count defaults to 0."""
-        now = datetime.now().isoformat()
-        mem = Memory.create(
-            stage="ephemeral",
-            title="access_count default",
-            content="c",
-            created_at=now,
-            updated_at=now,
-        )
-        result = Memory.get_by_id(mem.id)
-        assert result.access_count == 0
-
-    def test_raw_importance_null_by_default(self, store):
-        """raw_importance is null when not set."""
-        now = datetime.now().isoformat()
-        mem = Memory.create(
-            stage="ephemeral",
-            title="raw_importance null",
-            content="c",
-            created_at=now,
-            updated_at=now,
-        )
-        result = Memory.get_by_id(mem.id)
-        assert result.raw_importance is None
+    # w2_created_at / access_count / raw_importance removed: dropped in migration 0007
 
 
 class TestProjectContext:
@@ -569,10 +535,11 @@ def _make_embedding(dims: int = 384) -> bytes:
     return struct.pack(f"{dims}f", *floats)
 
 
+@pytest.mark.usefixtures("store")
 class TestVecUnavailableFallback:
     """Verify VecStore is accessible after init_db."""
 
-    def test_vec_store_accessible(self, store):
+    def test_vec_store_accessible(self):
         vec = get_vec_store()
         assert vec is not None
         assert isinstance(vec.available, bool)
@@ -635,34 +602,35 @@ class TestVecEnabled:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("store")
 class TestQuestionLifecycleFields:
     """Round-trip tests for resolves_question_id, resolved_at, is_pinned."""
 
-    def test_is_pinned_defaults_false(self, store):
+    def test_is_pinned_defaults_false(self):
         mem = _create_memory(kind='open_question')
         fresh = Memory.get_by_id(mem.id)
         # SQLite stores as 0; treat 0 / None / False as falsy
         assert not fresh.is_pinned
 
-    def test_is_pinned_persists_true(self, store):
+    def test_is_pinned_persists_true(self):
         mem = _create_memory(kind='open_question')
         Memory.update(is_pinned=1).where(Memory.id == mem.id).execute()
         fresh = Memory.get_by_id(mem.id)
         assert fresh.is_pinned == 1
 
-    def test_resolved_at_defaults_null(self, store):
+    def test_resolved_at_defaults_null(self):
         mem = _create_memory(kind='open_question')
         fresh = Memory.get_by_id(mem.id)
         assert fresh.resolved_at is None
 
-    def test_resolved_at_accepts_datetime(self, store):
+    def test_resolved_at_accepts_datetime(self):
         mem = _create_memory(kind='open_question')
         now = datetime.now(timezone.utc)
         Memory.update(resolved_at=now).where(Memory.id == mem.id).execute()
         fresh = Memory.get_by_id(mem.id)
         assert fresh.resolved_at is not None
 
-    def test_resolved_at_round_trips_none(self, store):
+    def test_resolved_at_round_trips_none(self):
         mem = _create_memory(kind='open_question')
         now = datetime.now(timezone.utc)
         Memory.update(resolved_at=now).where(Memory.id == mem.id).execute()
@@ -670,12 +638,12 @@ class TestQuestionLifecycleFields:
         fresh = Memory.get_by_id(mem.id)
         assert fresh.resolved_at is None
 
-    def test_resolves_question_id_defaults_null(self, store):
+    def test_resolves_question_id_defaults_null(self):
         mem = _create_memory(kind='correction')
         fresh = Memory.get_by_id(mem.id)
         assert fresh.resolves_question_id is None
 
-    def test_resolves_question_id_persists(self, store):
+    def test_resolves_question_id_persists(self):
         question = _create_memory(kind='open_question')
         resolver = _create_memory(kind='correction')
         Memory.update(resolves_question_id=str(question.id)).where(
@@ -684,7 +652,7 @@ class TestQuestionLifecycleFields:
         fresh = Memory.get_by_id(resolver.id)
         assert fresh.resolves_question_id == str(question.id)
 
-    def test_all_three_fields_in_single_row(self, store):
+    def test_all_three_fields_in_single_row(self):
         now = datetime.now(timezone.utc)
         question = _create_memory(kind='open_question')
         resolver = _create_memory(kind='correction')
@@ -706,10 +674,11 @@ class TestQuestionLifecycleFields:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("store")
 class TestMigrationIdempotency:
     """Running _run_migrations() twice must not raise on new columns."""
 
-    def test_expires_at_migration_idempotent(self, store):
+    def test_expires_at_migration_idempotent(self):
         """Re-running migrations does not error when expires_at already exists."""
         from core.database import _run_migrations
         _run_migrations()  # second run — column already present
@@ -717,7 +686,7 @@ class TestMigrationIdempotency:
         cols = [row[1] for row in cursor.fetchall()]
         assert "expires_at" in cols
 
-    def test_source_migration_idempotent(self, store):
+    def test_source_migration_idempotent(self):
         """Re-running migrations does not error when source already exists."""
         from core.database import _run_migrations
         _run_migrations()  # second run
@@ -726,20 +695,21 @@ class TestMigrationIdempotency:
         assert "source" in cols
 
 
+@pytest.mark.usefixtures("store")
 class TestNewModelFields:
     """expires_at and source fields round-trip through the ORM."""
 
-    def test_expires_at_defaults_null(self, store):
+    def test_expires_at_defaults_null(self):
         mem = _create_memory()
         fresh = Memory.get_by_id(mem.id)
         assert fresh.expires_at is None
 
-    def test_source_defaults_human(self, store):
+    def test_source_defaults_human(self):
         mem = _create_memory()
         fresh = Memory.get_by_id(mem.id)
         assert fresh.source == 'human'
 
-    def test_source_persists_agent(self, store):
+    def test_source_persists_agent(self):
         now = datetime.now().isoformat()
         mem = Memory.create(
             stage='ephemeral',
@@ -753,10 +723,11 @@ class TestNewModelFields:
         assert fresh.source == 'agent'
 
 
+@pytest.mark.usefixtures("store")
 class TestSetExpiry:
     """Memory.set_expiry() computes correct expires_at per tier."""
 
-    def test_set_expiry_instinctive_returns_none(self, store):
+    def test_set_expiry_instinctive_returns_none(self):
         """T1 (instinctive) → expires_at = None."""
         mem = _create_memory(stage='instinctive')
         result = mem.set_expiry()
@@ -764,7 +735,7 @@ class TestSetExpiry:
         fresh = Memory.get_by_id(mem.id)
         assert fresh.expires_at is None
 
-    def test_set_expiry_crystallized_positive_int(self, store):
+    def test_set_expiry_crystallized_positive_int(self):
         """T2 (crystallized) → expires_at is a positive integer (Unix ts)."""
         import time as _time
         mem = _create_memory(stage='crystallized')
@@ -778,7 +749,7 @@ class TestSetExpiry:
         assert fresh.expires_at >= before + expected_ttl
         assert fresh.expires_at <= after + expected_ttl
 
-    def test_set_expiry_consolidated_positive_int(self, store):
+    def test_set_expiry_consolidated_positive_int(self):
         """T3 (consolidated) → expires_at set to ~90 days from now."""
         import time as _time
         mem = _create_memory(stage='consolidated')
@@ -790,7 +761,7 @@ class TestSetExpiry:
         assert fresh.expires_at >= before + expected_ttl
         assert fresh.expires_at <= after + expected_ttl
 
-    def test_set_expiry_ephemeral_positive_int(self, store):
+    def test_set_expiry_ephemeral_positive_int(self):
         """T4 (ephemeral) → expires_at set to ~30 days from now."""
         import time as _time
         mem = _create_memory(stage='ephemeral')
@@ -802,17 +773,18 @@ class TestSetExpiry:
         assert fresh.expires_at >= before + expected_ttl
         assert fresh.expires_at <= after + expected_ttl
 
-    def test_set_expiry_returns_none(self, store):
+    def test_set_expiry_returns_none(self):
         """set_expiry() always returns None regardless of tier."""
         for stage in ('instinctive', 'crystallized', 'consolidated', 'ephemeral'):
             mem = _create_memory(stage=stage)
             assert mem.set_expiry() is None
 
 
+@pytest.mark.usefixtures("store")
 class TestLiveScope:
     """Memory.live() filters archived and expired memories."""
 
-    def test_live_excludes_archived(self, store):
+    def test_live_excludes_archived(self):
         """A memory with archived_at set is excluded from live()."""
         mem = _create_memory()
         Memory.update(archived_at=datetime.now().isoformat()).where(
@@ -821,7 +793,7 @@ class TestLiveScope:
         ids = [m.id for m in Memory.live()]
         assert mem.id not in ids
 
-    def test_live_excludes_past_expires_at(self, store):
+    def test_live_excludes_past_expires_at(self):
         """A memory with expires_at in the past is excluded from live()."""
         mem = _create_memory()
         past_ts = int(time_module_unix()) - 3600  # 1 hour ago
@@ -829,7 +801,7 @@ class TestLiveScope:
         ids = [m.id for m in Memory.live()]
         assert mem.id not in ids
 
-    def test_live_includes_future_expires_at(self, store):
+    def test_live_includes_future_expires_at(self):
         """A memory with expires_at in the future is included in live()."""
         mem = _create_memory()
         future_ts = int(time_module_unix()) + 86400  # 1 day from now
@@ -837,14 +809,14 @@ class TestLiveScope:
         ids = [m.id for m in Memory.live()]
         assert mem.id in ids
 
-    def test_live_includes_null_expires_at(self, store):
+    def test_live_includes_null_expires_at(self):
         """A memory with expires_at = NULL (T1) is included in live()."""
         mem = _create_memory(stage='instinctive')
         # expires_at left as NULL (default)
         ids = [m.id for m in Memory.live()]
         assert mem.id in ids
 
-    def test_live_coexists_with_active(self, store):
+    def test_live_coexists_with_active(self):
         """Memory.live() and Memory.active() both return queries independently."""
         mem = _create_memory()
         active_ids = {m.id for m in Memory.active()}
@@ -859,17 +831,18 @@ def time_module_unix() -> int:
     return int(_t.time())
 
 
+@pytest.mark.usefixtures("store")
 class TestHardDelete:
     """Memory.hard_delete() removes from memories, memories_fts, and vec_memories."""
 
-    def test_hard_delete_removes_from_memories(self, store):
+    def test_hard_delete_removes_from_memories(self):
         mem = _create_memory(content='hard delete test unique_xyzzy')
         mem_id = mem.id
         Memory.hard_delete(mem_id)
         with pytest.raises(Memory.DoesNotExist):
             Memory.get_by_id(mem_id)
 
-    def test_hard_delete_removes_from_fts(self, store):
+    def test_hard_delete_removes_from_fts(self):
         mem = _create_memory(content='fts cascade check ftsxyzzy123')
         mem_id = mem.id
         # Verify it's in FTS before deletion
@@ -879,11 +852,11 @@ class TestHardDelete:
         results_after = Memory.search_fts('ftsxyzzy123')
         assert len(results_after) == 0
 
-    def test_hard_delete_nonexistent_is_silent(self, store):
+    def test_hard_delete_nonexistent_is_silent(self):
         """hard_delete of a missing ID should not raise."""
         Memory.hard_delete('00000000-0000-0000-0000-000000000000')
 
-    def test_hard_delete_removes_from_vec_if_available(self, store):
+    def test_hard_delete_removes_from_vec_if_available(self):
         """When VecStore is available, vec entry is also deleted."""
         import struct
         from core.database import get_vec_store
