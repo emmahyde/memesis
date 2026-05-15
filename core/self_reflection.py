@@ -500,6 +500,10 @@ class SelfReflector:
             existing = Memory.select().where(Memory.content_hash == content_hash).first()
             return existing.id
 
+        # Extract W5 enrichment fields encoded in tags ("kind:X", "knowledge_type:Y").
+        kind_tag = next((t.split(":", 1)[1] for t in tags if t.startswith("kind:")), None)
+        kt_tag = next((t.split(":", 1)[1] for t in tags if t.startswith("knowledge_type:")), None)
+
         now = datetime.now().isoformat()
         mem = Memory.create(
             stage="instinctive",
@@ -512,6 +516,11 @@ class SelfReflector:
             created_at=now,
             updated_at=now,
             content_hash=content_hash,
+            # W5 schema fields — parsed from tag conventions used by seeders
+            kind=kind_tag,
+            knowledge_type=kt_tag,
+            knowledge_type_confidence="high" if kt_tag else None,
+            subtitle=summary or None,
             # Defensive nulls — self_reflection is a non-card write path (D3)
             temporal_scope=None,
             confidence=None,

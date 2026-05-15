@@ -35,6 +35,23 @@ NATIVE_TYPE_MAP = {
     "reference": "domain_knowledge",
 }
 
+# Map native Claude Code memory types to W5 Memory.kind enum values.
+# Memory.kind ∈ {decision, finding, preference, constraint, correction, open_question}
+NATIVE_KIND_MAP = {
+    "user": "preference",      # user role/profile = stable preference signal
+    "feedback": "correction",   # explicit user guidance to adjust behavior
+    "project": "decision",      # ongoing initiative state = product/eng decisions
+    "reference": "finding",     # external-system pointers = factual references
+}
+
+# Map native types to W5 knowledge_type axis.
+NATIVE_KNOWLEDGE_TYPE_MAP = {
+    "user": "metacognitive",    # about how to collaborate with the user
+    "feedback": "procedural",   # how to behave going forward
+    "project": "factual",       # what is true about the project state
+    "reference": "factual",     # what/where external resources are
+}
+
 # Importance defaults for native memory types.
 # Feedback is highest — corrections are the most valuable signal.
 NATIVE_IMPORTANCE = {
@@ -258,6 +275,11 @@ class NativeMemoryIngestor:
                     created_at=now,
                     updated_at=now,
                     content_hash=content_hash,
+                    # W5 schema fields — populate from native frontmatter
+                    kind=NATIVE_KIND_MAP.get(native_type),
+                    knowledge_type=NATIVE_KNOWLEDGE_TYPE_MAP.get(native_type),
+                    knowledge_type_confidence="high" if native_type in NATIVE_KIND_MAP else None,
+                    subtitle=(mem.get("description") or "")[:150] or None,
                     # Defensive nulls — ingest is a non-card write path (D3)
                     temporal_scope=None,
                     confidence=None,
