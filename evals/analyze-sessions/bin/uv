@@ -1,0 +1,74 @@
+#!/bin/bash
+# Mock uv binary for analyze-sessions eval.
+# Intercepts "uv run python3 -c ..." calls that require the memesis DB
+# and returns canned output keyed to the eval scenario.
+# All other uv invocations fall through to the real uv or python3.
+
+SCENARIO_FILE="${WORK:-/work}/.memesis-eval-scenario"
+SCENARIO=$(cat "$SCENARIO_FILE" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
+
+# Only intercept "uv run python3 -c <script>"
+if [ "$1" = "run" ] && [ "$2" = "python3" ] && [ "$3" = "-c" ]; then
+  SCRIPT="$4"
+
+  # Check if this is a DB-dependent script (requires peewee/memesis models)
+  if echo "$SCRIPT" | grep -qE 'init_db|Observation|Memory|ConsolidationLog|ParameterOverrides|rule_registry'; then
+
+    case "$SCENARIO" in
+      cwd-bug)
+        if echo "$SCRIPT" | grep -qE 'Observation|Memory'; then
+          echo "Observations in DB for session: 0"
+          echo "Memories citing this session: 0"
+        elif echo "$SCRIPT" | grep -q "ConsolidationLog"; then
+          echo "(no consolidation log entries for this session)"
+        elif echo "$SCRIPT" | grep -q "ParameterOverrides"; then
+          echo "Active rules: []"
+        fi
+        exit 0
+        ;;
+
+      max-tokens)
+        if echo "$SCRIPT" | grep -qE 'Observation|Memory'; then
+          echo "Observations in DB for session: 0"
+          echo "Memories citing this session: 0"
+        elif echo "$SCRIPT" | grep -q "ConsolidationLog"; then
+          echo "(no consolidation log entries for this session)"
+        elif echo "$SCRIPT" | grep -q "ParameterOverrides"; then
+          echo "Active rules: []"
+        fi
+        exit 0
+        ;;
+
+      good-session)
+        if echo "$SCRIPT" | grep -qE 'Observation.*select|select.*Observation'; then
+          echo "Observations in DB for session: 1"
+          echo "  [correction] imp=0.75 Timing/duration helpers belong in core/trace.py, not core/utils.py"
+          echo "Memories citing this session: 1"
+          echo "  [consolidated] Timing/duration helpers belong in core/trace.py, not core/utils.py"
+        elif echo "$SCRIPT" | grep -q "ConsolidationLog"; then
+          echo "2026-05-14T13:00:05 ses_good001 keep: correction captured"
+        elif echo "$SCRIPT" | grep -q "ParameterOverrides"; then
+          echo "Active rules: []"
+        fi
+        exit 0
+        ;;
+
+      *)
+        # Unknown scenario — return empty
+        echo "(eval mock: unknown scenario '$SCENARIO')"
+        exit 0
+        ;;
+    esac
+  fi
+fi
+
+# Fallback: try real uv, then fall back to python3 directly
+if command -v uv.real >/dev/null 2>&1; then
+  exec uv.real "$@"
+elif [ "$1" = "run" ] && [ "$2" = "python3" ]; then
+  shift 2
+  exec python3 "$@"
+else
+  echo "uv mock: unhandled invocation: $*" >&2
+  exit 1
+fi
