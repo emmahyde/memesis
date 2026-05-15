@@ -7,9 +7,9 @@ same migrations). Callers receive `base_dir` as the context value; they can
 construct a `MemoryStore` or any other component that accepts a `base_dir`
 argument.
 
-Rejects `:memory:` (D-06): in-memory databases use a different code path that
-bypasses WAL pragmas and sqlite-vec extension loading. Replay fidelity requires
-the full on-disk initialization sequence.
+Rejects `:memory:`: in-memory databases use a different code path that
+bypasses WAL pragmas. Replay fidelity requires the full on-disk
+initialization sequence.
 
 Usage::
 
@@ -46,9 +46,8 @@ class ReplayDB:
     def __init__(self, db_path: str | None = None) -> None:
         if db_path == ":memory:":
             raise ValueError(
-                "ReplayDB rejects ':memory:' (D-06): in-memory SQLite bypasses WAL "
-                "pragmas and sqlite-vec extension loading; use the default tempfile path "
-                "for replay fidelity."
+                "ReplayDB rejects ':memory:': in-memory SQLite bypasses WAL "
+                "pragmas; use the default tempfile path for replay fidelity."
             )
         self._db_path = db_path
         self._tempdir: str | None = None

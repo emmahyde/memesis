@@ -103,7 +103,7 @@ def expand_neighbors(
 
     Returns neighbor IDs not already in seed_ids, limited to max_expansion.
     Causal edge types are prioritised over structural ones.  Within the
-    same priority tier, neighbors are ordered by sqlite-vec cosine
+    same priority tier, neighbors are ordered by vec store cosine
     similarity to the seed set centroid (when available).
     """
     if not get_flag("graph_expansion") or not seed_ids:

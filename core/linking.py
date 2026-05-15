@@ -75,11 +75,24 @@ def _get_embedding_bytes(memory) -> bytes | None:
     """
     Retrieve raw embedding bytes for a Memory.
 
-    Tries VecStore (sqlite-vec) first, then falls back to the inline
-    ``embedding`` attribute if present (test injection path).
+    Precedence — inline first, then VecStore:
+      1. ``memory.embedding`` attribute (list[float] or bytes). Test-injection path.
+      2. VecStore lookup keyed by memory.id. Production path. VecStore is the
+         numpy-over-Peewee-BlobField implementation in core/vec.py (replaced
+         sqlite-vec + apsw); 384-dim float32 blobs.
+
+    GOTCHA: inline only works for memories the caller constructed and held a
+    reference to. Memories returned by ``Memory.select()`` / ``Memory.get_by_id()``
+    are fresh instances with no inline ``embedding`` attribute, so they fall
+    through to VecStore. Tests that need similarity matching across multiple
+    memories (e.g. ``link_memory``, ``auto_promote_if_dupe``, both of which
+    fetch candidates via ``Memory.select()``) MUST persist embeddings via
+    ``vec_store.store_embedding(memory_id, bytes)`` — setting ``mem.embedding``
+    inline on the test fixture is not enough.
+
+    See ``tests/test_linking.py::_persist_with_embedding`` for the canonical
+    pattern.
     """
-    # Test-injection path: Memory objects in tests may carry a synthetic
-    # ``embedding`` attribute that is already a list[float] or bytes.
     inline = getattr(memory, "embedding", None)
     if inline is not None:
         if isinstance(inline, (bytes, bytearray)):
