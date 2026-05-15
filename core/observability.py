@@ -49,7 +49,7 @@ import json
 import math
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,6 @@ SHADOW_ONLY: bool = True
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(os.environ.get("MEMESIS_REPO_ROOT", Path(__file__).parent.parent))
-_OBS_DIR = _REPO_ROOT / "backfill-output" / "observability"
 
 
 def _obs_dir() -> Path:
@@ -97,7 +96,7 @@ def _append_jsonl(path: Path, record: dict) -> None:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ---------------------------------------------------------------------------
