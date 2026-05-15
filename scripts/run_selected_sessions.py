@@ -236,6 +236,20 @@ def main() -> None:
                     1 for a in entry_record.get("affect_signals", [])
                     if a.get("max_boost", 0) > 0
                 )
+                emitted_kts = {
+                    kt for kt in (
+                        (o.get("knowledge_type") for o in obs_list)
+                    ) if kt
+                } | {
+                    kt for kt in (
+                        (c.get("knowledge_type") for c in cards)
+                    ) if kt
+                }
+                logger.info(
+                    "  knowledge_type diversity: %d unique (%s)",
+                    len(emitted_kts),
+                    sorted(emitted_kts) or "[]",
+                )
                 stats = ExtractionRunStats(
                     session_id=session_id,
                     session_type=session_type,
@@ -255,6 +269,7 @@ def main() -> None:
                     cost_calls=entry_record.get("cost_calls", 0),
                     dropped_duplicates=entry_record.get("dropped_duplicates", 0),
                     low_importance_dropped=entry_record.get("low_importance_dropped", 0),
+                    unique_knowledge_types_emitted=len(emitted_kts),
                     windows_with_affect_signal_but_no_card=entry_record.get(
                         "windows_with_affect_signal_but_no_card", 0
                     ),

@@ -25,7 +25,7 @@ DEFAULTS = {
     "thompson_sampling": True,
     "provenance_signals": True,
     "orienting_detector": True,
-    "habituation_baseline": True,
+    "habituation_baseline": False,
     "somatic_markers": True,
     "replay_priority": True,
     "sm2_spaced_injection": True,

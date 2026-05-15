@@ -33,6 +33,8 @@ from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
 from .linking import link_memory as _link_memory, auto_promote_if_dupe
 from .llm import call_llm as _call_llm_transport
+from peewee import IntegrityError
+
 from .models import ConsolidationLog, Memory, Observation
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
@@ -406,8 +408,20 @@ class Consolidator:
                     "hash": content_hash,
                     "ordinal": index + 1,  # 1-indexed stable key for LLM obs_ids pairing; DB stores index (0-indexed)
                 })
+            except IntegrityError as exc:
+                # Duplicate content_hash from a restored buffer — log loudly so
+                # we know obs are being skipped, not silently lost.
+                logger.warning(
+                    "Observation.create skipped duplicate hash session=%s ordinal=%d hash=%s: %s",
+                    session_id, index, content_hash[:12], exc,
+                )
             except Exception as exc:
-                logger.debug("Observation instrumentation skipped: %s", exc)
+                # Anything else is a real bug — surface at warning so it shows
+                # up in cron logs.
+                logger.warning(
+                    "Observation.create failed session=%s ordinal=%d: %s",
+                    session_id, index, exc,
+                )
 
         return refs
 

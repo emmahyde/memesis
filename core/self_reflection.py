@@ -469,7 +469,7 @@ class SelfReflector:
             title=COMPACTION_GUIDANCE_TITLE,
             summary=COMPACTION_GUIDANCE_SUMMARY,
             tags=["meta-cognition", "compaction", "kind:preference", "knowledge_type:procedural"],
-            importance=0.80,
+            importance=0.90,
         )
 
     def _create_instinctive_memory(

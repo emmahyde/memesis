@@ -1247,4 +1247,55 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
             results["processed"] += 1
             results["observations_total"] += n
 
+            # ExtractionRunStats bridge: production cron previously ran no
+            # reflection rules, so confirmed_rule_no_action / monotone_knowledge
+            # _lens never fired in the live path. Flat-mode stats have no window
+            # or card data; rules that require those silently no-op, which is OK.
+            if not dry_run:
+                try:
+                    from .self_reflection_extraction import (
+                        ExtractionRunStats,
+                        reflect_on_extraction,
+                    )
+                    ntu = sum(
+                        1 for e in entries
+                        if e.get("role") == "user"
+                        and len(e.get("text", "")) >= 60
+                    )
+                    emitted_kts = {
+                        o.get("knowledge_type") for o in obs_list
+                        if o.get("knowledge_type")
+                    }
+                    stats = ExtractionRunStats(
+                        session_id=session_id,
+                        session_type=session_type,
+                        chunking="flat",
+                        windows=1,
+                        productive_windows=1 if obs_list else 0,
+                        raw_observations=len(obs_list),
+                        final_observations=len(obs_list),
+                        issue_cards=0,
+                        orphans=len(obs_list),
+                        skipped_windows=0,
+                        parse_errors=0,
+                        affect_signals_total=0,
+                        affect_quotes_used=0,
+                        nontrivial_user_turn_count=ntu,
+                        entry_count=len(entries),
+                        cost_calls=1,
+                        unique_knowledge_types_emitted=len(emitted_kts),
+                    )
+                    fired = reflect_on_extraction(stats)
+                    if fired:
+                        logger.info(
+                            "tick: self-reflection fired %d rule(s) for %s (%s)",
+                            len(fired), session_id,
+                            ", ".join(r.rule_id for r in fired),
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "tick: self-reflection failed for %s: %s",
+                        session_id, exc,
+                    )
+
     return results

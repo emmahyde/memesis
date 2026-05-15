@@ -3,9 +3,12 @@
 Hourly cron — full memory lifecycle outside any Claude Code session.
 
 Scans all project memory directories for ephemeral buffers with observations,
-runs LLM-based consolidation via Bedrock, then runs the full lifecycle:
-crystallization, thread building, relevance maintenance, and periodic
-self-reflection.
+runs LLM-based consolidation, then runs the full lifecycle: crystallization,
+thread building, relevance maintenance, and periodic self-reflection.
+
+LLM transport: defaults to the agent-SDK / OAuth path used by interactive
+Claude Code sessions. To opt into Bedrock, set CLAUDE_CODE_USE_BEDROCK=1
+in the cron environment.
 
 Usage:
     python3 /path/to/consolidate_cron.py
@@ -17,7 +20,6 @@ Install as cron:
 import fcntl
 import json
 import logging
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.consolidator import Consolidator
 from core.crystallizer import Crystallizer
-from core.database import close_db, get_base_dir, get_vec_store, init_db
+from core.database import close_db, get_vec_store, init_db
 from core.embeddings import embed_for_memory
 from core.feedback import FeedbackLoop
 from core.lifecycle import LifecycleManager
@@ -41,11 +43,6 @@ logging.basicConfig(
     format="%(asctime)s [consolidate-cron] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# Ensure Bedrock credentials are available
-os.environ.setdefault("AWS_PROFILE", "bedrock-users")
-os.environ.setdefault("AWS_REGION", "us-west-2")
-os.environ.setdefault("CLAUDE_CODE_USE_BEDROCK", "true")
 
 # Run self-reflection every N consolidations.
 REFLECTION_INTERVAL = 5
@@ -132,7 +129,18 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         project_context = str(memory_dir.parent)
 
         # --- Consolidation ---
+        obs_in_buffer = sum(
+            1 for line in content.splitlines() if line.startswith("## [")
+        )
         result = consolidator.consolidate_session(str(snapshot_path), session_id)
+        logger.info(
+            "Baseline stats: obs_in=%d kept=%d pruned=%d orphaned=%d promoted=%d",
+            obs_in_buffer,
+            len(result.get("kept", [])),
+            len(result.get("pruned", [])),
+            len(result.get("orphaned", [])),
+            len(result.get("promoted", [])),
+        )
         feedback.update_importance_scores(session_id)
 
         vec_store = get_vec_store()
@@ -337,9 +345,41 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         close_db()
 
         logger.info("  %s", ", ".join(summary_parts))
-        return result
-    finally:
         snapshot_path.unlink(missing_ok=True)
+        return result
+    except Exception:
+        # Restore the snapshot content back to the ephemeral buffer so the
+        # next cron run gets a chance to reprocess. Without this, a single
+        # LLM failure permanently drops every observation in the snapshot
+        # (the buffer was cleared under lock before consolidation ran).
+        try:
+            with open(lock_path, "w") as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                try:
+                    current = ephemeral_path.read_text(encoding="utf-8") \
+                        if ephemeral_path.exists() else header
+                    # Append snapshot body (minus header) so concurrent writes survive.
+                    body = "\n".join(
+                        line for line in content.splitlines()
+                        if line.strip() and not line.startswith("# Session")
+                    )
+                    ephemeral_path.write_text(
+                        current.rstrip() + "\n" + body + "\n",
+                        encoding="utf-8",
+                    )
+                    logger.warning(
+                        "Restored %d byte(s) to ephemeral buffer after failure",
+                        len(body),
+                    )
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception as restore_exc:
+            logger.exception(
+                "CRITICAL: snapshot restore failed; observations lost: %s",
+                restore_exc,
+            )
+        snapshot_path.unlink(missing_ok=True)
+        raise
 
 
 def main():
@@ -368,6 +408,7 @@ def main():
 
     logger.info("Found %d buffer(s) with observations", len(buffers))
 
+    failed_buffers = 0
     for buf in buffers:
         project_hash = buf.parent.parent.parent.name
         logger.info("Processing %s (project: %s)", buf.name, project_hash)
@@ -376,6 +417,7 @@ def main():
             if result is None:
                 logger.info("  (empty after lock — skipped)")
         except Exception as exc:
+            failed_buffers += 1
             logger.exception("  Failed to process %s", buf)
             # Persist a structured error record so db_check / observability
             # can surface failed cron runs that would otherwise vanish into
@@ -400,6 +442,11 @@ def main():
                 pass  # error-logging is best-effort
 
     logger.info("Lifecycle run complete")
+    if failed_buffers:
+        logger.error(
+            "Lifecycle run completed with %d buffer failure(s)", failed_buffers
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
