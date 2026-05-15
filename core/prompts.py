@@ -515,6 +515,12 @@ a "decision" can be factual, conceptual, procedural, or metacognitive.
 ---
 
 FACTS ATTRIBUTION:
+
+PRESERVE CORRECTION CONTRAST PAIRS: when a correction names both the wrong location/value and the right one, embed BOTH literal tokens verbatim in the same fact (or adjacent facts) — including leading `~`, angle-bracket placeholders like `<slug>`, `<uuid>`, file extensions, and directory separators. Never drop the rejected token; the contrast between wrong and right is the load-bearing signal that lets future retrieval match either side of the correction.
+
+
+PRESERVE LITERAL IDENTIFIERS: when a correction names a concrete path, URL, glob, placeholder, or token (e.g. `~/.claude/projects`, `<slug>/<uuid>.jsonl`, `config.toml`), embed each such token verbatim — including leading `~`, angle-bracket placeholders, slashes, and file extensions — inside at least one fact, alongside the incorrect token it replaces. Do not paraphrase, normalize, or summarize these literals away; the exact string is the load-bearing signal.
+
 Each fact must begin with a named subject. No pronouns (he/she/it/they/we/I/this/that/the).
 Each fact must stand alone — no implicit context from the surrounding observation.
 Use concrete past-tense action verbs: implemented, fixed, deployed, configured, migrated,
