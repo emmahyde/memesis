@@ -198,8 +198,7 @@ def test_tick_attaches_session_type_to_observations(tmp_path):
     with CursorStore(cursors_db) as store:
         store.upsert("session-st1", str(transcript), 0)
 
-    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/projects/sector",
-                     "message": {"role": "user", "content": "hello"}}]
+    fake_entries = [{"role": "user", "text": "hello"}]
     # Observation without session_type — tick should add it
     fake_obs = [{"content": "some finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
@@ -211,7 +210,8 @@ def test_tick_attaches_session_type_to_observations(tmp_path):
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, "/Users/emmahyde/projects/sector")), \
+         patch("core.transcript_ingest.extract_tool_uses", return_value=[]), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -233,8 +233,7 @@ def test_tick_code_cwd_produces_code_session_type(tmp_path):
     with CursorStore(cursors_db) as store:
         store.upsert("session-st2", str(transcript), 0)
 
-    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/projects/sector",
-                     "message": {"role": "user", "content": "hello"}}]
+    fake_entries = [{"role": "user", "text": "hello"}]
     fake_obs = [{"content": "code finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
@@ -245,7 +244,8 @@ def test_tick_code_cwd_produces_code_session_type(tmp_path):
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, "/Users/emmahyde/projects/sector")), \
+         patch("core.transcript_ingest.extract_tool_uses", return_value=[]), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -265,8 +265,7 @@ def test_tick_writing_cwd_produces_writing_session_type(tmp_path):
     with CursorStore(cursors_db) as store:
         store.upsert("session-st3", str(transcript), 0)
 
-    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/manuscript/chapter-01",
-                     "message": {"role": "user", "content": "hello"}}]
+    fake_entries = [{"role": "user", "text": "hello"}]
     fake_obs = [{"content": "writing finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
@@ -277,7 +276,8 @@ def test_tick_writing_cwd_produces_writing_session_type(tmp_path):
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, "/Users/emmahyde/manuscript/chapter-01")), \
+         patch("core.transcript_ingest.extract_tool_uses", return_value=[]), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):

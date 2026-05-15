@@ -8,6 +8,7 @@ Public API:
     read_transcript(path)              — full file parse
     read_transcript_from(path, offset) — delta parse from byte offset
     summarize(messages)                — format [USER]/[CLAUDE] text block
+    extract_tool_uses(path)            — scan raw JSONL for tool_use blocks
 """
 
 import json
@@ -36,6 +37,38 @@ def _detect_cwd(path: Path) -> str | None:
     except OSError:
         pass
     return None
+
+
+def extract_tool_uses(path: Path) -> list[dict]:
+    """Scan raw JSONL for tool_use blocks in assistant messages.
+
+    read_transcript_from() collapses content into {role, text} and loses
+    tool metadata. This separate scan recovers tool_name + file_path for
+    the session-type heuristic in detect_session_type_from_tools().
+    """
+    tool_uses: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                content = entry.get("message", {}).get("content", "")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if block.get("type") != "tool_use":
+                        continue
+                    tool_name = block.get("name", "")
+                    file_path = (block.get("input") or {}).get("file_path", "")
+                    if tool_name:
+                        tool_uses.append({"tool_name": tool_name, "file_path": file_path})
+    except OSError:
+        pass
+    return tool_uses
 
 
 def _clean_text(text: str) -> str:

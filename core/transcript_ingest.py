@@ -29,6 +29,7 @@ from datetime import date
 from pathlib import Path
 
 from core.transcript import (
+    extract_tool_uses,
     read_transcript_from,
     summarize,
     iter_windows,
@@ -1214,24 +1215,13 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
 
             rendered = summarize(entries)
 
-            # Detect session type from cwd embedded in transcript entries + tool mix.
-            # Attachment entries (which carry the cwd field) are filtered out by
-            # read_transcript_from(), so fall back to transcript_cwd from _detect_cwd()
-            # which does a separate full-file scan before the filter is applied.
-            session_cwd: str | None = None
-            tool_uses: list[dict] = []
-            for entry in entries:
-                msg = entry.get("message") or {}
-                # cwd lives at top-level or inside message
-                if not session_cwd:
-                    session_cwd = entry.get("cwd") or msg.get("cwd")
-                # Collect tool use entries for tool-mix heuristic
-                if entry.get("type") == "tool_use" or msg.get("type") == "tool_use":
-                    tool_name = entry.get("tool_name") or msg.get("name") or ""
-                    file_path = entry.get("input", {}).get("file_path") or ""
-                    if tool_name:
-                        tool_uses.append({"tool_name": tool_name, "file_path": file_path})
-            session_cwd = session_cwd or transcript_cwd
+            # cwd: attachment entries (carrying the cwd field) are filtered by
+            # read_transcript_from(); transcript_cwd comes from _detect_cwd() which
+            # scans the raw file separately.
+            # tool_uses: read_transcript_from() collapses content to {role,text},
+            # stripping tool metadata — scan raw JSONL via extract_tool_uses().
+            session_cwd: str | None = transcript_cwd
+            tool_uses: list[dict] = extract_tool_uses(path)
 
             session_type = detect_session_type(session_cwd, tool_uses or None)
             obs_list = extract_observations(rendered, session_type=session_type)

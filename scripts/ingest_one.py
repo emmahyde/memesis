@@ -26,7 +26,7 @@ from core.database import close_db, init_db
 from core.lifecycle import LifecycleManager
 from core.models import Memory
 from core.session_detector import detect_session_type
-from core.transcript import read_transcript_from, summarize
+from core.transcript import extract_tool_uses, read_transcript_from, summarize
 from core.transcript_ingest import (
     append_to_ephemeral,
     extract_observations,
@@ -59,7 +59,7 @@ def ingest(jsonl_path: Path) -> None:
     logger.info("Stage counts before: %s", before)
 
     # Read full transcript from offset 0 (bypass cursor).
-    entries, _, _ = read_transcript_from(jsonl_path, 0)
+    entries, _, transcript_cwd = read_transcript_from(jsonl_path, 0)
     if not entries:
         logger.warning("transcript empty: %s", jsonl_path)
         close_db()
@@ -67,17 +67,10 @@ def ingest(jsonl_path: Path) -> None:
 
     rendered = summarize(entries)
 
-    session_cwd = None
-    tool_uses = []
-    for entry in entries:
-        msg = entry.get("message") or {}
-        if not session_cwd:
-            session_cwd = entry.get("cwd") or msg.get("cwd")
-        if entry.get("type") == "tool_use" or msg.get("type") == "tool_use":
-            tool_name = entry.get("tool_name") or msg.get("name") or ""
-            file_path = entry.get("input", {}).get("file_path") or ""
-            if tool_name:
-                tool_uses.append({"tool_name": tool_name, "file_path": file_path})
+    # cwd: returned directly by read_transcript_from (raw file scan).
+    # tool_uses: entries are {role,text} — scan raw JSONL for tool_use blocks.
+    session_cwd = transcript_cwd
+    tool_uses = extract_tool_uses(jsonl_path)
 
     session_type = detect_session_type(session_cwd, tool_uses or None)
     logger.info("Session type: %s | %d entries | %d tool_uses",
