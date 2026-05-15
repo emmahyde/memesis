@@ -133,7 +133,7 @@ def test_extract_observations_array_with_obs_returns_filtered_list():
     assert result[0]["content"] == "Auth uses JWT"
 
 
-def test_extract_observations_skipped_dict_returns_empty_list(tmp_path, caplog):
+def test_extract_observations_skipped_dict_returns_empty_list(caplog):
     """{"skipped": true, "reason": "..."} → empty list, skip trace logged."""
     import logging
     import json
@@ -204,7 +204,8 @@ def test_tick_attaches_session_type_to_observations(tmp_path):
     fake_obs = [{"content": "some finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
-    def fake_append(mem_dir, observations, dry_run=False):
+    def fake_append(*args, **kwargs):
+        observations = args[1]
         captured_obs.append(list(observations))
         return len(observations)
 
@@ -237,7 +238,8 @@ def test_tick_code_cwd_produces_code_session_type(tmp_path):
     fake_obs = [{"content": "code finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
-    def fake_append(mem_dir, observations, dry_run=False):
+    def fake_append(*args, **kwargs):
+        observations = args[1]
         captured_obs.append(list(observations))
         return len(observations)
 
@@ -268,7 +270,8 @@ def test_tick_writing_cwd_produces_writing_session_type(tmp_path):
     fake_obs = [{"content": "writing finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
-    def fake_append(mem_dir, observations, dry_run=False):
+    def fake_append(*args, **kwargs):
+        observations = args[1]
         captured_obs.append(list(observations))
         return len(observations)
 
@@ -402,7 +405,7 @@ class TestJsonRepair:
         import json
         drop_stats: dict = {}
         raw = json.dumps([{"content": "clean obs", "importance": 0.6}])
-        obs, reason = _parse_extract_response(raw, drop_stats=drop_stats)
+        obs, _ = _parse_extract_response(raw, drop_stats=drop_stats)
         assert len(obs) == 1
         assert obs[0]["content"] == "clean obs"
         assert drop_stats.get("parse_errors_repaired", 0) == 0
@@ -413,7 +416,7 @@ class TestJsonRepair:
         raw = "totally not json at all }{]["
         obs, reason = _parse_extract_response(raw, drop_stats=drop_stats)
         assert obs == []
-        assert reason is None
+        assert reason is not None and "[parse_error]" in reason
         # Repair counter should NOT increment for garbage that can't be repaired
         assert drop_stats.get("parse_errors_repaired", 0) == 0
 
@@ -654,8 +657,7 @@ class TestPrefilterResearchNeutral:
 
     def test_research_zero_affect_skipped(self):
         """Research session + max_boost==0.0 → windows skipped, call_llm_batch not called for them."""
-        import json
-        from unittest.mock import patch, call as mock_call
+        from unittest.mock import patch
         from core.transcript_ingest import extract_observations_hierarchical
         import core.transcript_ingest as ti
 

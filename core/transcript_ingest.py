@@ -37,12 +37,9 @@ from core.transcript import (
 from core.cursors import CursorStore
 from core.llm import call_llm, call_llm_batch, _repair_json  # noqa: F401
 from core.prompts import (
-    OBSERVATION_EXTRACT_PROMPT,
     OBSERVATION_TYPES,
     format_observation,
     format_extract_prompt,
-    _OBSERVATION_EXTRACT_PROMPT_TEMPLATE,
-    SESSION_TYPE_GUIDANCE,
 )
 from core.session_detector import detect_session_type, RESEARCH_PATH_HINTS_PREPEND
 from core.extraction_affect import aggregate_window_affect, apply_affect_prior, format_affect_hint, WindowAffect
@@ -345,15 +342,22 @@ def _parse_extract_response(
             logger.warning("_parse_extract_response: JSON decode failed: %s", exc)
             if drop_stats is not None:
                 drop_stats["parse_errors"] = drop_stats.get("parse_errors", 0) + 1
-            return [], None
+            return [], skip_reason or "[parse_error] JSON decode failed"
 
     if isinstance(parsed, list):
         kept = [o for o in parsed if o.get("importance", 0) >= 0.3]
+        dropped = len(parsed) - len(kept)
         if drop_stats is not None:
             drop_stats["low_importance_dropped"] = (
-                drop_stats.get("low_importance_dropped", 0)
-                + (len(parsed) - len(kept))
+                drop_stats.get("low_importance_dropped", 0) + dropped
             )
+        if not kept:
+            empty_reason = (
+                f"[importance_gate] all {dropped} observation(s) below 0.3 threshold"
+                if dropped
+                else (skip_reason or "[empty_response] LLM returned no observations")
+            )
+            return [], empty_reason
         return kept, None
 
     if isinstance(parsed, dict):
@@ -378,13 +382,13 @@ def _parse_extract_response(
             "_parse_extract_response: LLM returned a dict without 'skipped' key — treating as malformed"
         )
         _write_ingest_trace("rejected", "dict response without skipped=true", raw_excerpt[:80])
-        return [], None
+        return [], skip_reason or "[malformed_response] dict without skipped=true"
 
     logger.warning(
         "_parse_extract_response: unexpected parsed type %s — discarding",
         type(parsed).__name__,
     )
-    return [], None
+    return [], skip_reason or f"[unexpected_type] {type(parsed).__name__}"
 
 
 def _normalize_for_dedupe(text: str) -> frozenset[str]:
@@ -1175,16 +1179,19 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
                 results["skipped"] += 1
                 continue
 
-            entries, new_offset, _ = read_transcript_from(path, cursor.last_byte_offset)
+            entries, new_offset, transcript_cwd = read_transcript_from(path, cursor.last_byte_offset)
 
             if not entries:
                 if not dry_run:
-                    store.upsert(session_id, str(path), new_offset)
+                    store.upsert(session_id, str(path), new_offset, cwd=transcript_cwd)
                 continue
 
             rendered = summarize(entries)
 
-            # Detect session type from cwd embedded in transcript entries + tool mix
+            # Detect session type from cwd embedded in transcript entries + tool mix.
+            # Attachment entries (which carry the cwd field) are filtered out by
+            # read_transcript_from(), so fall back to transcript_cwd from _detect_cwd()
+            # which does a separate full-file scan before the filter is applied.
             session_cwd: str | None = None
             tool_uses: list[dict] = []
             for entry in entries:
@@ -1198,6 +1205,7 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
                     file_path = entry.get("input", {}).get("file_path") or ""
                     if tool_name:
                         tool_uses.append({"tool_name": tool_name, "file_path": file_path})
+            session_cwd = session_cwd or transcript_cwd
 
             session_type = detect_session_type(session_cwd, tool_uses or None)
             obs_list = extract_observations(rendered, session_type=session_type)
@@ -1209,7 +1217,7 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
             n = append_to_ephemeral(mem_dir, obs_list, dry_run=dry_run)
 
             if not dry_run:
-                store.upsert(session_id, str(path), new_offset)
+                store.upsert(session_id, str(path), new_offset, cwd=session_cwd)
 
             logger.info(
                 "tick: session %s — %d observation(s) appended", session_id, n
