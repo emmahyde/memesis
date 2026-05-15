@@ -23,10 +23,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # ---------------------------------------------------------------------------
 
 ALLOWED_ACTIONS: frozenset[str] = frozenset(
-    {"keep", "update", "merge", "archive", "prune", "promote"}
+    {"keep", "update", "merge", "archive", "prune", "promote", "supersede"}
 )
 
-DESTRUCTIVE_ACTIONS: frozenset[str] = frozenset({"prune", "archive"})
+DESTRUCTIVE_ACTIONS: frozenset[str] = frozenset({"prune", "archive", "supersede"})
 
 # Valid stage transition map: stage → set of stages it may transition to.
 # "*" is represented as any source stage may transition to pending_delete.
@@ -116,7 +116,6 @@ class ConsolidationDecision(BaseModel):
     rationale: str = ""
 
     # Importance — optional because promote decisions may omit it
-    raw_importance: float | None = None
     importance: float | None = None
 
     # Keep-specific fields
@@ -143,6 +142,11 @@ class ConsolidationDecision(BaseModel):
     subtitle: str | None = None
     resolves_question_id: str | None = None  # memory UUID4 or None
 
+    # Stable ordinal back-reference: echo back the OBSERVATION_ID(s) this decision covers.
+    # When present and non-empty, consolidator uses ordinal lookup instead of substring matching.
+    # Optional (default []) for back-compat with callers that don't supply obs_ids.
+    obs_ids: list[int] = Field(default_factory=list)
+
     # Card-shaped optional fields (present when "scope" or "evidence_quotes" in dict)
     scope: str | None = None
     evidence_quotes: list[str] | None = None
@@ -166,7 +170,23 @@ class ConsolidationDecision(BaseModel):
             )
         return normalised
 
-    @field_validator("importance", "raw_importance", mode="before")
+    @field_validator("knowledge_type", mode="before")
+    @classmethod
+    def normalize_knowledge_type(cls, v: Any) -> Any:
+        """Coerce common LLM truncations to canonical values."""
+        if not isinstance(v, str):
+            return v
+        normalised = v.strip().lower()
+        # Common LLM mistakes: "procedure" → "procedural", "fact" → "factual", etc.
+        synonyms = {
+            "procedure": "procedural",
+            "fact": "factual",
+            "concept": "conceptual",
+            "metacognition": "metacognitive",
+        }
+        return synonyms.get(normalised, normalised)
+
+    @field_validator("importance", mode="before")
     @classmethod
     def validate_importance(cls, v: Any) -> float | None:
         if v is None:

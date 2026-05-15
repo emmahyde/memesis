@@ -75,6 +75,7 @@ class Memory(BaseModel):
     injection_count = IntegerField(default=0, null=True)
     usage_count = IntegerField(default=0, null=True)
     project_context = TextField(null=True)
+    project = TextField(null=True)            # slug: -Users-emmahyde-projects-memesis
     source_session = TextField(null=True)
     content_hash = TextField(null=True)
     archived_at = TextField(null=True)
@@ -94,7 +95,6 @@ class Memory(BaseModel):
     subtitle = TextField(null=True)                   # ≤24 words retrieval card
     cwd = TextField(null=True)                        # multi-project attribution
     session_type = TextField(null=True)               # code | writing | research | null (Sprint B forward-compat)
-    raw_importance = FloatField(null=True)            # Stage 1 importance, preserved for audit (C7)
     linked_observation_ids = TextField(null=True)     # JSON-serialized list of UUIDs
 
     # WS-H: open_question lifecycle fields (Sprint B DS-F9)
@@ -102,11 +102,9 @@ class Memory(BaseModel):
     resolved_at = DateTimeField(null=True)         # when this question was resolved (set on question row)
     is_pinned = IntegerField(default=0, null=True) # 1 = exempt from auto-pruning (open_questions)
 
-    # DS-F3 forward-compat: shadow-prune logger fields
-    access_count = IntegerField(default=0, null=True)
+    # DS-F3 forward-compat: shadow-prune logger fields.
+    # access_count + w2_created_at dropped in migration 0007: 0% set, no readers.
     last_accessed_at = DateTimeField(null=True)
-    # NOTE: created_at already exists as TextField; w2_created_at captures timezone-aware value
-    w2_created_at = DateTimeField(null=True, default=lambda: datetime.now(timezone.utc))
 
     # Agentic-memory BLOCKER set (B4 + E3)
     expires_at = IntegerField(null=True)          # Unix timestamp; NULL = never expires (T1)
@@ -158,6 +156,34 @@ class Memory(BaseModel):
             return value if isinstance(value, list) else []
         except (ValueError, TypeError):
             return []
+
+    # -- Construction safeguard ----------------------------------------
+
+    def __init__(self, *args, **kwargs):
+        """Warn on unknown kwargs to catch silent-accept gotcha.
+
+        Peewee accepts arbitrary keyword arguments to Model.create() / __init__,
+        setting unknown names as instance attributes that never persist to DB.
+        Production code reading via Memory.select() / get_by_id() then sees None,
+        producing tests that pass-by-accident.
+        """
+        if kwargs:
+            field_names = set(self._meta.fields.keys()) if hasattr(self, "_meta") else set()
+            # Allow Peewee internal kwargs (e.g., __data__, __dirty__) and known non-column attrs
+            allowed_extras = {"embedding"}  # vec store backed attr — see core/linking.py:_get_embedding_bytes
+            unknown = [
+                k for k in kwargs
+                if k not in field_names
+                and not k.startswith("__")
+                and k not in allowed_extras
+            ]
+            if unknown:
+                logger.warning(
+                    "Memory.__init__: unknown kwargs %s — will NOT persist to DB. "
+                    "If you meant to inject for testing, set as attribute AFTER construction.",
+                    unknown,
+                )
+        super().__init__(*args, **kwargs)
 
     # -- Scopes --------------------------------------------------------
 
@@ -596,7 +622,13 @@ class ConsolidationLog(BaseModel):
 
 
 class Observation(BaseModel):
-    """Raw and filtered observations captured before consolidation decisions."""
+    """Raw and filtered observations captured before consolidation decisions.
+
+    Note: `ordinal` is 0-indexed by historical convention (first observation = 0).
+    The consolidator's runtime ref dicts use 1-indexed ordinals (see _record_observations).
+    Diagnostic queries joining on Observation.ordinal must add 1 to match the LLM-visible
+    OBSERVATION_ID values echoed back in obs_ids.
+    """
 
     id = AutoField()
     created_at = TextField(default=lambda: datetime.now().isoformat())
@@ -609,6 +641,7 @@ class Observation(BaseModel):
     status = TextField(null=True)
     memory_id = TextField(null=True)
     metadata = TextField(null=True)
+    project = TextField(null=True)            # slug: -Users-emmahyde-projects-memesis
 
     class Meta:
         table_name = "observations"

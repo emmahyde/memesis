@@ -100,8 +100,14 @@ def _apply_sql(conn, path: Path) -> None:
             conn.execute_sql(stmt)
         except Exception as exc:
             msg = str(exc).lower()
-            # Tolerate "duplicate column name" and "index already exists"
-            if "duplicate column" in msg or "already exists" in msg:
+            # Tolerate idempotent re-application failures:
+            #   - duplicate column name / already exists: ADD already happened
+            #   - no such column: DROP target never existed (e.g., seeded init)
+            if (
+                "duplicate column" in msg
+                or "already exists" in msg
+                or "no such column" in msg
+            ):
                 logger.debug("Skipping already-applied statement in %s: %s", path.name, exc)
             else:
                 raise
