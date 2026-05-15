@@ -272,16 +272,24 @@ def _run_replay(transcript_path: Path, base_dir: str, _session_id: str, _force_l
                     except Exception as exc:
                         print(f"[evolve] Embed warning ({memory_id}): {exc}")
                 print(f"[evolve] Embedded {n_embedded} memories into vec_store.")
-                # Probe vec0 row count
-                if vec_store and vec_store.available:
-                    try:
-                        from core.models import db as _probe_db
-                        n_rows = _probe_db.execute_sql("SELECT COUNT(*) FROM vec_memories").fetchone()[0]
-                        print(f"[evolve] vec_memories row count: {n_rows} at {mem_dir}")
-                    except Exception as exc:
-                        print(f"[evolve] vec probe failed: {exc}")
-                else:
-                    print(f"[evolve] vec_store unavailable: store={vec_store} avail={getattr(vec_store, 'available', None)}")
+                # Mid-pipeline persistence probe
+                try:
+                    from core.database import get_db_path
+                    from core.models import db as _probe_db
+                    import sqlite3 as _sq3
+                    n_mem_peewee = _probe_db.execute_sql("SELECT COUNT(*) FROM memories").fetchone()[0]
+                    _dbp = str(get_db_path())
+                    _c = _sq3.connect(_dbp)
+                    n_mem_direct = _c.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+                    n_emb_direct = _c.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
+                    _c.close()
+                    print(f"[evolve] DB probe: db_path={_dbp}")
+                    print(f"[evolve] DB probe: memories peewee={n_mem_peewee} direct={n_mem_direct} memory_embeddings={n_emb_direct}")
+                    if os.environ.get("EVOLVE_DUMP_KEPT"):
+                        for _row in _probe_db.execute_sql("SELECT id, kind, title, content FROM memories ORDER BY created_at"):
+                            print(f"[evolve-dump] id={_row[0][:8]} kind={_row[1]} title={_row[2]!r}\n  content={_row[3][:200]!r}")
+                except Exception as exc:
+                    print(f"[evolve] DB probe failed: {exc}")
                 if _tw:
                     _tw.emit("consolidate", "consolidation_end", {
                         "kept": kept, "pruned": pruned, "promoted": promoted,
@@ -361,7 +369,7 @@ def _compile_evals(
     return specs, eval_paths
 
 
-def _run_guard_suite(_slug: str, eval_paths: list[Path]) -> dict[str, bool]:
+def _run_guard_suite(_slug: str, eval_paths: list[Path], replay_store: str | None = None) -> dict[str, bool]:
     """Run pytest for tests/ + each compiled eval file. Returns {eval_slug: pass}."""
     results: dict[str, bool] = {}
 
@@ -375,6 +383,9 @@ def _run_guard_suite(_slug: str, eval_paths: list[Path]) -> dict[str, bool]:
             "--no-header",
             "-p", "no:cacheprovider",
         ]
+        env = os.environ.copy()
+        if replay_store:
+            env["MEMESIS_REPLAY_STORE"] = replay_store
         try:
             proc = subprocess.run(
                 cmd,
@@ -382,6 +393,7 @@ def _run_guard_suite(_slug: str, eval_paths: list[Path]) -> dict[str, bool]:
                 text=True,
                 cwd=str(_PROJECT_ROOT),
                 timeout=30,
+                env=env,
             )
             passed = proc.returncode == 0
         except subprocess.TimeoutExpired:
@@ -668,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
             # Run guard suite
             print()
             print("=== GUARD SUITE ===")
-            results = _run_guard_suite(slug, eval_paths)
+            results = _run_guard_suite(slug, eval_paths, replay_store=str(base_dir))
 
         # Diagnostic delta (after ReplayDB cleanup — eval files still exist on disk)
         _emit_diagnostic_delta(specs, eval_paths, results, replay_session_id)
