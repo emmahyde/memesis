@@ -36,11 +36,15 @@ def up(conn):
         pass
 
     # Also remove the optional shadow tables that vec0 may leave behind
-    # (vec_memories_chunks, vec_memories_rowids, vec_memories_vector_chunks00).
+    # (vec_memories_chunks, vec_memories_rowids, vec_memories_vector_chunks00,
+    # vec_memories_info) and any autoindexes SQLite created on those tables.
     try:
         conn.execute_sql("PRAGMA writable_schema = 1")
         conn.execute_sql(
             "DELETE FROM sqlite_master WHERE name LIKE 'vec_memories_%'"
+        )
+        conn.execute_sql(
+            "DELETE FROM sqlite_master WHERE name LIKE 'sqlite_autoindex_vec_memories%'"
         )
         conn.execute_sql("PRAGMA writable_schema = 0")
     except Exception:

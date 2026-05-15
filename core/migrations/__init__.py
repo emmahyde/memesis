@@ -107,6 +107,7 @@ def _apply_sql(conn, path: Path) -> None:
                 "duplicate column" in msg
                 or "already exists" in msg
                 or "no such column" in msg
+                or "orphan index" in msg
             ):
                 logger.debug("Skipping already-applied statement in %s: %s", path.name, exc)
             else:
