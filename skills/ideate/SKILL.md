@@ -21,7 +21,9 @@ WANT → build → WANT → build → WANT → ...
 
 Each cycle: identify what to build, build it, then immediately identify the next thing. The loop runs until context exhaustion or explicit user interruption — NOT until one item completes.
 
+<MANDATORY>
 **Do not ask permission. Do not wait for approval between cycles. Just build.**
+</MANDATORY>
 
 ## Invocation
 
@@ -100,7 +102,9 @@ This continues until:
 - User explicitly interrupts
 - A blocking error that can't be auto-resolved
 
+<MANDATORY>
 **Do NOT idle after completing one item.** The whole point is continuous development.
+</MANDATORY>
 
 ## Constraints
 
