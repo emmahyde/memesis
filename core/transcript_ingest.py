@@ -47,6 +47,7 @@ from core.issue_cards import synthesize_issue_cards
 from core.card_validators import _card_evidence_load_bearing
 from core.rule_registry import ParameterOverrides
 from core.trace import get_active_writer
+from core.validators import validate_stage1_soft
 
 # Module-level prefilter knobs are deprecated — settings now live on
 # `ParameterOverrides` (core.rule_registry) so the closed-loop registry can
@@ -291,6 +292,29 @@ def extract_observations(
         type(parsed).__name__,
     )
     return []
+
+
+def _soft_validate_window_obs(
+    obs: list[dict],
+    window_index: int,
+    drop_stats: dict | None,
+) -> None:
+    """Run soft validation on a window's observations and log warnings.
+
+    Never drops observations — soft mode for migration period (LLME-F6).
+    Accumulates schema_warnings count in drop_stats if provided.
+    """
+    for o in obs:
+        warnings = validate_stage1_soft(o)[1]
+        if warnings:
+            logger.debug(
+                "stage1 soft-validate window %d obs %r: %s",
+                window_index,
+                str(o.get("kind") or o.get("content", ""))[:40],
+                "; ".join(warnings),
+            )
+            if drop_stats is not None:
+                drop_stats["schema_warnings"] = drop_stats.get("schema_warnings", 0) + len(warnings)
 
 
 def _parse_extract_response(
@@ -733,6 +757,7 @@ def extract_observations_hierarchical(
             if obs:
                 productive_windows += 1
                 apply_affect_prior(obs, affect)
+                _soft_validate_window_obs(obs, i, drop_stats)
 
                 # Embed each new observation and add to the in-session index.
                 # Join facts[] or fall back to content for embedding text.
@@ -854,6 +879,7 @@ def extract_observations_hierarchical(
             if obs:
                 productive_windows += 1
                 apply_affect_prior(obs, affect)
+                _soft_validate_window_obs(obs, i, drop_stats)
             else:
                 # Attempt to extract llm_reason from the raw response (if LLM emitted {"reason": ...})
                 llm_reason: str | None = None
