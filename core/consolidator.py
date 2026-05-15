@@ -936,8 +936,12 @@ class Consolidator:
                 content_hash=content_hash,
                 temporal_scope=card_fields["temporal_scope"],
                 confidence=card_fields["confidence"],
-                # D3: "neutral" default for card-derived; non-card branches leave NULL
-                affect_valence=card_fields.get("affect_valence") or "neutral" if is_card else card_fields["affect_valence"],
+                # D3: "neutral" default for card-derived; non-card NULL unless somatic detected non-neutral signal
+                affect_valence=(
+                    (card_fields.get("affect_valence") or "neutral")
+                    if is_card
+                    else (valence if valence and valence != "neutral" else None)
+                ),
                 actor=card_fields["actor"],
                 # #36-A: wire criterion_weights + rejected_options from card fields
                 criterion_weights=json.dumps(card_fields.get("criterion_weights")) if card_fields.get("criterion_weights") else None,

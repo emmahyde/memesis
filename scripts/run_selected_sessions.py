@@ -255,6 +255,9 @@ def main() -> None:
                     cost_calls=entry_record.get("cost_calls", 0),
                     dropped_duplicates=entry_record.get("dropped_duplicates", 0),
                     low_importance_dropped=entry_record.get("low_importance_dropped", 0),
+                    windows_with_affect_signal_but_no_card=entry_record.get(
+                        "windows_with_affect_signal_but_no_card", 0
+                    ),
                 )
                 reflections = reflect_on_extraction(stats)
                 entry_record["self_observations"] = [r.to_dict() for r in reflections]

@@ -588,6 +588,7 @@ def extract_observations_hierarchical(
     productive_windows = 0
     parse_errors = 0
     cost_calls = 0
+    affect_signal_no_extraction = 0
     drop_stats: dict = {"low_importance_dropped": 0}
 
     # Three-stage cheapest-first prefilter. Each gate records distinct outcome.
@@ -791,6 +792,8 @@ def extract_observations_hierarchical(
                 if llm_reason is not None:
                     skip_record["llm_reason"] = llm_reason
                 skips.append(skip_record)
+                if affect.max_boost > 0:
+                    affect_signal_no_extraction += 1
 
             all_obs.extend(obs)
             logger.info(
@@ -902,6 +905,8 @@ def extract_observations_hierarchical(
                 if llm_reason is not None:
                     skip_record["llm_reason"] = llm_reason
                 skips.append(skip_record)
+                if affect.max_boost > 0:
+                    affect_signal_no_extraction += 1
             all_obs.extend(obs)
             logger.info(
                 "hierarchical: window %d/%d → %d obs (affect=%s/%.2f)",
@@ -1006,6 +1011,7 @@ def extract_observations_hierarchical(
         "cost_calls": cost_calls,
         "prefilter_skipped_count": len(prefiltered),
         "cross_window_dedup_hits": cross_window_dedup_hits,
+        "windows_with_affect_signal_but_no_card": affect_signal_no_extraction,
     }
 
 
