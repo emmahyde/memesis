@@ -26,6 +26,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from core.autoresearch import Autoresearcher  # noqa: E402
 from core.llm import call_llm  # noqa: E402
+from core.trace import TraceWriter, set_active_writer  # noqa: E402
 
 
 ANCHOR = "FACTS ATTRIBUTION:\n"
@@ -142,12 +143,20 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    researcher = PromptsPatcher(
-        session_path=args.session_path,
-        eval_slug=args.eval_slug,
-        replay_store=args.replay_store,
-    )
-    result = researcher.run()
+    # Activate a TraceWriter so call_llm emits llm_envelope events that
+    # Autoresearcher._default_token_counter can read for token tracking.
+    trace_session = f"autoresearch-{args.session_path.name}-{args.eval_slug}"
+    trace_writer = TraceWriter(session_id=trace_session)
+    set_active_writer(trace_writer)
+    try:
+        researcher = PromptsPatcher(
+            session_path=args.session_path,
+            eval_slug=args.eval_slug,
+            replay_store=args.replay_store,
+        )
+        result = researcher.run()
+    finally:
+        set_active_writer(None)
     print(f"halt_reason={result.halt_reason}")
     print(f"iterations={result.iterations_completed}")
     print(f"kept={result.mutations_kept} discarded={result.mutations_discarded}")

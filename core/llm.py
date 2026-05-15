@@ -260,8 +260,12 @@ def _strip_oauth_env() -> dict[str, str]:
     }
 
 
-async def _call_via_agent_sdk(prompt: str) -> str:
+async def _call_via_agent_sdk(prompt: str) -> tuple[str, int | None, int | None]:
     """Single-shot LLM call via claude-agent-sdk on OAuth credentials.
+
+    Returns (result_text, input_tokens, output_tokens). Token counts come
+    from the ResultMessage.usage dict and may be None if the SDK version
+    in use does not surface them.
 
     The SDK serializes OAuth refresh internally, so concurrent gather()
     over many calls does not race on token storage the way raw subprocess
@@ -288,6 +292,8 @@ async def _call_via_agent_sdk(prompt: str) -> str:
     )
     try:
         result_text = ""
+        input_tokens: int | None = None
+        output_tokens: int | None = None
         async for msg in _agent_query(prompt=prompt, options=options):
             if ResultMessage is not None and isinstance(msg, ResultMessage):
                 # ResultMessage.result holds the final assistant text in
@@ -297,11 +303,15 @@ async def _call_via_agent_sdk(prompt: str) -> str:
                     or getattr(msg, "text", None)
                     or ""
                 )
+                usage = getattr(msg, "usage", None)
+                if isinstance(usage, dict):
+                    input_tokens = usage.get("input_tokens")
+                    output_tokens = usage.get("output_tokens")
                 # Do not break — exhaust the generator so it completes naturally.
                 # Breaking mid-generator leaves ag_running=True, causing
                 # "aclose(): asynchronous generator is already running" when
                 # asyncio.run() shuts down the event loop.
-        return result_text
+        return result_text, input_tokens, output_tokens
     finally:
         for k, v in saved.items():
             if v is not None:
@@ -324,8 +334,10 @@ async def call_llm_async(
     use_bedrock = bool(os.environ.get("CLAUDE_CODE_USE_BEDROCK"))
 
     if not use_bedrock and not _have_api_key() and _AGENT_SDK_AVAILABLE:
-        raw = await _call_via_agent_sdk(prompt)
-        return strip_markdown_fences(raw)
+        raw_text, in_toks, out_toks = await _call_via_agent_sdk(prompt)
+        result = strip_markdown_fences(raw_text)
+        _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
+        return result
 
     return await asyncio.to_thread(
         call_llm,
@@ -409,8 +421,9 @@ def call_llm(
     if not use_bedrock and not _have_api_key():
         if _AGENT_SDK_AVAILABLE:
             try:
-                result = strip_markdown_fences(asyncio.run(_call_via_agent_sdk(prompt)))
-                _emit_llm_envelope(model, prompt, None, None, len(result))
+                raw_text, in_toks, out_toks = asyncio.run(_call_via_agent_sdk(prompt))
+                result = strip_markdown_fences(raw_text)
+                _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
                 return result
             except RuntimeError as exc:
                 # Common failure: nested asyncio.run from already-running loop.

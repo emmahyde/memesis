@@ -90,9 +90,10 @@ class TestMakeClient:
 # ---------------------------------------------------------------------------
 
 
-def _async_return(value):
+def _async_return_sdk(text, in_toks=None, out_toks=None):
+    """Mock for _call_via_agent_sdk: returns the (text, in, out) tuple shape."""
     async def _coro(*_args, **_kwargs):
-        return value
+        return text, in_toks, out_toks
     return _coro
 
 
@@ -108,16 +109,16 @@ class TestCallLlmOAuthPath:
         with patch.dict(os.environ, env, clear=True), \
              patch("core.llm._AGENT_SDK_AVAILABLE", True), \
              patch("core.llm._call_via_agent_sdk",
-                   side_effect=_async_return('```json\n{"result": true}\n```')):
+                   side_effect=_async_return_sdk('```json\n{"result": true}\n```')):
             assert call_llm("test prompt") == '{"result": true}'
 
     def test_passes_prompt_to_sdk(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_USE_BEDROCK"}
         captured = {}
 
-        async def _spy(prompt: str) -> str:
+        async def _spy(prompt: str) -> tuple[str, int | None, int | None]:
             captured["prompt"] = prompt
-            return "ok"
+            return "ok", None, None
 
         with patch.dict(os.environ, env, clear=True), \
              patch("core.llm._AGENT_SDK_AVAILABLE", True), \
@@ -279,7 +280,7 @@ class TestLlmEnvelopeTrace:
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_USE_BEDROCK"}
         with patch.dict(os.environ, env, clear=True), \
              patch("core.llm._AGENT_SDK_AVAILABLE", True), \
-             patch("core.llm._call_via_agent_sdk", side_effect=_async_return("response text")), \
+             patch("core.llm._call_via_agent_sdk", side_effect=_async_return_sdk("response text")), \
              patch("core.llm.get_active_writer", return_value=writer):
             call_llm(prompt)
 
