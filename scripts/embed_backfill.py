@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Embed all existing memories via Bedrock Titan v2 and store in vec_memories.
+Embed all existing memories via Bedrock Titan v2 and store in memory_embeddings.
 
 Usage:
     python3 scripts/embed_backfill.py                    # Embed all missing

@@ -833,7 +833,7 @@ def time_module_unix() -> int:
 
 @pytest.mark.usefixtures("store")
 class TestHardDelete:
-    """Memory.hard_delete() removes from memories, memories_fts, and vec_memories."""
+    """Memory.hard_delete() removes from memories, memories_fts, and memory_embeddings."""
 
     def test_hard_delete_removes_from_memories(self):
         mem = _create_memory(content='hard delete test unique_xyzzy')

@@ -18,7 +18,7 @@ In other words: current time exceeds archived_at by one TTL period.  Since
 expires_at already represents (created_at + TTL), the total elapsed time
 since creation is at least 2× TTL before hard-deletion fires — hence "2× TTL window".
 
-Cascade: Memory.hard_delete() handles FTS5 + vec_memories + primary row in one
+Cascade: Memory.hard_delete() handles FTS5 + memory_embeddings + primary row in one
 db.atomic() block.  This script never issues raw DELETE FROM memories.
 
 Usage

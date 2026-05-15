@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_embeddings(memories: list):
-    """Retrieve stored embeddings from vec_memories."""
+    """Retrieve stored embeddings from memory_embeddings."""
     try:
         import struct
         import numpy as np

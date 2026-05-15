@@ -81,7 +81,7 @@ Respond ONLY with valid JSON:
 
 def _get_embeddings(candidates: list):
     """
-    Retrieve stored embeddings for candidates from vec_memories.
+    Retrieve stored embeddings for candidates from memory_embeddings.
 
     Returns numpy array of shape (N, 512), or None if embeddings
     are not available for all candidates.

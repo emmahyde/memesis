@@ -352,11 +352,11 @@ def test_{_safe_fn(spec.slug)}_semantic_similarity():
         from core.database import get_db_path
         from core.models import db as _db
         try:
-            n_vec = _db.execute_sql("SELECT COUNT(*) FROM vec_memories").fetchone()[0]
+            n_vec = _db.execute_sql("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
         except Exception as _e:
             n_vec = f"err:{{_e}}"
         print(f"\\n[eval-debug] db_path={{get_db_path()}}")
-        print(f"[eval-debug] vec_memories rows: {{n_vec}}")
+        print(f"[eval-debug] memory_embeddings rows: {{n_vec}}")
         print(f"[eval-debug] Memory rows (active): {{len(memory_ids)}} ids={{memory_ids}}")
         print(f"[eval-debug] search_vector returned {{len(results)}}: {{results}}")
 
