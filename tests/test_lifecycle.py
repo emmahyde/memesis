@@ -639,3 +639,92 @@ class TestExpiryWiring:
 
         with pytest.raises(Memory.DoesNotExist):
             Memory.get_by_id(memory_id)
+
+
+# -------------------------------------------------------------------
+# Importance-gated hybrid crystallization gate
+# -------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("base")
+class TestImportanceGatedCrystallization:
+    """Hybrid gate: high-importance memories crystallize at rc=2; standard path at rc=3."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch):
+        from core.lifecycle import LifecycleManager
+        monkeypatch.setattr(LifecycleManager, "MIN_REINFORCEMENT_SPAN_DAYS", 2)
+        monkeypatch.setattr(LifecycleManager, "CRYSTALLIZE_IMPORTANCE_THRESH", 0.75)
+
+    def test_high_importance_rc2_spaced_promotes(self, manager):
+        """importance >= thresh AND rc=2 AND spaced -> promotes to crystallized."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.80)
+        base = datetime(2026, 3, 1, 10, 0)
+        _add_reinforcement_log(memory_id, base, "s1")
+        _add_reinforcement_log(memory_id, base + timedelta(days=2), "s2")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+        assert 'high-importance' in reason.lower()
+
+    def test_low_importance_rc2_blocks(self, manager):
+        """importance < thresh AND rc=2 -> blocked on standard path (need 3+)."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.60)
+        base = datetime(2026, 3, 1, 10, 0)
+        _add_reinforcement_log(memory_id, base, "s1")
+        _add_reinforcement_log(memory_id, base + timedelta(days=2), "s2")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is False
+        assert 'need 3+' in reason.lower()
+
+    def test_rc3_promotes_regardless_of_importance(self, manager):
+        """rc >= 3 with low importance still crystallizes via standard path."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=3, importance=0.40)
+        base = datetime(2026, 3, 1, 10, 0)
+        for i in range(3):
+            _add_reinforcement_log(memory_id, base + timedelta(days=i * 2), f"s{i}")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+
+    def test_high_importance_rc2_single_day_blocks(self, manager):
+        """High importance + rc=2 but same-day reinforcements -> spacing blocks regardless."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.90)
+        same_day = datetime(2026, 3, 15, 9, 0)
+        _add_reinforcement_log(memory_id, same_day, "s1")
+        _add_reinforcement_log(memory_id, same_day.replace(hour=14), "s2")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is False
+        assert 'spacing' in reason.lower() or 'distinct day' in reason.lower()
+
+    def test_importance_at_threshold_qualifies(self, manager):
+        """importance == thresh exactly is accepted (>= boundary)."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.75)
+        base = datetime(2026, 3, 1, 10, 0)
+        _add_reinforcement_log(memory_id, base, "s1")
+        _add_reinforcement_log(memory_id, base + timedelta(days=3), "s2")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+
+    def test_get_promotion_candidates_includes_high_importance_rc2(self, manager):
+        """get_promotion_candidates returns high-importance rc=2 memories."""
+        hi_id = _create_memory(
+            stage='consolidated', title='High importance', reinforcement_count=2, importance=0.80
+        )
+        base = datetime(2026, 3, 1, 10, 0)
+        _add_reinforcement_log(hi_id, base, "s1")
+        _add_reinforcement_log(hi_id, base + timedelta(days=2), "s2")
+
+        lo_id = _create_memory(
+            stage='consolidated', title='Low importance', reinforcement_count=2, importance=0.50
+        )
+        _add_reinforcement_log(lo_id, base, "s3")
+        _add_reinforcement_log(lo_id, base + timedelta(days=2), "s4")
+
+        candidates = manager.get_promotion_candidates()
+        ids = [c['id'] for c in candidates]
+        assert hi_id in ids
+        assert lo_id not in ids

@@ -5,6 +5,7 @@ Implements D-07 (3+ reinforcements for crystallized), D-08 (cross-project promot
 and D-09 (demotion for unused memories).
 """
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,9 @@ class LifecycleManager:
 
     # Spacing effect: minimum distinct calendar days reinforcements must span.
     MIN_REINFORCEMENT_SPAN_DAYS = 0
+    CRYSTALLIZE_IMPORTANCE_THRESH: float = float(
+        os.environ.get("MEMESIS_CRYSTALLIZE_IMPORTANCE_THRESH", "0.75")
+    )
 
     def __init__(self):
         pass
@@ -159,7 +163,8 @@ class LifecycleManager:
         Get memories eligible for promotion to crystallized stage.
 
         Returns:
-            List of consolidated memories with reinforcement_count >= 3
+            List of consolidated memories meeting the hybrid crystallization gate
+            (rc >= 3 + spacing, or importance >= CRYSTALLIZE_IMPORTANCE_THRESH + rc >= 2 + spacing)
         """
         consolidated_memories = list(Memory.by_stage('consolidated'))
         candidates = []
@@ -275,6 +280,7 @@ class LifecycleManager:
                 'id': memory.id,
                 'reinforcement_count': memory.reinforcement_count,
                 'stage': memory.stage,
+                'importance': memory.importance,
             }
             return self._can_promote_to_crystallized(mem_dict)
 
@@ -320,14 +326,31 @@ class LifecycleManager:
         """
         Check if memory meets criteria for promotion to crystallized.
 
-        D-07: Requires 3+ independent reinforcements.
-        Spacing effect: reinforcements must span multiple distinct days.
+        Two paths (either qualifies):
+        - Standard: rc >= 3 + spaced reinforcements (D-07)
+        - High-importance: importance >= CRYSTALLIZE_IMPORTANCE_THRESH AND rc >= 2 + spaced
+
+        Spacing is required on both paths — single-session burst reinforcement
+        is never enough regardless of importance.
         """
         reinforcement_count = memory.get('reinforcement_count', 0) or 0
+        importance = memory.get('importance', 0.0) or 0.0
+        thresh = self.CRYSTALLIZE_IMPORTANCE_THRESH
+
+        # High-importance fast path: lower rc bar for high-signal memories
+        if importance >= thresh and reinforcement_count >= 2:
+            spaced, spacing_reason = self._has_spaced_reinforcement(memory['id'])
+            if spaced:
+                return True, (
+                    f"High-importance ({importance:.2f} >= {thresh}) "
+                    f"with {reinforcement_count} reinforcements and adequate spacing"
+                )
+            return False, spacing_reason
+
+        # Standard path
         if reinforcement_count < 3:
             return False, f"Only {reinforcement_count} reinforcements (need 3+)"
 
-        # Spacing effect: check temporal distribution
         spaced, spacing_reason = self._has_spaced_reinforcement(memory['id'])
         if not spaced:
             return False, spacing_reason
