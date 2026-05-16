@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 backfill-output/
 reduce.db
+.claude/research/
 eval/transcripts/
 eval/eval-observations.db
 eval/reports/
