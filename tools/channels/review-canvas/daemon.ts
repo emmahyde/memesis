@@ -18,7 +18,7 @@ let currentPath = process.env.REVIEW_CANVAS_TRANSCRIPT ?? ''
 
 type Turn = { idx: number; role: 'user' | 'assistant'; ts: string; text: string }
 type Comment = { id: string; turn_idx: number; line_start: number; line_end: number; quote: string; text: string }
-type PendingComment = Comment & { createdAt: number }
+type BridgeEvent = Record<string, unknown>
 
 // ---------------------------------------------------------------------------
 // Transcript loading (verbatim from server.ts)
@@ -67,18 +67,23 @@ const wsClients = new Set<ServerWebSocket<{ route: string }>>()
 let bridgeWs: ServerWebSocket<{ route: string }> | null = null
 
 // ---------------------------------------------------------------------------
-// Pending comments queue
+// Pending bridge-event queue (comments + thread followups)
 // ---------------------------------------------------------------------------
 
-const pendingComments: PendingComment[] = []
+const pendingEvents: { payload: BridgeEvent; createdAt: number }[] = []
 const QUEUE_CAP = 50
 const QUEUE_TTL = 10 * 60 * 1000
 
-function enqueuePending(c: Comment) {
+// Send an event to the MCP bridge; queue it if the bridge is offline.
+function sendToBridge(payload: BridgeEvent) {
+  if (bridgeWs && bridgeWs.readyState === WebSocket.OPEN) {
+    bridgeWs.send(JSON.stringify(payload))
+    return
+  }
   const now = Date.now()
-  while (pendingComments.length > 0 && now - pendingComments[0].createdAt > QUEUE_TTL) pendingComments.shift()
-  if (pendingComments.length >= QUEUE_CAP) pendingComments.shift()
-  pendingComments.push({ ...c, createdAt: now })
+  while (pendingEvents.length > 0 && now - pendingEvents[0].createdAt > QUEUE_TTL) pendingEvents.shift()
+  if (pendingEvents.length >= QUEUE_CAP) pendingEvents.shift()
+  pendingEvents.push({ payload, createdAt: now })
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +260,25 @@ main { max-width: 960px; margin: 0 auto; padding: 1.2em; }
   border-radius: 0 4px 4px 0; white-space: pre-wrap;
 }
 .comment .reply.pending { color: var(--fg-muted); font-style: italic; }
+.comment .reply.from-user {
+  background: var(--comment-bg); border-left-color: var(--comment-border);
+}
+.comment .reply.from-user b { color: var(--comment-border); }
+.comment .followup { margin-top: .5em; }
+.comment .followup.hidden { display: none; }
+.comment .followup textarea {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px;
+  padding: .4em .6em; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--fg); resize: vertical; min-height: 2.4em;
+}
+.comment .followup textarea:focus { outline: 2px solid var(--user); outline-offset: -1px; border-color: var(--user); }
+.comment .followup .row { display: flex; justify-content: flex-end; margin-top: .35em; }
+.comment .followup button {
+  font: inherit; font-size: 12px; padding: .3em .9em;
+  border: 1px solid var(--user); border-radius: 6px;
+  background: var(--user); color: #fff; cursor: pointer; transition: filter .15s;
+}
+.comment .followup button:hover { filter: brightness(1.1); }
 
 /* Markdown syntax */
 .md-heading { color: var(--md-heading); font-weight: 600; }
@@ -578,13 +602,29 @@ document.addEventListener('keydown', e => {
 })
 
 function addCommentEl(c) {
+  if (commentsByLoc[c.id]) return
   const turnEl = document.querySelector('.turn[data-idx="' + c.turn_idx + '"]')
   if (!turnEl) return
   const el = document.createElement('div')
   el.className = 'comment'
   el.dataset.id = c.id
-  el.innerHTML = '<div class="by">L' + c.line_start + '-' + c.line_end + ' · you</div><div class="body"></div><div class="reply pending" data-reply>waiting for reply…</div>'
+  el.innerHTML =
+    '<div class="by">L' + c.line_start + '-' + c.line_end + ' · you</div>' +
+    '<div class="body"></div>' +
+    '<div class="thread" data-thread></div>' +
+    '<div class="followup hidden" data-followup>' +
+      '<textarea placeholder="Reply… (Cmd+Enter to send)"></textarea>' +
+      '<div class="row"><button>reply</button></div>' +
+    '</div>'
   el.querySelector('.body').textContent = c.text
+  setPending(el, true)
+  const fu = el.querySelector('[data-followup]')
+  const ta = fu.querySelector('textarea')
+  const send = () => { sendFollowup(c.id, ta.value); ta.value = '' }
+  fu.querySelector('button').onclick = send
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send() }
+  })
   // Insert after the last selected line; fall back to turn-end
   const anchor = turnEl.querySelector('.line[data-line="' + c.line_end + '"]')
   if (anchor) anchor.insertAdjacentElement('afterend', el)
@@ -592,15 +632,56 @@ function addCommentEl(c) {
   commentsByLoc[c.id] = el
 }
 
+// Toggle the "waiting for reply…" placeholder at the tail of a thread.
+function setPending(el, on) {
+  const thread = el.querySelector('[data-thread]')
+  const existing = thread.querySelector('.reply.pending')
+  if (on && !existing) {
+    const p = document.createElement('div')
+    p.className = 'reply pending'
+    p.textContent = 'waiting for reply…'
+    thread.appendChild(p)
+  } else if (!on && existing) {
+    existing.remove()
+  }
+}
+
+// Append one message bubble to a comment thread.
+function appendMsg(el, role, text) {
+  const thread = el.querySelector('[data-thread]')
+  const m = document.createElement('div')
+  m.className = role === 'user' ? 'reply from-user' : 'reply'
+  m.innerHTML = role === 'user' ? '<b>you:</b> ' : '<b>claude:</b> '
+  const span = document.createElement('span')
+  span.textContent = text
+  m.appendChild(span)
+  thread.appendChild(m)
+}
+
 function applyReply(comment_id, text) {
   const el = commentsByLoc[comment_id]
   if (!el) return
-  const r = el.querySelector('[data-reply]')
-  r.classList.remove('pending')
-  r.innerHTML = '<b>claude:</b> '
-  const span = document.createElement('span')
-  span.textContent = text
-  r.appendChild(span)
+  setPending(el, false)
+  appendMsg(el, 'claude', text)
+  el.querySelector('[data-followup]').classList.remove('hidden')
+}
+
+function applyFollowup(comment_id, text) {
+  const el = commentsByLoc[comment_id]
+  if (!el) return
+  setPending(el, false)
+  appendMsg(el, 'user', text)
+  setPending(el, true)
+}
+
+async function sendFollowup(comment_id, raw) {
+  const text = (raw || '').trim()
+  if (!text) return
+  await fetch('/followup', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ comment_id, text }),
+  })
 }
 
 function connectWS() {
@@ -609,6 +690,7 @@ function connectWS() {
     const m = JSON.parse(e.data)
     if (m.type === 'reload') { turns = m.turns; if (m.path) document.getElementById('path').textContent = m.path; render(); runMermaid(); document.getElementById('meta').textContent = turns.length + ' turns' }
     if (m.type === 'comment') addCommentEl(m)
+    if (m.type === 'followup') applyFollowup(m.comment_id, m.text)
     if (m.type === 'reply') applyReply(m.comment_id, m.text)
   }
   ws.onclose = () => setTimeout(connectWS, 1000)
@@ -671,12 +753,20 @@ const server = Bun.serve<{ route: string }>({
         const id = crypto.randomUUID()
         const c: Comment = { id, ...body }
         broadcastWs({ type: 'comment', ...c })
-        if (bridgeWs && bridgeWs.readyState === WebSocket.OPEN) {
-          bridgeWs.send(JSON.stringify({ type: 'comment', ...c }))
-        } else {
-          enqueuePending(c)
-        }
+        sendToBridge({ type: 'comment', ...c })
         return Response.json({ id })
+      })()
+    }
+
+    // Follow-up message on an existing comment thread — keyed by comment_id,
+    // letting the user continue the conversation after Claude has replied.
+    if (url.pathname === '/followup' && req.method === 'POST') {
+      return (async () => {
+        const { comment_id, text } = await req.json() as { comment_id: string; text: string }
+        if (!comment_id || !text) return new Response('comment_id and text required', { status: 400 })
+        broadcastWs({ type: 'followup', comment_id, text, ts: Date.now() })
+        sendToBridge({ type: 'followup', comment_id, text })
+        return Response.json({ ok: true })
       })()
     }
 
@@ -704,14 +794,12 @@ const server = Bun.serve<{ route: string }>({
         }
         bridgeWs = ws
 
-        // Drain pending comments queue
+        // Drain pending bridge-event queue
         const now = Date.now()
-        const toSend = pendingComments.filter(c => now - c.createdAt <= QUEUE_TTL)
-        for (const c of toSend) {
-          const { createdAt: _, ...comment } = c
-          ws.send(JSON.stringify({ type: 'comment', ...comment }))
+        for (const ev of pendingEvents) {
+          if (now - ev.createdAt <= QUEUE_TTL) ws.send(JSON.stringify(ev.payload))
         }
-        pendingComments.length = 0
+        pendingEvents.length = 0
       }
     },
 
