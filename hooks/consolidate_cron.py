@@ -2,9 +2,10 @@
 """
 Hourly cron — full memory lifecycle outside any Claude Code session.
 
-Scans all project memory directories for ephemeral buffers with observations,
-runs LLM-based consolidation, then runs the full lifecycle: crystallization,
-thread building, relevance maintenance, and periodic self-reflection.
+Scans ~/.claude/memory/ephemeral/<project-slug>/ for ephemeral buffers with
+observations, runs LLM-based consolidation against the single global store,
+then runs the full lifecycle: crystallization, thread building, relevance
+maintenance, and periodic self-reflection.
 
 LLM transport: defaults to the agent-SDK / OAuth path used by interactive
 Claude Code sessions. To opt into Bedrock, set CLAUDE_CODE_USE_BEDROCK=1
@@ -50,19 +51,25 @@ STALENESS_INTERVAL = 20  # Run staleness detection every 20 cron consolidations 
 
 
 def find_ephemeral_buffers() -> list[Path]:
-    """Find all ephemeral session files with actual observations."""
-    projects_dir = Path.home() / ".claude" / "projects"
-    if not projects_dir.exists():
+    """Find all ephemeral session files with actual observations.
+
+    Single global store: buffers stage under
+    `~/.claude/memory/ephemeral/<project-slug>/session-*.md`. The slug
+    sub-directory carries project identity (see process_buffer).
+    """
+    ephemeral_root = Path.home() / ".claude" / "memory" / "ephemeral"
+    if not ephemeral_root.exists():
         return []
 
     buffers = []
-    for memory_dir in projects_dir.glob("*/memory/ephemeral"):
-        project_dir_name = memory_dir.parent.parent.name
-        if not project_dir_name.startswith("-"):
-            logger.warning("Skipping rogue project directory (no leading dash): %s", project_dir_name)
+    for slug_dir in ephemeral_root.iterdir():
+        if not slug_dir.is_dir():
+            continue
+        if not slug_dir.name.startswith("-"):
+            logger.warning("Skipping rogue ephemeral directory (no leading dash): %s", slug_dir.name)
             continue
 
-        for session_file in memory_dir.glob("session-*.md"):
+        for session_file in slug_dir.glob("session-*.md"):
             content = session_file.read_text(encoding="utf-8").strip()
             lines = [l for l in content.splitlines() if l.strip() and not l.startswith("# Session")]
             if lines:
@@ -93,8 +100,13 @@ def _increment_consolidation_count(base_dir: Path) -> int:
 
 
 def process_buffer(ephemeral_path: Path) -> dict | None:
-    """Run full lifecycle on a single ephemeral buffer."""
-    memory_dir = ephemeral_path.parent.parent  # up from ephemeral/ to memory/
+    """Run full lifecycle on a single ephemeral buffer.
+
+    Layout: ~/.claude/memory/ephemeral/<project-slug>/session-*.md
+    The slug sub-directory names the project; it is stamped into the
+    `project` column via init_db(project=...).
+    """
+    project_slug = ephemeral_path.parent.name
     lock_path = ephemeral_path.parent / ".lock"
     date_str = ephemeral_path.stem.replace("session-", "")
     header = f"# Session Observations — {date_str}\n\n"
@@ -116,7 +128,7 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
     snapshot_path.write_text(content, encoding="utf-8")
 
     try:
-        base_dir = init_db(base_dir=str(memory_dir))
+        base_dir = init_db(project=project_slug)
         lifecycle = LifecycleManager()
         consolidator = Consolidator(lifecycle)
         manifest = ManifestGenerator()
@@ -125,8 +137,8 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
 
         session_id = f"cron-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-        # Derive project context from memory_dir path
-        project_context = str(memory_dir.parent)
+        # Project identity is the ephemeral sub-directory slug.
+        project_context = project_slug
 
         # --- Consolidation ---
         obs_in_buffer = sum(
@@ -261,6 +273,26 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
                 summary_parts.append(f"decomposer: {dc_result['split']} split")
         except Exception as e:
             logger.warning("Decomposer sweep error (non-fatal): %s", e)
+
+        # --- Rule sync: auto-activate invariant memories as semantic rules ---
+        try:
+            from core.rules import sync_rules_from_memories
+            rs_result = sync_rules_from_memories()
+            if rs_result["created"] or rs_result["updated"] or rs_result["deactivated"]:
+                summary_parts.append(
+                    f"rule-sync: +{rs_result['created']} ~{rs_result['updated']} -{rs_result['deactivated']}"
+                )
+        except Exception as e:
+            logger.warning("Rule sync error (non-fatal): %s", e)
+
+        # --- Rule proposal (candidate guardrails from memories) ---
+        try:
+            from core.rule_proposal import run_rule_proposal_sweep
+            rp_result = run_rule_proposal_sweep()
+            if rp_result["proposed"]:
+                summary_parts.append(f"rules: {rp_result['proposed']} proposed")
+        except Exception as e:
+            logger.warning("Rule proposal error (non-fatal): %s", e)
 
         # --- Relevance maintenance ---
         relevance = RelevanceEngine()

@@ -240,6 +240,14 @@ def main():
                 except Exception as e:
                     emit_stderr(f"Self-reflection error (non-fatal): {e}")
 
+            # Session digest — topic label for SessionStart grouping plus a
+            # pre-compact summary the post-compact session reads back.
+            try:
+                from core.session_digest import write_session_digest
+                write_session_digest(session_id, usage_text, result.get("kept", []))
+            except Exception as e:
+                emit_stderr(f"Session digest error (non-fatal): {e}")
+
             manifest.write_manifest()
 
             summary = f"Consolidation: {len(result['kept'])} kept, {len(result['pruned'])} pruned"

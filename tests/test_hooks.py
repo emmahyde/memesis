@@ -44,6 +44,33 @@ def base(tmp_path):
     close_db()
 
 
+@pytest.fixture(autouse=True)
+def _stub_precompact_llm(monkeypatch):
+    """Stub the LLM-bearing helpers PreCompact tests run in-process.
+
+    write_session_digest / reconsolidate / reconsolidate_hypotheses all reach
+    core.llm, which falls back to a `claude -p` subprocess. That subprocess
+    inherits the real HOME and spawns memesis hooks against the production
+    store (CLAUDE.md Rule 3). The dedicated suites — test_session_digest.py and
+    test_reconsolidation.py — exercise the real functions in isolation.
+    """
+    monkeypatch.setattr(
+        "core.session_digest.write_session_digest",
+        lambda *a, **k: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "core.reconsolidation.reconsolidate",
+        lambda *a, **k: {"confirmed": [], "contradicted": [], "refined": []},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "core.reconsolidation.reconsolidate_hypotheses",
+        lambda *a, **k: {"confirmed": [], "contradicted": []},
+        raising=False,
+    )
+
+
 def _make_memory(stage, title, content, summary=None, importance=0.5):
     """Create a memory and return its ID."""
     now = datetime.now().isoformat()
@@ -162,7 +189,7 @@ class TestSessionStartMain:
             env_overrides={"HOME": str(tmp_path)},
             cwd=str(tmp_path),
         )
-        assert "MEMORY CONTEXT" in stdout
+        assert "memesis" in stdout and "legend" in stdout  # panel rendered
         assert "Self-Model" in stdout or "Observation Habit" in stdout
 
     def test_session_start_prints_injected_context_with_memories(self, tmp_path, monkeypatch):
@@ -180,8 +207,8 @@ class TestSessionStartMain:
             cwd=str(tmp_path),
         )
         assert code == 0
-        assert "---MEMORY CONTEXT---" in stdout
-        assert "---END MEMORY CONTEXT---" in stdout
+        assert "memesis" in stdout and "legend" in stdout  # panel rendered
+        assert "Conciseness" in stdout
 
     def test_session_start_creates_ephemeral_buffer_on_run(self, tmp_path, monkeypatch):
         """Hook creates ephemeral/session-{date}.md during execution.

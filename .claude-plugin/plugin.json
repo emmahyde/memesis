@@ -41,6 +41,17 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "NLTK_DATA=${CLAUDE_PLUGIN_DATA}/nltk_data ${CLAUDE_PLUGIN_DATA}/venv/bin/python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_guard.py",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }

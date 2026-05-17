@@ -26,6 +26,23 @@ from core.prompts import format_observation
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _stub_dedup_llm(monkeypatch):
+    """Stub the LLM dedup-confirmation gate in core.linking.
+
+    auto_promote_if_dupe calls _llm_confirms_duplicate when cosine similarity
+    falls in the near-miss band [LINK_LLM_REVIEW_FLOOR, LINK_AUTO_PROMOTE_THRESHOLD).
+    The real call reaches core.llm, which uses the agent-SDK subprocess transport
+    and triggers memesis SessionStart hooks against the real store (CLAUDE.md Rule 3).
+    Returning False means "not a duplicate" — a safe no-op for all consolidator tests.
+    """
+    monkeypatch.setattr(
+        "core.linking._llm_confirms_duplicate",
+        lambda *a, **k: False,
+        raising=False,
+    )
+
+
 @pytest.fixture
 def base(tmp_path):
     """Initialize DB in a throwaway temp directory."""

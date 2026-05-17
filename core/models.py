@@ -767,3 +767,69 @@ class MemoryEmbedding(BaseModel):
 
     class Meta:
         table_name = "memory_embeddings"
+
+
+# ---------------------------------------------------------------------------
+# Rule
+# ---------------------------------------------------------------------------
+
+
+class Rule(BaseModel):
+    """An enforced behavioural guardrail — distinct from a Memory.
+
+    A rule is born from a memory (LLM-proposed) or authored directly by the
+    user. Unlike memories it has no stage progression and no decay: it carries
+    a machine-checkable predicate (``check_kind`` + ``check_arg``) that the
+    PreToolUse guard evaluates against every tool call, soft-blocking
+    violations.
+
+    check_kind values:
+      forbid_bash_pattern — check_arg is a regex matched against Bash commands
+      forbid_path_edit    — check_arg is a glob matched against Edit/Write paths
+      require_absent      — check_arg is a regex that must not appear in input
+      semantic            — check_arg is a natural-language rule, LLM-judged
+
+    severity: ``block`` (deny the call), ``ask`` (defer to the user), ``warn``
+    (surface only). status: ``proposed`` (inert), ``active`` (enforced),
+    ``disabled``. scope: NULL = global, else a project slug or path glob.
+    """
+
+    id = TextField(primary_key=True, default=lambda: uuid.uuid4().hex)
+    text = TextField()
+    check_kind = TextField()
+    check_arg = TextField(null=True)
+    severity = TextField(default="block")
+    status = TextField(default="proposed", index=True)
+    scope = TextField(null=True)
+    source_memory_id = TextField(null=True)
+    violation_count = IntegerField(default=0)
+    commit_ref = TextField(null=True)
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+    updated_at = TextField(default=lambda: datetime.now().isoformat())
+
+    class Meta:
+        table_name = "rules"
+
+
+# ---------------------------------------------------------------------------
+# SessionDigest
+# ---------------------------------------------------------------------------
+
+
+class SessionDigest(BaseModel):
+    """A short topic label + summary for one session, written at PreCompact.
+
+    Two consumers: the SessionStart panel groups memories per session using
+    ``topic``, and the post-compact session reads ``summary`` to recover what
+    the pre-compact session was doing. ``memory_ids`` is a JSON array of the
+    memories consolidated from that session.
+    """
+
+    session_id = TextField(primary_key=True)
+    topic = TextField()
+    summary = TextField(null=True)
+    memory_ids = TextField(null=True)
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+
+    class Meta:
+        table_name = "session_digest"

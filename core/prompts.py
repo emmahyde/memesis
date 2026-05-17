@@ -868,3 +868,91 @@ Return ONLY valid JSON, no prose outside it:
 children is [] when the verdict is COHERENT. When SPLIT, children has at least
 two entries.
 """
+
+
+RULE_SEMANTIC_JUDGE_PROMPT = """\
+You are a guardrail judge. A behavioural RULE is in force. Decide whether the
+TOOL CALL the agent is about to make violates it.
+
+## Rule
+{rule}
+
+## Proposed tool call
+Tool: {tool_name}
+Input: {tool_input}
+
+Judge ONLY whether this specific call violates the rule. A call that is merely
+adjacent to the rule's topic, or that the rule does not actually forbid, is OK.
+Be precise — a false VIOLATION blocks legitimate work.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "verdict": "VIOLATION" or "OK",
+  "confidence": <0.0-1.0>,
+  "reason": "<one sentence — why it does or does not violate the rule>"
+}}
+"""
+
+
+RULE_PROPOSAL_PROMPT = """\
+You are deciding whether one stored memory encodes an enforceable behavioural
+RULE — a guardrail the agent must obey on every future tool call, not just a
+fact worth remembering.
+
+## Memory under review
+Kind: {kind}
+Title: {title}
+Content:
+{content}
+
+A memory is a RULE only when it prescribes or forbids a concrete action ("never
+edit the lockfile by hand", "always run tests before committing"). A memory
+that merely records a fact, a decision, or a preference is NOT a rule.
+
+If it IS a rule, express a machine-checkable predicate. Pick the narrowest
+check_kind that fits:
+  forbid_bash_pattern — check_arg is a regex matched against Bash commands
+  forbid_path_edit    — check_arg is a glob matched against edited file paths
+  require_absent      — check_arg is a regex that must not appear in tool input
+  semantic            — fuzzy rule with no clean pattern; check_arg is the rule
+                        text itself, judged by an LLM at enforcement time
+
+Be conservative — a false rule blocks legitimate work. When unsure, is_rule
+is false.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "is_rule": true or false,
+  "text": "<imperative one-line rule statement>",
+  "check_kind": "forbid_bash_pattern|forbid_path_edit|require_absent|semantic",
+  "check_arg": "<regex, glob, or rule text>",
+  "severity": "block|ask|warn",
+  "rationale": "<one sentence>"
+}}
+
+When is_rule is false, the other fields may be empty.
+"""
+
+
+SESSION_DIGEST_PROMPT = """\
+Summarise one work session for a memory index.
+
+## Session observations
+{content}
+
+Produce:
+- topic: a short noun phrase naming what the session was about — at most 8
+  words, no trailing punctuation. It labels a group of memories, so make it
+  specific ("Rules engine and PreToolUse enforcement", not "Coding work").
+- summary: 2-4 sentences a future session can read to recover where this one
+  left off — what was done, what is in progress, what is unresolved.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "topic": "<short noun phrase>",
+  "summary": "<2-4 sentences>"
+}}
+"""
