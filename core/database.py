@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _vec_store = None
 _db_path: Optional[Path] = None
 _base_dir: Optional[Path] = None
+_project: Optional[str] = None
 
 ALL_TABLES = [
     Memory,
@@ -73,6 +74,7 @@ def _resolve_db_path(project_context: str = None, base_dir: str = None) -> tuple
 def init_db(
     project_context: str = None,
     base_dir: str = None,
+    project: str = None,
 ) -> Path:
     """
     Initialise (or re-initialise) the Peewee database.
@@ -85,14 +87,31 @@ def init_db(
     - Runs schema migrations
     - Initialises the VecStore singleton
 
+    `project` records the project identity (a Claude Code directory slug)
+    written into the `project` column of new memories/observations — see
+    get_project(). It does not affect the database path. When omitted it is
+    derived: from project_context (slugified) if given, else from base_dir
+    when base_dir points at a `.../<slug>/memory` directory.
+
     Returns:
         The resolved base_dir Path.
     """
-    global _vec_store, _db_path, _base_dir
+    global _vec_store, _db_path, _base_dir, _project
 
     bd, dp = _resolve_db_path(project_context=project_context, base_dir=base_dir)
     _base_dir = bd
     _db_path = dp
+
+    if project:
+        _project = project
+    elif project_context:
+        _project = project_slug(project_context)
+    elif base_dir and bd.name == "memory":
+        # Production callers pass base_dir=.../<slug>/memory; the slug is the
+        # project identity (see consolidate_cron.py, scripts/ingest_one.py).
+        _project = bd.parent.name
+    else:
+        _project = None
 
     # Ensure base directory exists
     bd.mkdir(parents=True, exist_ok=True)
@@ -170,6 +189,28 @@ def get_db_path() -> Optional[Path]:
 def get_base_dir() -> Optional[Path]:
     """Return the base directory (parent of index.db)."""
     return _base_dir
+
+
+def get_project() -> Optional[str]:
+    """Return the project identity for the active database connection.
+
+    This is the value stamped into the `project` column of new memories and
+    observations, used to scope retrieval. None when init_db() could not
+    determine a project (e.g. an anonymous test base_dir).
+    """
+    return _project
+
+
+def project_slug(project_context: Optional[str]) -> Optional[str]:
+    """Slugify a project path to the canonical `project` column key.
+
+    Retrieval callers pass a filesystem path (os.getcwd()); the write path
+    derives the same slug from the memory directory name. Both must run
+    through this function so reads and writes agree on one key.
+    """
+    if not project_context:
+        return None
+    return re.sub(r"[^a-zA-Z0-9-]", "-", project_context)
 
 
 def close_db():

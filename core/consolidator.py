@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .compression import compress_memory_for_stage, compression_ratio, get_stage_depth
 
-from .database import db, get_base_dir
+from .database import db, get_base_dir, get_project
 from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
 from .linking import link_memory as _link_memory, auto_promote_if_dupe
@@ -400,6 +400,7 @@ class Consolidator:
                     filtered_content=content,
                     content_hash=content_hash,
                     status="pending",
+                    project=get_project(),
                     metadata=json.dumps({"source": "consolidator"}),
                 )
                 refs.append({
@@ -948,6 +949,7 @@ class Consolidator:
                 updated_at=now,
                 source_session=session_id,
                 content_hash=content_hash,
+                project=get_project(),
                 temporal_scope=card_fields["temporal_scope"],
                 confidence=card_fields["confidence"],
                 # D3: "neutral" default for card-derived; non-card NULL unless somatic detected non-neutral signal

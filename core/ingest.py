@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .database import get_base_dir
+from .database import get_base_dir, get_project
 from .models import Memory, Observation
 
 logger = logging.getLogger(__name__)
@@ -259,6 +259,7 @@ class NativeMemoryIngestor:
                     filtered_content=content,
                     content_hash=content_hash,
                     status="ingested",
+                    project=get_project(),
                     metadata=json.dumps({
                         "source": "native-claude-code",
                         "native_type": native_type,
@@ -275,6 +276,7 @@ class NativeMemoryIngestor:
                     created_at=now,
                     updated_at=now,
                     content_hash=content_hash,
+                    project=get_project(),
                     # W5 schema fields — populate from native frontmatter
                     kind=NATIVE_KIND_MAP.get(native_type),
                     knowledge_type=NATIVE_KNOWLEDGE_TYPE_MAP.get(native_type),

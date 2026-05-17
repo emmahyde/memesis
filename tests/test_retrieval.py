@@ -60,7 +60,13 @@ def _make_memory(content, stage, title, summary=None, importance=0.5,
     )
 
     if project_context is not None:
-        Memory.update(project_context=project_context).where(Memory.id == mem.id).execute()
+        # Project scoping reads the `project` column (a slug); project_context
+        # is a path. Stamp both so tests exercise the real comparison path.
+        from core.database import project_slug
+        Memory.update(
+            project_context=project_context,
+            project=project_slug(project_context),
+        ).where(Memory.id == mem.id).execute()
 
     return mem.id
 

@@ -21,7 +21,7 @@ from peewee import fn
 
 import json
 
-from .database import get_base_dir, get_vec_store
+from .database import get_base_dir, get_vec_store, project_slug
 from .flags import get_flag
 from .models import (
     Memory,
@@ -443,7 +443,7 @@ class RetrievalEngine:
                 "stage": memory.stage,
                 "tags": memory.tag_list,
                 "rank": rrf_score,
-                "project_context": memory.project_context,
+                "project_context": memory.project,
             })
 
         # RISK-11: compute per-module contribution scores and attach to each result
@@ -960,14 +960,14 @@ class RetrievalEngine:
             key=lambda m: m.importance or 0.0,
             reverse=True,
         )
+        # Prefer same-project memories. `project` holds a slug; project_context
+        # is a path — slugify before comparing so this agrees with the write path.
+        _project_key = project_slug(project_context)
         records_sorted = sorted(
             records_sorted,
             key=lambda m: (
                 0
-                if (
-                    project_context is not None
-                    and m.project_context == project_context
-                )
+                if (_project_key is not None and m.project == _project_key)
                 else 1
             ),
         )
@@ -1184,7 +1184,7 @@ class RetrievalEngine:
             boost = 0.0
             if memory.stage == "crystallized":
                 boost += CRYSTAL_BOOST
-            if project_context is not None and memory.project_context == project_context:
+            if project_context is not None and memory.project == project_slug(project_context):
                 boost += PROJECT_BOOST
             if getattr(memory, "affect_valence", None) == "friction":
                 boost += AFFECT_FRICTION_BOOST
