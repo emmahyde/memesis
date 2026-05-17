@@ -26,11 +26,12 @@ from core.database import close_db, init_db
 from core.lifecycle import LifecycleManager
 from core.models import Memory
 from core.session_detector import detect_session_type
-from core.transcript import extract_tool_uses, read_transcript_from, summarize
+from core.transcript import extract_tool_uses, read_transcript_from
 from core.transcript_ingest import (
     append_to_ephemeral,
-    extract_observations,
-    project_memory_dir,
+    extract_observations_hierarchical,
+    global_memory_dir,
+    transcript_project_slug,
 )
 
 logging.basicConfig(
@@ -51,9 +52,12 @@ def ingest(jsonl_path: Path) -> None:
     if not jsonl_path.exists():
         sys.exit(f"transcript not found: {jsonl_path}")
 
-    mem_dir = project_memory_dir(jsonl_path)
-    # Use base_dir directly — project_context would re-slug and write elsewhere.
-    init_db(base_dir=str(mem_dir))
+    # Single global store: one index.db at ~/.claude/memory. Project identity
+    # is recorded in the `project` column via init_db(project=<slug>); the
+    # ephemeral buffer stages under <global>/ephemeral/<slug>/.
+    project_slug = transcript_project_slug(jsonl_path)
+    mem_dir = global_memory_dir()
+    init_db(project=project_slug)
 
     before = _stage_counts()
     logger.info("Stage counts before: %s", before)
@@ -65,8 +69,6 @@ def ingest(jsonl_path: Path) -> None:
         close_db()
         return
 
-    rendered = summarize(entries)
-
     # cwd: returned directly by read_transcript_from (raw file scan).
     # tool_uses: entries are {role,text} — scan raw JSONL for tool_use blocks.
     session_cwd = transcript_cwd
@@ -76,19 +78,37 @@ def ingest(jsonl_path: Path) -> None:
     logger.info("Session type: %s | %d entries | %d tool_uses",
                 session_type, len(entries), len(tool_uses))
 
-    obs_list = extract_observations(rendered, session_type=session_type)
+    # Windowed (map-reduce) extraction. A single flat extract_observations()
+    # call on a whole transcript under-extracts badly — the model self-limits
+    # its JSON array regardless of input size. Hierarchical extraction maps
+    # over overlapping windows so coverage scales with session length.
+    # ingest_one ingests the FULL session, so size max_windows to cover it.
+    total_chars = sum(len(e.get("text", "")) for e in entries)
+    n_windows = max(10, total_chars // 12800 + 2)  # 12800 = default stride
+    result = extract_observations_hierarchical(
+        entries,
+        session_type=session_type,
+        max_windows=n_windows,
+        cwd=session_cwd,
+    )
+    obs_list = result["observations"]
+    logger.info(
+        "Hierarchical extraction: %d window(s), raw=%d → %d deduped observation(s)",
+        result["windows"], result.get("raw_count", 0), len(obs_list),
+    )
     for obs in obs_list:
         obs.setdefault("session_type", session_type)
     # Clear today's ephemeral so re-runs of the same transcript don't duplicate.
-    eph_clear = mem_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
-    if eph_clear.exists():
-        eph_clear.unlink()
-    n_appended = append_to_ephemeral(mem_dir, obs_list, dry_run=False)
+    eph_path = mem_dir / "ephemeral" / project_slug / f"session-{date.today().isoformat()}.md"
+    if eph_path.exists():
+        eph_path.unlink()
+    n_appended = append_to_ephemeral(
+        mem_dir, obs_list, dry_run=False, project_slug=project_slug
+    )
     logger.info("Extracted %d observations, appended %d to ephemeral",
                 len(obs_list), n_appended)
 
     # Consolidate today's ephemeral file.
-    eph_path = mem_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
     lifecycle = LifecycleManager()
     if not eph_path.exists():
         logger.warning("No ephemeral file at %s — nothing to consolidate", eph_path)

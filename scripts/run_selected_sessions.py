@@ -23,7 +23,8 @@ from core.transcript_ingest import (  # noqa: E402
     extract_observations,
     extract_observations_hierarchical,
     append_to_ephemeral,
-    project_memory_dir,
+    global_memory_dir,
+    transcript_project_slug,
 )
 from core.rule_registry import resolve_overrides_from_root  # noqa: E402
 from core.session_detector import detect_session_type  # noqa: E402
@@ -205,8 +206,11 @@ def main() -> None:
 
             for obs in obs_list:
                 obs.setdefault("session_type", session_type)
-            mem_dir = project_memory_dir(path)
-            n = append_to_ephemeral(mem_dir, obs_list, dry_run=False)
+            project_slug = transcript_project_slug(path)
+            n = append_to_ephemeral(
+                global_memory_dir(), obs_list, dry_run=False,
+                project_slug=project_slug,
+            )
             store.upsert(session_id, str(path), new_offset, cwd=cwd)
             entry_record["appended"] = n
             entry_record["observations"] = obs_list

@@ -28,7 +28,11 @@ from core.models import Memory
 from core.prompts import format_extract_prompt
 from core.session_detector import detect_session_type
 from core.transcript import read_transcript_from, summarize
-from core.transcript_ingest import append_to_ephemeral, project_memory_dir
+from core.transcript_ingest import (
+    append_to_ephemeral,
+    global_memory_dir,
+    transcript_project_slug,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,8 +131,12 @@ def main() -> None:
 
     logger.info("Found %d transcripts in last %d days", len(transcripts), args.days)
 
-    mem_dir = project_memory_dir(transcripts[0])
-    init_db(base_dir=str(mem_dir))
+    # Single global store; project recorded in the `project` column. All
+    # transcripts in a reprocess run share one project dir, so the slug of
+    # the first applies to the batch.
+    project_slug = transcript_project_slug(transcripts[0])
+    mem_dir = global_memory_dir()
+    init_db(project=project_slug)
 
     # Phase 1: prep (cheap, sequential — reads jsonl files)
     t0 = time.time()
@@ -160,10 +168,12 @@ def main() -> None:
             continue
         totals["extracted"] += len(obs_list)
         try:
-            eph_path = mem_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
+            eph_path = mem_dir / "ephemeral" / project_slug / f"session-{date.today().isoformat()}.md"
             if eph_path.exists():
                 eph_path.unlink()
-            totals["appended"] += append_to_ephemeral(mem_dir, obs_list, dry_run=False)
+            totals["appended"] += append_to_ephemeral(
+                mem_dir, obs_list, dry_run=False, project_slug=project_slug
+            )
             if not eph_path.exists():
                 continue
             result = consolidator.consolidate_session(str(eph_path), session_id=jsonl.stem)

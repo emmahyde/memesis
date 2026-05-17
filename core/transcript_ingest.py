@@ -165,9 +165,29 @@ def discover_transcripts(max_age_hours: int = 60 * 24) -> list[Path]:
     return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def project_memory_dir(jsonl_path: Path) -> Path:
-    """Return the memory dir for the project containing jsonl_path."""
-    return jsonl_path.parent / "memory"
+# memesis uses ONE global store. Per-project `index.db` files are gone:
+# project identity lives in the `project` column. Ephemeral buffers stage
+# under <global>/ephemeral/<slug>/ so the consolidator can still recover the
+# originating project for each buffer.
+
+
+def global_memory_dir() -> Path:
+    """The single global memory store, ~/.claude/memory.
+
+    Resolved at call time (not import) so tests can redirect HOME — mirrors
+    core.database._resolve_db_path.
+    """
+    return Path.home() / ".claude" / "memory"
+
+
+def transcript_project_slug(jsonl_path: Path) -> str:
+    """Return the Claude Code project slug for a transcript.
+
+    The slug is the `~/.claude/projects/<slug>/` directory name (e.g.
+    `-Users-emmahyde-projects-memesis`); it is stamped into the `project`
+    column and used to scope the ephemeral staging sub-directory.
+    """
+    return jsonl_path.parent.name
 
 
 def _write_ingest_trace(outcome: str, reason: str, raw_excerpt: str) -> None:
@@ -839,7 +859,7 @@ def extract_observations_hierarchical(
                     })
             active_prompts = [prompts[i] for i in active_indices]
             active_responses = call_llm_batch(
-                active_prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+                active_prompts, max_concurrency=5, max_tokens=overrides.max_tokens_stage1,
                 system_prompt_file="extraction",
             )
             # Reassemble full-length response list with empty strings for skipped windows
@@ -848,7 +868,7 @@ def extract_observations_hierarchical(
                 raw_responses[dst_i] = active_responses[src_i]
         else:
             raw_responses = call_llm_batch(
-                prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+                prompts, max_concurrency=5, max_tokens=overrides.max_tokens_stage1,
                 system_prompt_file="extraction",
             )
 
@@ -1125,12 +1145,21 @@ def append_to_ephemeral(
     memory_dir: Path,
     observations: list[dict],
     dry_run: bool = False,
+    project_slug: str | None = None,
 ) -> int:
-    """Append formatted observations to today's ephemeral session buffer."""
+    """Append formatted observations to today's ephemeral session buffer.
+
+    When `project_slug` is given the buffer is staged under
+    `<memory_dir>/ephemeral/<project_slug>/` so the consolidator can recover
+    the originating project. Without it the legacy flat path is used (tests).
+    """
     if not observations:
         return 0
 
-    target = memory_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
+    eph_dir = memory_dir / "ephemeral"
+    if project_slug:
+        eph_dir = eph_dir / project_slug
+    target = eph_dir / f"session-{date.today().isoformat()}.md"
     lines = []
     for obs in observations:
         # W5 lean schema: facts[] is the canonical field. obs["content"] is
@@ -1241,8 +1270,11 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
             # Attach session_type to each observation for downstream validators
             for obs in obs_list:
                 obs.setdefault("session_type", session_type)
-            mem_dir = project_memory_dir(path)
-            n = append_to_ephemeral(mem_dir, obs_list, dry_run=dry_run)
+            project_slug = transcript_project_slug(path)
+            n = append_to_ephemeral(
+                global_memory_dir(), obs_list, dry_run=dry_run,
+                project_slug=project_slug,
+            )
 
             if not dry_run:
                 store.upsert(session_id, str(path), new_offset, cwd=session_cwd)

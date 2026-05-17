@@ -31,8 +31,8 @@ def _vec(emb_bytes: bytes) -> list[float]:
 
 
 def main(dry_run: bool = False) -> None:
-    mem_dir = Path.home() / ".claude/projects/-Users-emmahyde-projects-memesis/memory"
-    init_db(base_dir=str(mem_dir))
+    # Single global store at ~/.claude/memory.
+    init_db()
 
     mems = list(
         Memory.select().where(

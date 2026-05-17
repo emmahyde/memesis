@@ -3,6 +3,8 @@ from pathlib import Path
 from datetime import date
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.cursors import CursorStore
@@ -17,7 +19,20 @@ from core.transcript_ingest import (  # type: ignore[import]
     _refine_observations,
     discover_transcripts,
     append_to_ephemeral,
+    global_memory_dir,
 )
+
+
+@pytest.fixture(autouse=True)
+def _home_in_tmp(tmp_path, monkeypatch):
+    """Redirect HOME into tmp_path.
+
+    tick() / append_to_ephemeral resolve the global store via
+    transcript_ingest.global_memory_dir() -> ~/.claude/memory. Without this
+    redirect, tests would stage ephemeral buffers in the real user store
+    (CLAUDE.md Rule 3).
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def test_new_session_seeds_cursor_at_eof(tmp_path):
@@ -60,7 +75,12 @@ def test_known_session_with_delta_extracts_observations(tmp_path):
     assert results["processed"] == 1
     assert results["observations_total"] == 1
 
-    buffer = tmp_path / "projects" / "proj-hash" / "memory" / "ephemeral" / f"session-{date.today().isoformat()}.md"
+    # Single global store: buffer stages under
+    # ~/.claude/memory/ephemeral/<project-slug>/ (slug = projects/<slug> dir).
+    buffer = (
+        global_memory_dir() / "ephemeral" / "proj-hash"
+        / f"session-{date.today().isoformat()}.md"
+    )
     assert buffer.exists()
     assert "Auth uses JWT" in buffer.read_text()
 
