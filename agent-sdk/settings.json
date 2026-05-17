@@ -1,0 +1,17 @@
+{
+  "enabledPlugins": {
+    "memesis@memesis-local": true,
+    "pyright-lsp@claude-plugins-official": true
+  },
+  "extraKnownMarketplaces": {
+    "memesis-local": {
+      "source": {
+        "source": "directory",
+        "path": "/Users/emmahyde/projects/memesis"
+      }
+    }
+  },
+  "effortLevel": "high",
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark"
+}
