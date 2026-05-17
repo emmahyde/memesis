@@ -1,0 +1,8 @@
+# Opt-in clean-room Claude Code config. Activate with:  MISE_ENV=cleanroom
+#
+# Points CLAUDE_CONFIG_DIR at agent-sdk/, so a `claude` session loads only the
+# memesis plugin — none of the user-level ~/.claude plugins, hooks, or skills.
+# Use this when developing/testing the memesis plugin in isolation.
+# See agent-sdk/settings.json for the clean-room's own settings.
+[env]
+CLAUDE_CONFIG_DIR = "{{config_root}}/agent-sdk"
