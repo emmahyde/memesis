@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Optional
 
 from .codebook import encode_field_value, is_codebook_enabled
-from .database import get_base_dir, get_vec_store
+from .database import get_base_dir, get_project, get_vec_store
 from .flags import get_flag
 from .lifecycle import LifecycleManager
 from .llm import call_llm
@@ -401,6 +401,7 @@ class Crystallizer:
             created_at=now,
             updated_at=now,
             content_hash=content_hash,
+            project=get_project(),
             # Defensive nulls — crystallizer is a non-card write path (D3)
             temporal_scope=None,
             confidence=None,

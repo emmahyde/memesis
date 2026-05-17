@@ -14,7 +14,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from .database import get_base_dir
+from .database import get_base_dir, get_project
 from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, db
 from .prompts import SELF_REFLECTION_PROMPT
@@ -407,6 +407,7 @@ class SelfReflector:
             reinforcement_count=0,
             created_at=now,
             updated_at=now,
+            project=get_project(),
             # Hypothesis schema fields (RISK-12)
             kind="hypothesis",
             evidence_count=1,
@@ -516,6 +517,7 @@ class SelfReflector:
             created_at=now,
             updated_at=now,
             content_hash=content_hash,
+            project=get_project(),
             # W5 schema fields — parsed from tag conventions used by seeders
             kind=kind_tag,
             knowledge_type=kt_tag,
