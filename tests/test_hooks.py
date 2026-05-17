@@ -165,15 +165,18 @@ class TestSessionStartMain:
         assert "MEMORY CONTEXT" in stdout
         assert "Self-Model" in stdout or "Observation Habit" in stdout
 
-    def test_session_start_prints_injected_context_with_memories(self, tmp_path):
+    def test_session_start_prints_injected_context_with_memories(self, tmp_path, monkeypatch):
         """Hook outputs memory context block when memories exist."""
+        # HOME → tmp_path: post single-global-DB, project_context no longer
+        # path-scopes the store, so isolation must come from HOME (Rule 3).
+        monkeypatch.setenv("HOME", str(tmp_path))
         # Pre-populate via init_db + create
         init_db(project_context=str(tmp_path))
         _make_memory("instinctive", "Conciseness", "Always be concise")
         close_db()
 
         stdout, code = _run_hook(
-            env_overrides={"HOME": str(Path.home()), "CLAUDE_SESSION_ID": "test-session"},
+            env_overrides={"HOME": str(tmp_path), "CLAUDE_SESSION_ID": "test-session"},
             cwd=str(tmp_path),
         )
         assert code == 0
@@ -221,8 +224,9 @@ class TestSessionStartMain:
         )
         assert code == 0
 
-    def test_session_start_session_id_env_var_used(self, tmp_path):
+    def test_session_start_session_id_env_var_used(self, tmp_path, monkeypatch):
         """CLAUDE_SESSION_ID is read from the environment."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         session_id = "my-custom-session-42"
         init_db(project_context=str(tmp_path))
         _make_memory("instinctive", "Guideline", "Guideline content")
@@ -230,7 +234,7 @@ class TestSessionStartMain:
 
         _run_hook(
             env_overrides={
-                "HOME": str(Path.home()),
+                "HOME": str(tmp_path),
                 "CLAUDE_SESSION_ID": session_id,
             },
             cwd=str(tmp_path),
@@ -243,14 +247,15 @@ class TestSessionStartMain:
         close_db()
         assert session_id in logged_sessions
 
-    def test_session_start_session_id_defaults_to_unknown(self, tmp_path):
+    def test_session_start_session_id_defaults_to_unknown(self, tmp_path, monkeypatch):
         """When CLAUDE_SESSION_ID is absent, session_id defaults to 'unknown'."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         init_db(project_context=str(tmp_path))
         _make_memory("instinctive", "Default Session", "Guideline content")
         close_db()
 
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_SESSION_ID"}
-        env["HOME"] = str(Path.home())
+        env["HOME"] = str(tmp_path)
         subprocess.run(
             [sys.executable, HOOK_PATH],
             capture_output=True,

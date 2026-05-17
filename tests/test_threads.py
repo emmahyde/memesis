@@ -418,7 +418,7 @@ class TestThreadNarrator:
         result = narrator.narrate_cluster(cluster)
         assert result is None
 
-    @patch("core.llm.call_llm", side_effect=Exception("LLM down"))
+    @patch("core.threads.call_llm", side_effect=Exception("LLM down"))
     def test_llm_failure_returns_none(self, mock_llm, base):
         cluster = self._make_cluster()
 
