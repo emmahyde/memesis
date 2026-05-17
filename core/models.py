@@ -141,6 +141,9 @@ class Memory(BaseModel):
     # Cluster anchoring: named cluster slug; retrieval expands 1-hop to siblings
     cluster = TextField(null=True, index=True)  # see core/graph.py:expand_clusters
 
+    # Bundled-row decomposer: 1 once the decomposer sweep has audited this row
+    decompose_checked = IntegerField(default=0, null=True)  # see core/decomposer.py
+
     class Meta:
         table_name = "memories"
 

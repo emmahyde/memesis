@@ -798,3 +798,45 @@ other does not.
 
 Respond with ONLY one word: DUPLICATE or DISTINCT.
 """
+
+
+# ---------------------------------------------------------------------------
+# Bundled-row decomposition prompt
+# ---------------------------------------------------------------------------
+
+MEMORY_DECOMPOSITION_PROMPT = """\
+You are auditing one stored memory for the bundled-row problem: a memory that
+packs multiple unrelated atoms (for example, an API-key fact buried inside notes
+about user friction). Bundled memories retrieve poorly — each atom dilutes the
+others.
+
+## Memory under audit
+Title: {title}
+Content:
+{content}
+
+A memory is COHERENT when every sentence serves one subject — one fact, one
+decision, one pattern. SPLIT it only when its sentences cluster into two or more
+genuinely unrelated topics, each of which would stand alone as its own memory.
+
+Be conservative. A memory carrying one subject plus its rationale, evidence, or
+implications is COHERENT — do not fragment it. Only split clearly unrelated
+atoms.
+
+If you SPLIT, produce one child per distinct topic. Each child must be
+self-contained: a reader seeing only that child understands it in full.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "verdict": "COHERENT" or "SPLIT",
+  "children": [
+    {{"title": "<short title>", "content": "<self-contained body>",
+      "memory_kind": "decision|lesson|gotcha|goal|invariant|opinion|bias|todo|debt|fact"}}
+  ],
+  "rationale": "<one sentence>"
+}}
+
+children is [] when the verdict is COHERENT. When SPLIT, children has at least
+two entries.
+"""

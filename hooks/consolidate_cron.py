@@ -253,6 +253,15 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         except Exception as e:
             logger.warning("Verifier sweep error (non-fatal): %s", e)
 
+        # --- Bundled-row decomposer ---
+        try:
+            from core.decomposer import run_decomposer_sweep
+            dc_result = run_decomposer_sweep()
+            if dc_result["split"]:
+                summary_parts.append(f"decomposer: {dc_result['split']} split")
+        except Exception as e:
+            logger.warning("Decomposer sweep error (non-fatal): %s", e)
+
         # --- Relevance maintenance ---
         relevance = RelevanceEngine()
         maint = relevance.run_maintenance(project_context)
