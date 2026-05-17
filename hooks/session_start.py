@@ -13,7 +13,7 @@ from pathlib import Path
 # Allow running from any directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hooks._safe import emit_stderr, emit_stdout
+from hooks._safe import emit_context, emit_stderr, emit_stdout
 from hooks._render import build_role_line, render_index
 
 from core.database import get_project, init_db
@@ -121,7 +121,9 @@ def main():
             emit_stderr(f"Panel render error (non-fatal): {e}")
         create_ephemeral_buffer(base_dir)
 
-        emit_stdout(injected)
+        # Surface the panel to both the user and the model. Plain stdout
+        # reaches the model only; emit_context adds the user-visible copy.
+        emit_context(injected, "SessionStart")
     except Exception:
         # Never crash the session
         emit_stdout("")

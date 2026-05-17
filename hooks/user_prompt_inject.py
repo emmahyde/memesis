@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hooks._safe import emit_stderr, emit_stdout
+from hooks._safe import emit_context, emit_stderr, emit_stdout
 
 from core.affect import coherence_probe, load_analyzer, save_analyzer, format_guidance
 from core.database import get_base_dir, get_vec_store, init_db
@@ -342,7 +342,8 @@ def main():
             except Exception:
                 pass  # affect tracking is best-effort
 
-        emit_stdout(result)
+        # Surface JIT injections to both the user and the model.
+        emit_context(result, "UserPromptSubmit")
 
     except Exception as exc:
         # Never crash the user's prompt
