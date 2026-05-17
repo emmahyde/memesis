@@ -133,6 +133,10 @@ class Memory(BaseModel):
     evidence_count = IntegerField(default=0, null=True)          # number of sessions that observed this hypothesis
     evidence_session_ids = TextField(default='[]', null=True)    # JSON array of session IDs that contributed evidence
 
+    # Verifier sweep: declarative staleness predicate (see core/verifier.py)
+    verify_kind = TextField(null=True)   # grep_present | grep_absent | file_exists | test_passes
+    verify_arg = TextField(null=True)    # predicate argument: regex, repo-relative path, or pytest node id
+
     class Meta:
         table_name = "memories"
 

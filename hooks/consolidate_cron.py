@@ -244,6 +244,15 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         except Exception as e:
             logger.warning("Contradiction resolution error (non-fatal): %s", e)
 
+        # --- Verifier sweep (auto-archive stale memories) ---
+        try:
+            from core.verifier import run_verifier_sweep
+            vr_result = run_verifier_sweep(project_context)
+            if vr_result["archived"]:
+                summary_parts.append(f"verifier: {vr_result['archived']} archived")
+        except Exception as e:
+            logger.warning("Verifier sweep error (non-fatal): %s", e)
+
         # --- Relevance maintenance ---
         relevance = RelevanceEngine()
         maint = relevance.run_maintenance(project_context)
