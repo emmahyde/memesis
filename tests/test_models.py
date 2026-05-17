@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.database import init_db, close_db, get_db_path, get_vec_store
+from core.database import init_db, close_db, get_db_path, get_vec_store, get_project
 from core.models import Memory, ConsolidationLog, RetrievalLog, db
 
 
@@ -80,12 +80,16 @@ class TestDatabaseInit:
             close_db()
 
     def test_project_context(self, tmp_path, monkeypatch):
-        """Test project-specific storage."""
+        """project_context sets the project identity, not the DB path.
+
+        memesis uses one global database; project_context no longer routes
+        the path — it is recorded per-row in the `project` column.
+        """
         monkeypatch.setenv('HOME', str(tmp_path))
         base_dir = init_db(project_context='/Users/test/my-project')
         try:
-            expected = tmp_path / '.claude' / 'projects' / '-Users-test-my-project' / 'memory'
-            assert base_dir == expected
+            assert base_dir == tmp_path / '.claude' / 'memory'
+            assert get_project() == '-Users-test-my-project'
         finally:
             close_db()
 
@@ -521,11 +525,11 @@ class TestProjectContext:
     """Test project-specific storage."""
 
     def test_project_path_hashing(self, tmp_path, monkeypatch):
+        """project_context is slugified into the `project` identity."""
         monkeypatch.setenv('HOME', str(tmp_path))
-        base_dir = init_db(project_context='/Users/test/my-project')
+        init_db(project_context='/Users/test/my-project')
         try:
-            expected = tmp_path / '.claude' / 'projects' / '-Users-test-my-project' / 'memory'
-            assert base_dir == expected
+            assert get_project() == '-Users-test-my-project'
         finally:
             close_db()
 

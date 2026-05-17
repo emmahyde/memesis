@@ -57,13 +57,15 @@ def _resolve_db_path(project_context: str = None, base_dir: str = None) -> tuple
     """
     Resolve the database path and base directory.
 
+    memesis uses ONE global database. `project_context` no longer routes the
+    path — project identity is recorded per-row in the `project` column
+    instead (see init_db / get_project). `base_dir` is an explicit override
+    retained for tests.
+
     Returns:
         (base_dir, db_path) tuple.
     """
-    if project_context:
-        path_hash = re.sub(r"[^a-zA-Z0-9-]", "-", project_context)
-        bd = Path.home() / ".claude" / "projects" / path_hash / "memory"
-    elif base_dir:
+    if base_dir:
         bd = Path(base_dir).expanduser()
     else:
         bd = Path.home() / ".claude" / "memory"

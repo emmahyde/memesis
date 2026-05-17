@@ -180,8 +180,14 @@ class TestSessionStartMain:
         assert "---MEMORY CONTEXT---" in stdout
         assert "---END MEMORY CONTEXT---" in stdout
 
-    def test_session_start_creates_ephemeral_buffer_on_run(self, tmp_path):
-        """Hook creates ephemeral/session-{date}.md during execution."""
+    def test_session_start_creates_ephemeral_buffer_on_run(self, tmp_path, monkeypatch):
+        """Hook creates ephemeral/session-{date}.md during execution.
+
+        HOME is redirected to tmp_path: with the single global DB, the hook
+        resolves ~/.claude/memory, so the test must isolate HOME or it would
+        write into the real store (CLAUDE.md rule 3).
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
         init_db(project_context=str(tmp_path))
         base_dir = get_base_dir()
         today = datetime.now().strftime("%Y-%m-%d")
@@ -191,7 +197,7 @@ class TestSessionStartMain:
         assert not expected_buffer.exists()
 
         _run_hook(
-            env_overrides={"HOME": str(Path.home())},
+            env_overrides={"HOME": str(tmp_path)},
             cwd=str(tmp_path),
         )
 
