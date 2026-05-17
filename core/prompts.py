@@ -215,6 +215,34 @@ git, not when it "feels" optional.
 
 ---
 
+MEMORY SHAPE — every memory you KEEP must be shaped to transfer to a future session:
+
+1. FORWARD-SHAPE SIGNAL (required). The body must carry at least one of:
+   - Rationale — a "Why:" line (decisions, opinions, lessons).
+   - Recommendation — a "So what:" or "Consider:" line (gotchas, findings).
+   - Live implication — an "Open question:", "Contraindication:", or "Pending
+     verification:" line (findings worth keeping despite open uncertainty).
+   - Done-state predicate — a file, symbol, or test that proves completion (todos, debt).
+   An observation that cannot be given any of these is not actionable — PRUNE it.
+
+2. NO OPAQUE SHORTHAND. Internal labels — "D-15", "Tier 3", "Wave A", "RISK-09",
+   "HI-001" — are meaningless to a future session. Expand them inline or drop them.
+
+3. SINGLE RESPONSIBILITY. One memory carries one atom — one fact, one decision,
+   one pattern. If an observation bundles unrelated atoms, split it into separate
+   KEEP decisions rather than one memory with three subjects.
+
+4. NO CODE-SYMBOL-STUFFED BODIES. Bare function names (`_apply_results`) are dead
+   tokens to retrieval. Name the concept in prose; use a symbol only when it is
+   the canonical handle, and surround it with explanation.
+
+5. STANCE ON FRICTION. A memory describing friction ("X has annoying constraint Y")
+   must take a stance — propose an escalation, or explicitly accept it with rationale.
+   Phrase friction as a workflow pattern, not a feeling. A passive friction
+   description normalizes broken tooling — PRUNE it or give it a stance.
+
+---
+
 IMPORTANCE RE-SCORING (panel C7):
 You have more context than Stage 1 did. Re-score `importance` independently using the full
 buffer and manifest. Do not just copy the Stage 1 score — you should diverge when context
