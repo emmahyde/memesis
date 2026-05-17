@@ -35,6 +35,54 @@ KIND_VALUES = frozenset({
     "open_question",
 })
 
+# Memory-row curated taxonomy (canvas review 2026-05-15 §1) — stored in
+# memories.memory_kind. Distinct from KIND_VALUES above: KIND_VALUES is the
+# raw observation-extraction taxonomy; this is the curated per-memory kind that
+# scoring and retrieval reason about. Retires the `finding`/`checkpoint`
+# dumping-ground kinds.
+MEMORY_KIND_VALUES = frozenset({
+    "decision",    # chose between alternatives; has rationale + rejected options
+    "lesson",      # pattern extracted from >=2 incidents; prescribes future behavior
+    "gotcha",      # a trap that bit us; concrete + reproducible
+    "goal",        # north-star statement that shapes future decisions
+    "invariant",   # fragile coupling future refactors must preserve
+    "opinion",     # stance on whether something is right/wrong, with rationale
+    "bias",        # systematic LLM/system failure mode (anti-checklist)
+    "todo",        # action item with a concrete done-state predicate
+    "debt",        # known issue / cleanup, status-bearing
+    "fact",        # small, code-derivable but worth pinning (rare)
+})
+
+# Deterministic map from an observation-extraction kind to a memory_kind.
+# goal / bias / todo / debt are not derivable from the extraction taxonomy —
+# they need richer classification and are left for a later pass.
+_OBSERVATION_TO_MEMORY_KIND = {
+    "decision": "decision",
+    "correction": "gotcha",
+    "constraint": "invariant",
+    "preference": "opinion",
+    # "finding" — handled in derive_memory_kind (depends on evidence_count).
+    # "open_question" — intentionally unmapped: it is a lifecycle state, not a
+    #   knowledge kind, so its memory_kind stays None.
+}
+
+
+def derive_memory_kind(observation_kind, evidence_count: int = 0) -> str | None:
+    """Map an observation-extraction kind to a curated memory_kind.
+
+    Returns None when no curated kind applies (open_question, unknown, missing).
+    `finding` — the documented dumping-ground kind — resolves to `lesson` when
+    it carries multi-session evidence (the synthesis definition of a lesson) and
+    to `fact` otherwise.
+    """
+    if not observation_kind:
+        return None
+    k = str(observation_kind).strip().lower()
+    if k == "finding":
+        return "lesson" if (evidence_count or 0) >= 2 else "fact"
+    return _OBSERVATION_TO_MEMORY_KIND.get(k)
+
+
 KNOWLEDGE_TYPE_VALUES = frozenset({
     "factual",
     "conceptual",

@@ -38,6 +38,7 @@ from peewee import IntegrityError
 from .models import ConsolidationLog, Memory, Observation
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
+from .validators import derive_memory_kind
 from .question_lifecycle import (
     detect_resolution,
     get_unresolved_questions,
@@ -965,6 +966,9 @@ class Consolidator:
                 rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
                 # Stage 2 enrichment fields from consolidation prompt
                 kind=decision.get("kind"),
+                memory_kind=derive_memory_kind(
+                    decision.get("kind"), decision.get("evidence_count")
+                ),
                 subtitle=decision.get("subtitle"),
                 cwd=decision.get("cwd"),
                 subject=decision.get("subject"),

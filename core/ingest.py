@@ -24,6 +24,7 @@ from typing import Optional
 
 from .database import get_base_dir, get_commit_ref, get_project
 from .models import Memory, Observation
+from .validators import derive_memory_kind
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,7 @@ class NativeMemoryIngestor:
                     commit_ref=get_commit_ref(),
                     # W5 schema fields — populate from native frontmatter
                     kind=NATIVE_KIND_MAP.get(native_type),
+                    memory_kind=derive_memory_kind(NATIVE_KIND_MAP.get(native_type)),
                     knowledge_type=NATIVE_KNOWLEDGE_TYPE_MAP.get(native_type),
                     knowledge_type_confidence="high" if native_type in NATIVE_KIND_MAP else None,
                     subtitle=(mem.get("description") or "")[:150] or None,

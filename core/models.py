@@ -90,7 +90,8 @@ class Memory(BaseModel):
     files_modified = TextField(null=True, default="[]")  # JSON array of relative paths
 
     # W2 schema additions
-    kind = TextField(null=True)                       # decision | finding | preference | constraint | correction | open_question
+    kind = TextField(null=True)                       # observation-extraction taxonomy: decision | finding | preference | constraint | correction | open_question
+    memory_kind = TextField(null=True, index=True)    # curated taxonomy (canvas review §1): decision|lesson|gotcha|goal|invariant|opinion|bias|todo|debt|fact — see core/validators.py
     knowledge_type = TextField(null=True)             # factual | conceptual | procedural | metacognitive
     knowledge_type_confidence = TextField(null=True)  # low | high
     subject = TextField(null=True)                    # self | user | system | collaboration | workflow | aesthetic | domain
