@@ -37,6 +37,7 @@ from peewee import IntegrityError
 
 from .models import ConsolidationLog, Memory, Observation
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
+from .importance import calibrate_importance
 from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
 from .validators import derive_memory_kind
 from .question_lifecycle import (
@@ -938,6 +939,13 @@ class Consolidator:
             else:
                 mem_importance = min(0.5 + importance_boost, 1.0)
 
+            # Curated kind + deterministic importance calibration (canvas §1/§3):
+            # raise to the per-kind floor and reward action items / numeric evidence.
+            mem_kind = derive_memory_kind(
+                decision.get("kind"), decision.get("evidence_count")
+            )
+            mem_importance = calibrate_importance(mem_importance, mem_kind, body_content)
+
             mem = Memory.create(
                 stage="consolidated",
                 title=title,
@@ -966,9 +974,7 @@ class Consolidator:
                 rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
                 # Stage 2 enrichment fields from consolidation prompt
                 kind=decision.get("kind"),
-                memory_kind=derive_memory_kind(
-                    decision.get("kind"), decision.get("evidence_count")
-                ),
+                memory_kind=mem_kind,
                 subtitle=decision.get("subtitle"),
                 cwd=decision.get("cwd"),
                 subject=decision.get("subject"),

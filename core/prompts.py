@@ -223,8 +223,18 @@ justifies it.
 Importance anchors:
   0.2  routine finding (re-derivable, low stakes)
   0.5  useful context (saves time but not load-bearing)
-  0.8  load-bearing decision (getting this wrong causes real problems)
-  0.95 correction or hard constraint (must-know to avoid repeating a mistake)
+  0.9  load-bearing decision or hard constraint (getting this wrong causes real problems)
+  0.95 correction or must-know to avoid repeating a mistake
+
+SPREAD THE SCORES. A distribution where most observations land at 0.5–0.6 carries no
+ranking signal. Commit to a judgment: if an observation is genuinely routine, score it
+low (0.2–0.35); if it is genuinely load-bearing, score it high (0.85+). Avoid the
+0.45–0.65 middle unless the observation truly is middling.
+
+Push the score UP for: an explicit action item ("should X", "needs Y", an unresolved
+question), numeric evidence backing the claim, or alignment with established engineering
+practice. Push it DOWN for: subject matter owned by a third-party package we do not
+maintain, or anything already enforced mechanically by a test, hook, type, or CI check.
 
 ---
 
