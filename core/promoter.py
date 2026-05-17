@@ -131,10 +131,13 @@ def resolve_contradictions_pass(session_id: str) -> dict:
             continue
 
         if mem_a.stage == "instinctive" and mem_b.stage == "instinctive":
+            # Intentionally skip rather than queue: instinctive memories can never
+            # be promoted further, so a queue entry would never unblock anything.
+            # _resolve_edge queues them if called directly; this sweep avoids the noise.
             counts["skipped"] += 1
             continue
 
-        result = _resolve_edge(edge, session_id)
+        _resolve_edge(edge, session_id)
         final_state = _edge_state(edge.id)
 
         # Sync reverse edge
@@ -199,6 +202,11 @@ def _apply_verdict(
 
     if verdict.verdict in ("SUPERSEDE", "ARCHIVE"):
         winner_id = verdict.winner_id
+        if winner_id not in (edge.source_id, edge.target_id):
+            raise ValueError(
+                f"winner_id {winner_id!r} is not an endpoint of edge {edge.id} "
+                f"({edge.source_id} / {edge.target_id})"
+            )
         loser_id = (
             edge.target_id if edge.source_id == winner_id else edge.source_id
         )
@@ -222,6 +230,11 @@ def _apply_verdict(
 
     elif verdict.verdict == "REFINE":
         winner_id = verdict.winner_id
+        if winner_id not in (edge.source_id, edge.target_id):
+            raise ValueError(
+                f"winner_id {winner_id!r} is not an endpoint of edge {edge.id} "
+                f"({edge.source_id} / {edge.target_id})"
+            )
         loser_id = (
             edge.target_id if edge.source_id == winner_id else edge.source_id
         )

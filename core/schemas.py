@@ -344,7 +344,7 @@ class StoredContradictionVerdict(BaseModel):
 
     @model_validator(mode="after")
     def validate_fields(self) -> "StoredContradictionVerdict":
-        if self.verdict in ("SUPERSEDE", "ARCHIVE") and self.winner_id is None:
+        if self.verdict in ("SUPERSEDE", "ARCHIVE", "REFINE") and self.winner_id is None:
             raise ValueError(f"winner_id required for verdict {self.verdict}")
         if self.verdict == "REFINE" and not self.merged_content:
             raise ValueError("merged_content required for verdict REFINE")
