@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .database import get_base_dir, get_project
+from .database import get_base_dir, get_commit_ref, get_project
 from .models import Memory, Observation
 
 logger = logging.getLogger(__name__)
@@ -277,6 +277,7 @@ class NativeMemoryIngestor:
                     updated_at=now,
                     content_hash=content_hash,
                     project=get_project(),
+                    commit_ref=get_commit_ref(),
                     # W5 schema fields — populate from native frontmatter
                     kind=NATIVE_KIND_MAP.get(native_type),
                     knowledge_type=NATIVE_KNOWLEDGE_TYPE_MAP.get(native_type),

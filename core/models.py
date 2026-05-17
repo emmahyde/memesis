@@ -78,6 +78,8 @@ class Memory(BaseModel):
     project_context = TextField(null=True)
     project = TextField(null=True)            # slug: -Users-emmahyde-projects-memesis
     source_session = TextField(null=True)
+    source_pr = TextField(null=True)                  # PR associated with this memory (reserved; set post-hoc)
+    commit_ref = TextField(null=True)                  # git short SHA at creation time — provenance trace
     content_hash = TextField(null=True)
     archived_at = TextField(null=True)
     subsumed_by = TextField(null=True)

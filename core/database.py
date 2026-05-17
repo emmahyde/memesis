@@ -203,6 +203,37 @@ def get_project() -> Optional[str]:
     return _project
 
 
+_commit_ref: Optional[str] = None
+_commit_ref_resolved: bool = False
+
+
+def get_commit_ref() -> Optional[str]:
+    """Return the current git commit ref (short SHA), best-effort.
+
+    Stamped into the `commit_ref` provenance column of new memories so a memory
+    can be traced to the code state that produced it. Resolved once and cached;
+    returns None outside a git repo or if git is unavailable. Never raises.
+    """
+    global _commit_ref, _commit_ref_resolved
+    if _commit_ref_resolved:
+        return _commit_ref
+    _commit_ref_resolved = True
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            _commit_ref = result.stdout.strip() or None
+    except Exception:
+        _commit_ref = None
+    return _commit_ref
+
+
 def project_slug(project_context: Optional[str]) -> Optional[str]:
     """Slugify a project path to the canonical `project` column key.
 

@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .compression import compress_memory_for_stage, compression_ratio, get_stage_depth
 
-from .database import db, get_base_dir, get_project
+from .database import db, get_base_dir, get_commit_ref, get_project
 from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
 from .linking import link_memory as _link_memory, auto_promote_if_dupe
@@ -948,6 +948,7 @@ class Consolidator:
                 created_at=now,
                 updated_at=now,
                 source_session=session_id,
+                commit_ref=get_commit_ref(),
                 content_hash=content_hash,
                 project=get_project(),
                 temporal_scope=card_fields["temporal_scope"],
