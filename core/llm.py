@@ -48,6 +48,37 @@ except ImportError:  # pragma: no cover
 DEFAULT_MODEL = "claude-sonnet-4-6"
 BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6"
 
+# System-prompt library — see core/system_prompts/. memesis LLM calls are
+# single-shot, tool-less subprocesses; a task-scoped system prompt frames the
+# model for the job instead of leaving it on the interactive coding-agent
+# preset that the SDK / CLI default to.
+_SYSTEM_PROMPT_DIR = os.path.join(os.path.dirname(__file__), "system_prompts")
+_system_prompt_cache: dict[str, tuple[str, str]] = {}
+
+
+def _load_system_prompt(spec: str | None) -> tuple[str, str] | None:
+    """Resolve a system-prompt spec to (absolute_path, text), or None.
+
+    ``spec`` may be an absolute path, an existing relative path, or a bare
+    name resolved against ``core/system_prompts/<name>.md``. Results are
+    cached by spec. A missing file raises FileNotFoundError — a misnamed
+    system prompt is a bug, not something to swallow silently.
+    """
+    if not spec:
+        return None
+    if spec in _system_prompt_cache:
+        return _system_prompt_cache[spec]
+    if os.path.isabs(spec) or os.path.exists(spec):
+        path = os.path.abspath(spec)
+    else:
+        name = spec[:-3] if spec.endswith(".md") else spec
+        path = os.path.join(_SYSTEM_PROMPT_DIR, f"{name}.md")
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read().strip()
+    resolved = (path, text)
+    _system_prompt_cache[spec] = resolved
+    return resolved
+
 
 try:
     from core.trace import get_active_writer
@@ -196,6 +227,7 @@ def _call_via_claude_cli(
     timeout: int = 180,
     max_attempts: int = 3,
     backoff_base: float = 2.0,
+    system_prompt_path: str | None = None,
 ) -> str:
     """Call `claude -p` subprocess using OAuth subscription credentials.
 
@@ -220,16 +252,21 @@ def _call_via_claude_cli(
     env = {k: v for k, v in os.environ.items()
            if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")}
 
+    argv = [
+        "claude", "-p",
+        "--output-format", "text",
+        "--disable-slash-commands",
+        "--disallowed-tools",
+        "Bash Edit Write Read Glob Grep Task WebFetch WebSearch",
+    ]
+    # Replace the default coding-agent system prompt with the task-scoped one.
+    if system_prompt_path is not None:
+        argv += ["--system-prompt-file", system_prompt_path]
+
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         proc = subprocess.run(
-            [
-                "claude", "-p",
-                "--output-format", "text",
-                "--disable-slash-commands",
-                "--disallowed-tools",
-                "Bash Edit Write Read Glob Grep Task WebFetch WebSearch",
-            ],
+            argv,
             input=prompt,
             capture_output=True,
             text=True,
@@ -260,7 +297,9 @@ def _strip_oauth_env() -> dict[str, str]:
     }
 
 
-async def _call_via_agent_sdk(prompt: str) -> tuple[str, int | None, int | None]:
+async def _call_via_agent_sdk(
+    prompt: str, system_prompt: str | None = None,
+) -> tuple[str, int | None, int | None]:
     """Single-shot LLM call via claude-agent-sdk on OAuth credentials.
 
     Returns (result_text, input_tokens, output_tokens). Token counts come
@@ -284,12 +323,17 @@ async def _call_via_agent_sdk(prompt: str) -> tuple[str, int | None, int | None]
         sys.stderr.write(f"[claude-cli-stderr] {line}")
         sys.stderr.flush()
 
-    options = ClaudeAgentOptions(
+    opt_kwargs: dict = dict(
         allowed_tools=[],
         permission_mode="bypassPermissions",
         max_turns=1,
         stderr=_stderr_sink if os.environ.get("MEMESIS_SDK_STDERR") else None,
     )
+    # A plain-string system_prompt replaces the SDK's default coding-agent
+    # preset — correct for these single-shot, tool-less memory subprocesses.
+    if system_prompt is not None:
+        opt_kwargs["system_prompt"] = system_prompt
+    options = ClaudeAgentOptions(**opt_kwargs)
     try:
         result_text = ""
         input_tokens: int | None = None
@@ -324,17 +368,23 @@ async def call_llm_async(
     max_tokens: int = 8192,
     temperature: float = 0,
     model: str | None = None,
+    system_prompt_file: str | None = None,
 ) -> str:
     """Async variant of call_llm — uses agent-SDK on the OAuth path.
 
     On the API-key / Bedrock paths this is just an asyncio-compat wrapper
     around the synchronous SDK; concurrency gain is real only on the OAuth
     path because that's where we get the SDK's token-refresh serialization.
+
+    ``system_prompt_file`` — see call_llm.
     """
     use_bedrock = bool(os.environ.get("CLAUDE_CODE_USE_BEDROCK"))
 
     if not use_bedrock and not _have_api_key() and _AGENT_SDK_AVAILABLE:
-        raw_text, in_toks, out_toks = await _call_via_agent_sdk(prompt)
+        _sp = _load_system_prompt(system_prompt_file)
+        raw_text, in_toks, out_toks = await _call_via_agent_sdk(
+            prompt, _sp[1] if _sp else None,
+        )
         result = strip_markdown_fences(raw_text)
         _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
         return result
@@ -345,6 +395,7 @@ async def call_llm_async(
         max_tokens=max_tokens,
         temperature=temperature,
         model=model,
+        system_prompt_file=system_prompt_file,
     )
 
 
@@ -355,6 +406,7 @@ def call_llm_batch(
     max_tokens: int = 8192,
     temperature: float = 0,
     model: str | None = None,
+    system_prompt_file: str | None = None,
 ) -> list[str]:
     """Run N prompts concurrently and return results in input order.
 
@@ -377,6 +429,7 @@ def call_llm_batch(
             try:
                 return await call_llm_async(
                     p, max_tokens=max_tokens, temperature=temperature, model=model,
+                    system_prompt_file=system_prompt_file,
                 )
             except Exception as exc:  # noqa: BLE001
                 return f"[ERROR] {type(exc).__name__}: {exc}"[:500]
@@ -393,6 +446,7 @@ def call_llm(
     max_tokens: int = 8192,
     temperature: float = 0,
     model: str | None = None,
+    system_prompt_file: str | None = None,
 ) -> str:
     """
     Call the Anthropic Messages API and return the response text.
@@ -408,6 +462,11 @@ def call_llm(
         temperature: Sampling temperature (ignored on OAuth paths).
         model: Override model ID. If None, selects based on
                CLAUDE_CODE_USE_BEDROCK env var. Ignored on OAuth paths.
+        system_prompt_file: Optional system-prompt spec — a bare name resolved
+               against core/system_prompts/<name>.md, or an explicit path.
+               Frames the call for its task instead of the default coding-
+               agent preset. Applied on every transport. None = no system
+               prompt (legacy behavior).
 
     Returns:
         The response text with markdown fences stripped.
@@ -415,13 +474,19 @@ def call_llm(
     Raises:
         anthropic.APIError: On direct/Bedrock API failures.
         RuntimeError: On OAuth subprocess failure or missing CLI.
+        FileNotFoundError: If system_prompt_file does not resolve to a file.
     """
     use_bedrock = bool(os.environ.get("CLAUDE_CODE_USE_BEDROCK"))
+    _sp = _load_system_prompt(system_prompt_file)
+    _sp_text = _sp[1] if _sp else None
+    _sp_path = _sp[0] if _sp else None
 
     if not use_bedrock and not _have_api_key():
         if _AGENT_SDK_AVAILABLE:
             try:
-                raw_text, in_toks, out_toks = asyncio.run(_call_via_agent_sdk(prompt))
+                raw_text, in_toks, out_toks = asyncio.run(
+                    _call_via_agent_sdk(prompt, _sp_text)
+                )
                 result = strip_markdown_fences(raw_text)
                 _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
                 return result
@@ -430,7 +495,7 @@ def call_llm(
                 # Fall through to subprocess path in that case.
                 if "asyncio.run" not in str(exc) and "running" not in str(exc).lower():
                     raise
-        raw = _call_via_claude_cli(prompt)
+        raw = _call_via_claude_cli(prompt, system_prompt_path=_sp_path)
         result = strip_markdown_fences(raw)
         _emit_llm_envelope(model, prompt, None, None, len(result))
         return result
@@ -440,12 +505,15 @@ def call_llm(
     if model is None:
         model = BEDROCK_MODEL if use_bedrock else DEFAULT_MODEL
 
-    response = client.messages.create(
+    create_kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
         messages=[{"role": "user", "content": prompt}],
     )
+    if _sp_text is not None:
+        create_kwargs["system"] = _sp_text
+    response = client.messages.create(**create_kwargs)
 
     raw = response.content[0].text
     result = strip_markdown_fences(raw)

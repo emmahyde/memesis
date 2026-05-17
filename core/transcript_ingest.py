@@ -225,9 +225,12 @@ def extract_observations(
         })
 
     # #33: use format_extract_prompt() to inject per-session-type guidance
-    raw = call_llm(format_extract_prompt(
-        transcript=rendered, session_type=session_type, affect_hint=""
-    ))
+    raw = call_llm(
+        format_extract_prompt(
+            transcript=rendered, session_type=session_type, affect_hint=""
+        ),
+        system_prompt_file="extraction",
+    )
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -479,7 +482,7 @@ def _refine_observations(
     )
 
     try:
-        raw = call_llm(prompt, max_tokens=8192)
+        raw = call_llm(prompt, max_tokens=8192, system_prompt_file="consolidation")
     except Exception as exc:  # noqa: BLE001
         logger.warning("_refine_observations: LLM call failed: %s", exc)
         return observations, {"merges": 0, "rescores": 0, "outcome": "llm_error", "error": str(exc)}
@@ -720,6 +723,7 @@ def extract_observations_hierarchical(
 
             raw_list = call_llm_batch(
                 [prompt], max_concurrency=1, max_tokens=overrides.max_tokens_stage1,
+                system_prompt_file="extraction",
             )
             raw = raw_list[0] if raw_list else "[ERROR] empty batch response"
             cost_calls += 1
@@ -836,6 +840,7 @@ def extract_observations_hierarchical(
             active_prompts = [prompts[i] for i in active_indices]
             active_responses = call_llm_batch(
                 active_prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+                system_prompt_file="extraction",
             )
             # Reassemble full-length response list with empty strings for skipped windows
             raw_responses = [""] * len(prompts)
@@ -844,6 +849,7 @@ def extract_observations_hierarchical(
         else:
             raw_responses = call_llm_batch(
                 prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+                system_prompt_file="extraction",
             )
 
         for i, (_w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):

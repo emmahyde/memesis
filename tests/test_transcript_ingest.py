@@ -177,7 +177,7 @@ def test_extract_observations_passes_session_type_to_prompt():
     obs = [{"content": "finding", "mode": "finding", "importance": 0.6, "tags": []}]
     captured_prompts: list[str] = []
 
-    def fake_llm(prompt: str) -> str:
+    def fake_llm(prompt: str, **kwargs) -> str:
         captured_prompts.append(prompt)
         return json.dumps(obs)
 

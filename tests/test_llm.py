@@ -116,7 +116,9 @@ class TestCallLlmOAuthPath:
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_USE_BEDROCK"}
         captured = {}
 
-        async def _spy(prompt: str) -> tuple[str, int | None, int | None]:
+        async def _spy(
+            prompt: str, system_prompt: str | None = None,
+        ) -> tuple[str, int | None, int | None]:
             captured["prompt"] = prompt
             return "ok", None, None
 
@@ -141,7 +143,7 @@ class TestCallLlmOAuthPath:
              patch("core.llm._AGENT_SDK_AVAILABLE", False), \
              patch("core.llm._call_via_claude_cli", return_value="cli-output") as mock_cli:
             assert call_llm("test") == "cli-output"
-            mock_cli.assert_called_once_with("test")
+            mock_cli.assert_called_once_with("test", system_prompt_path=None)
 
 
 # ---------------------------------------------------------------------------
