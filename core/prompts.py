@@ -757,3 +757,34 @@ Return ONLY valid JSON with no prose outside the JSON block:
   "rationale": "<one sentence explaining the decision>"
 }}
 """
+
+
+# ---------------------------------------------------------------------------
+# Paraphrase-aware duplicate confirmation prompt
+# ---------------------------------------------------------------------------
+
+DEDUP_CONFIRM_PROMPT = """\
+You are deciding whether two stored memories are duplicates — the same fact or
+workflow pattern expressed differently (paraphrase, reordering, partial
+overlap). Embedding similarity already flagged them as near-misses; yours is
+the final judgment.
+
+## Memory A
+Title: {a_title}
+Summary: {a_summary}
+Content:
+{a_content}
+
+## Memory B
+Title: {b_title}
+Summary: {b_summary}
+Content:
+{b_content}
+
+Two memories are DUPLICATE when one carries no durable information the other
+lacks — a reader holding one gains nothing actionable from the other. They are
+DISTINCT when each carries a fact, rationale, scope, or workflow detail the
+other does not.
+
+Respond with ONLY one word: DUPLICATE or DISTINCT.
+"""

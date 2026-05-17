@@ -38,6 +38,12 @@ LINK_COSINE_THRESHOLD: float = float(os.environ.get("MEMESIS_LINK_THRESHOLD", "0
 # archive the new dupe instead of leaving both in the store. Tighter than the
 # link threshold because the action is destructive (subsumes the new memory).
 LINK_AUTO_PROMOTE_THRESHOLD: float = float(os.environ.get("MEMESIS_AUTO_PROMOTE_THRESHOLD", "0.85"))
+# Paraphrase-aware dedup: embeddings of reworded duplicates often land *below*
+# the auto-promote threshold. Candidates whose cosine falls in the near-miss
+# band [LINK_LLM_REVIEW_FLOOR, LINK_AUTO_PROMOTE_THRESHOLD) are escalated to an
+# LLM duplicate-confirmation call. The LLM pass fires only when a near-miss
+# exists, so cost stays bounded — most KEEPs have no candidate in the band.
+LINK_LLM_REVIEW_FLOOR: float = float(os.environ.get("MEMESIS_DEDUP_LLM_FLOOR", "0.70"))
 LINK_MAX_NEIGHBORS: int = 3
 LINK_MIN_NEIGHBORS: int = 0  # may return empty list
 
@@ -197,6 +203,33 @@ def detect_topic_drift(new_memory, linked_memory) -> bool:
     return new_kind != lnk_kind and new_subject != lnk_subject and new_kt != lnk_kt
 
 
+def _llm_confirms_duplicate(mem_a, mem_b) -> bool:
+    """Ask the LLM whether two near-miss memories are duplicates.
+
+    Returns False on any error — a failed confirmation must never trigger the
+    destructive subsumption. Compares all text fields (title + summary + content)
+    so paraphrases that embeddings miss can still be caught.
+    """
+    try:
+        from .llm import call_llm
+        from .prompts import DEDUP_CONFIRM_PROMPT
+
+        prompt = DEDUP_CONFIRM_PROMPT.format(
+            a_title=mem_a.title or "",
+            a_summary=mem_a.summary or "",
+            a_content=(mem_a.content or "")[:1500],
+            b_title=mem_b.title or "",
+            b_summary=mem_b.summary or "",
+            b_content=(mem_b.content or "")[:1500],
+        )
+        raw = call_llm(prompt, max_tokens=16, temperature=0)
+    except Exception as exc:  # noqa: BLE001 — never let dedup confirmation crash a KEEP
+        logger.warning("dedup LLM confirmation failed: %s", exc)
+        return False
+    verdict = (raw or "").strip().upper()
+    return verdict.startswith("DUPLICATE") or "DUPLICATE" in verdict
+
+
 def auto_promote_if_dupe(memory) -> Optional[str]:
     """
     If a newly created memory is near-identical (cosine >= LINK_AUTO_PROMOTE_THRESHOLD)
@@ -227,9 +260,33 @@ def auto_promote_if_dupe(memory) -> Optional[str]:
         threshold=LINK_AUTO_PROMOTE_THRESHOLD,
         top_k=1,
     )
-    if not neighbors:
-        return None
-    target_id, score = neighbors[0]
+    if neighbors:
+        target_id, score = neighbors[0]
+    else:
+        # Near-miss band: cosine missed it, but a paraphrase may still be a
+        # duplicate. Escalate the best near-miss to an LLM judgment call.
+        near = find_links_for_observation(
+            memory,
+            candidates,
+            threshold=LINK_LLM_REVIEW_FLOOR,
+            top_k=1,
+        )
+        if not near:
+            return None
+        cand_id, cand_score = near[0]
+        if cand_score >= LINK_AUTO_PROMOTE_THRESHOLD:
+            return None  # would have been caught above; defensive
+        try:
+            cand = Memory.get_by_id(cand_id)
+        except Memory.DoesNotExist:
+            return None
+        if not _llm_confirms_duplicate(memory, cand):
+            return None
+        logger.info(
+            "AUTO-PROMOTE: LLM confirmed paraphrase duplicate %s ~ %s (cosine=%.3f)",
+            str(memory.id)[:8], str(cand_id)[:8], cand_score,
+        )
+        target_id, score = cand_id, cand_score
     try:
         target = Memory.get_by_id(target_id)
     except Memory.DoesNotExist:

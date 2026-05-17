@@ -468,18 +468,21 @@ def test_auto_promote_skips_archived_candidates(in_memory_db):
 
 
 def test_auto_promote_between_link_and_auto_thresholds_returns_none(in_memory_db):
-    """Cosine in (LINK_COSINE_THRESHOLD=0.72, LINK_AUTO_PROMOTE_THRESHOLD=0.85) → no subsume.
+    """Cosine in [0.70, 0.85) → escalates to LLM; an LLM "DISTINCT" → no subsume.
 
-    Verifies the dual-threshold design: a peer can be link-worthy but not
-    dupe-worthy. Only the tighter 0.85 gate triggers destructive subsumption.
+    Near-misses in the band are now LLM-reviewed for paraphrase duplicates
+    (paraphrase-aware dedup). Cosine alone no longer decides: only the 0.85 gate
+    or an LLM "DUPLICATE" confirmation triggers destructive subsumption.
     """
     import math
+    from unittest.mock import patch
     from core.linking import auto_promote_if_dupe
     # Angle ≈ 30° → cosine ≈ 0.866 — too high. Use ≈ 36° → cosine ≈ 0.809.
     theta = math.radians(36.0)
     _persist_with_embedding([1.0, 0.0])
     new_mem = _persist_with_embedding([math.cos(theta), math.sin(theta)])
-    assert auto_promote_if_dupe(new_mem) is None
+    with patch("core.llm.call_llm", return_value="DISTINCT"):
+        assert auto_promote_if_dupe(new_mem) is None
 
 
 def test_auto_promote_bumps_rc_to_crystallization_threshold(in_memory_db):
