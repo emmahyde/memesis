@@ -1148,16 +1148,20 @@ class RetrievalEngine:
 
         ranked_ids = [mid for mid, _ in ranked]
 
-        # 1-hop graph expansion: add thread/tag neighbors to candidate pool
-        from .graph import expand_neighbors
+        # 1-hop graph expansion: add thread/tag neighbors + cluster siblings
+        from .graph import expand_clusters, expand_neighbors
         neighbor_ids = expand_neighbors(ranked_ids, max_expansion=10, vec_store=get_vec_store())
-        if neighbor_ids:
-            # Neighbors get a reduced RRF score (half of the lowest seed score)
+        # Cluster anchoring: surfacing one cluster member pulls in its siblings.
+        seen = set(ranked_ids) | set(neighbor_ids)
+        cluster_ids = [c for c in expand_clusters(ranked_ids, max_expansion=10) if c not in seen]
+        expansion_ids = neighbor_ids + cluster_ids
+        if expansion_ids:
+            # Expanded candidates get a reduced RRF score (half the lowest seed score)
             min_score = min(s for _, s in ranked) if ranked else 0.0
             neighbor_score = min_score * 0.5
-            for nid in neighbor_ids:
+            for nid in expansion_ids:
                 ranked.append((nid, neighbor_score))
-            ranked_ids = ranked_ids + neighbor_ids
+            ranked_ids = ranked_ids + expansion_ids
 
         # Include both crystallized and consolidated memories — both have been
         # through quality gates. Crystallized get a boost in the scoring below.

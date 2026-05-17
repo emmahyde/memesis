@@ -137,6 +137,9 @@ class Memory(BaseModel):
     verify_kind = TextField(null=True)   # grep_present | grep_absent | file_exists | test_passes
     verify_arg = TextField(null=True)    # predicate argument: regex, repo-relative path, or pytest node id
 
+    # Cluster anchoring: named cluster slug; retrieval expands 1-hop to siblings
+    cluster = TextField(null=True, index=True)  # see core/graph.py:expand_clusters
+
     class Meta:
         table_name = "memories"
 
