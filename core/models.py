@@ -552,12 +552,37 @@ class MemoryEdge(BaseModel):
     edge_type = TextField()
     weight = FloatField(default=1.0)
     metadata = TextField(null=True)  # JSON: evidence, affect, timestamps
+    resolution_state = TextField(default='unresolved')
 
     class Meta:
         table_name = "memory_edges"
 
     # Edge types that compute_edges() rebuilds from scratch each run.
     RECOMPUTABLE_TYPES = {"thread_neighbor", "tag_cooccurrence"}
+
+
+# ---------------------------------------------------------------------------
+# ContradictionReview
+# ---------------------------------------------------------------------------
+
+
+class ContradictionReview(BaseModel):
+    """Queued human-review rows for BLOCK verdicts from the contradiction resolver."""
+
+    id = AutoField()
+    memory_id = TextField()
+    edge_id = IntegerField()
+    other_memory_id = TextField()
+    project = TextField(null=True)
+    llm_rationale = TextField(null=True)
+    status = TextField(default='open')
+    created_at = TextField()
+    recheck_fingerprint = TextField(null=True)
+    retry_count = IntegerField(default=0)
+    resolved_at = TextField(null=True)
+
+    class Meta:
+        table_name = "contradiction_reviews"
 
 
 # ---------------------------------------------------------------------------

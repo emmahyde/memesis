@@ -267,6 +267,11 @@ class LifecycleManager:
         if current_stage == 'instinctive':
             return False, "Already at highest stage (instinctive)"
 
+        from core import promoter as _promoter
+        blocked, why = _promoter.has_blocking_contradiction(memory_id)
+        if blocked:
+            return False, f"Blocked by unresolved contradiction: {why}"
+
         current_idx = self.STAGE_ORDER.index(current_stage)
         next_stage = self.STAGE_ORDER[current_idx + 1]
 

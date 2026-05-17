@@ -561,6 +561,7 @@ def _create_thread_contradiction_edges(
                 edge_type="contradicts",
                 weight=0.3,
                 metadata=meta,
+                resolution_state='resolved',
             )
             logger.info(
                 "Thread contradiction edge: %s -[contradicts]-> %s (thread=%s)",

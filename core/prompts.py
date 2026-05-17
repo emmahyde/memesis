@@ -705,3 +705,55 @@ def format_extract_prompt(
     if failure_block:
         prompt = failure_block + "\n" + prompt
     return prompt
+
+
+# ---------------------------------------------------------------------------
+# Stored-vs-stored contradiction resolution prompt
+# ---------------------------------------------------------------------------
+
+STORED_CONTRADICTION_RESOLUTION_PROMPT = """\
+You are resolving a detected contradiction between two stored memories.
+
+These memories represent workflow patterns observed across Claude Code sessions.
+Treat any apparent conflict as a *workflow-pattern divergence* — not a contradiction
+in values or feelings. Your job is to determine whether one pattern has superseded
+another, or whether both remain valid in different contexts.
+
+## Memory A
+ID: {memory_a_id}
+Stage: {memory_a_stage}
+Title: {memory_a_title}
+Content:
+{memory_a_content}
+
+## Memory B
+ID: {memory_b_id}
+Stage: {memory_b_stage}
+Title: {memory_b_title}
+Content:
+{memory_b_content}
+
+## Detection rationale
+{detection_rationale}
+
+## Task
+Choose the verdict that best fits:
+
+- **SUPERSEDE**: Memory A or B has been entirely replaced by the other. Specify winner_id.
+- **ARCHIVE**: One memory is stale or wrong and should be dropped. Specify winner_id (the one to KEEP).
+- **REFINE**: Both are partially correct; a merged version captures the full truth. Provide merged_content.
+- **BLOCK**: The conflict is genuinely ambiguous — both patterns may coexist, the evidence
+  is insufficient, or one endpoint is instinctive-stage (top-tier; never auto-archive).
+
+**IMPORTANT GUARDRAIL**: If *both* Memory A and Memory B are at stage `instinctive`,
+you MUST return BLOCK — never auto-archive or supersede a top-tier memory.
+
+Return ONLY valid JSON with no prose outside the JSON block:
+
+{{
+  "verdict": "SUPERSEDE|ARCHIVE|REFINE|BLOCK",
+  "winner_id": "<memory id to keep, or null for REFINE/BLOCK>",
+  "merged_content": "<merged text for REFINE only, else null>",
+  "rationale": "<one sentence explaining the decision>"
+}}
+"""

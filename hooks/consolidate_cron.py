@@ -234,6 +234,16 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         except Exception as e:
             logger.warning("Hypothesis reconsolidation error (non-fatal): %s", e)
 
+        # --- Stored-vs-stored contradiction resolution ---
+        try:
+            from core.promoter import resolve_contradictions_pass
+            cr_result = resolve_contradictions_pass(session_id)
+            if any(cr_result.values()):
+                parts = [f"{v} {k}" for k, v in cr_result.items() if v]
+                summary_parts.append(f"contradictions: {', '.join(parts)}")
+        except Exception as e:
+            logger.warning("Contradiction resolution error (non-fatal): %s", e)
+
         # --- Relevance maintenance ---
         relevance = RelevanceEngine()
         maint = relevance.run_maintenance(project_context)

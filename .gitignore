@@ -27,6 +27,10 @@ node_modules/
 # Planning artifacts (RFCs are tracked individually; baselines are runtime)
 .planning/eval-baseline-*.json
 
+# Clean-room CLAUDE_CONFIG_DIR — track settings.json, ignore runtime state
+agent-sdk/*
+!agent-sdk/settings.json
+
 # OS / editor
 .DS_Store
 *.swp

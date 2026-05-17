@@ -1,0 +1,4 @@
+[env]
+# Clean-room Claude Code config: only the memesis plugin loads, none of the
+# user-level ~/.claude plugins/hooks/skills. See agent-sdk/settings.json.
+CLAUDE_CONFIG_DIR = "{{config_root}}/agent-sdk"

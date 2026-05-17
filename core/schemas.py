@@ -318,3 +318,34 @@ class ContradictionResolution(BaseModel):
                 f"confidence must be in [0.0, 1.0], got {fv}"
             )
         return fv
+
+
+# ---------------------------------------------------------------------------
+# Stored-vs-stored contradiction resolution verdict
+# ---------------------------------------------------------------------------
+
+
+class StoredContradictionVerdict(BaseModel):
+    """LLM verdict from the stored-vs-stored contradiction resolver (core/promoter.py).
+
+    JSON shape:
+    {
+      "verdict": "SUPERSEDE|ARCHIVE|REFINE|BLOCK",
+      "winner_id": "<memory id or null>",
+      "merged_content": "<string, REFINE only, else null>",
+      "rationale": "<string, required>"
+    }
+    """
+
+    verdict: Literal["SUPERSEDE", "ARCHIVE", "REFINE", "BLOCK"]
+    winner_id: str | None = None
+    merged_content: str | None = None
+    rationale: str
+
+    @model_validator(mode="after")
+    def validate_fields(self) -> "StoredContradictionVerdict":
+        if self.verdict in ("SUPERSEDE", "ARCHIVE") and self.winner_id is None:
+            raise ValueError(f"winner_id required for verdict {self.verdict}")
+        if self.verdict == "REFINE" and not self.merged_content:
+            raise ValueError("merged_content required for verdict REFINE")
+        return self
