@@ -224,7 +224,7 @@ def _have_api_key() -> bool:
 def _call_via_claude_cli(
     prompt: str,
     *,
-    timeout: int = 180,
+    timeout: int = 1800,
     max_attempts: int = 3,
     backoff_base: float = 2.0,
     system_prompt_path: str | None = None,

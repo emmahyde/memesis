@@ -32,7 +32,7 @@ from .database import db, get_base_dir, get_commit_ref, get_project
 from .issue_cards import extract_card_memory_fields
 from .lifecycle import LifecycleManager
 from .linking import link_memory as _link_memory, auto_promote_if_dupe
-from .llm import call_llm as _call_llm_transport
+from .llm import call_llm as _call_llm_transport, call_llm_batch as _call_llm_batch
 from peewee import IntegrityError
 
 from .models import ConsolidationLog, Memory, Observation
@@ -73,6 +73,8 @@ class Consolidator:
     PENDING_DELETE_TTL_DAYS: int = 7
     # Max concurrent LLM subprocess calls in consolidate_batch
     BATCH_CONCURRENCY: int = 3
+    # Max observations per consolidation LLM call; larger sessions are chunked
+    CONSOLIDATION_CHUNK_SIZE: int = 50
 
     def __init__(
         self,
@@ -148,27 +150,75 @@ class Consolidator:
         # them 'failed' so the backlog reflects reality and operators can see
         # which sessions had broken consolidation runs.
         #
-        # Inject OBSERVATION_ID: N prefix per block so the LLM can echo back
-        # stable ordinal keys (obs_ids) instead of paraphrased text.
-        numbered_content = self._inject_observation_ids(filtered_content, observation_refs)
-        prompt = CONSOLIDATION_PROMPT.format(
-            ephemeral_content=numbered_content,
-            manifest_summary=manifest_summary,
-            open_questions_block=open_questions_block,
-        )
+        # Chunk large sessions and run all chunks concurrently.
+        # Chunks are independent (same manifest, different obs subsets) so
+        # parallel execution is safe. Ordinals in observation_refs are globally
+        # unique, so _refs_for_obs_ids resolves across chunks without conflicts.
+        #
+        # Chunk assignment is semantic, not index-sliced: observations are
+        # clustered by embedding so topically-related ones — including
+        # near-duplicates — land in the same chunk where the LLM can merge
+        # them. Deterministic for fixed observation text.
+        blocks = _split_observation_blocks(filtered_content)
+        chunk_size = self.CONSOLIDATION_CHUNK_SIZE
+        captured_ids = [ref["id"] for ref in observation_refs]
+        chunk_index_groups = _assign_semantic_chunks(blocks, chunk_size)
+        n_chunks = len(chunk_index_groups)
+        if n_chunks > 1:
+            logger.info(
+                "consolidate_session: clustered %d observations into %d parallel chunks",
+                len(observation_refs), n_chunks,
+            )
+
+        # Build all prompts upfront, then fire them concurrently.
+        chunk_prompts: list[str] = []
+        for group in chunk_index_groups:
+            chunk_refs = [observation_refs[i] for i in group]
+            chunk_blocks = [blocks[i] for i in group]
+            chunk_content = "\n\n---\n\n".join(chunk_blocks)
+            numbered_chunk = self._inject_observation_ids(chunk_content, chunk_refs)
+            chunk_prompts.append(CONSOLIDATION_PROMPT.format(
+                ephemeral_content=numbered_chunk,
+                manifest_summary=manifest_summary,
+                open_questions_block=open_questions_block,
+            ))
+
         try:
-            decisions = self._call_llm(prompt)
-            decisions = self._validate_decision_ids(decisions)
+            raw_responses = _call_llm_batch(
+                chunk_prompts,
+                max_concurrency=self.BATCH_CONCURRENCY,
+                max_tokens=2048,
+                temperature=0,
+            )
         except Exception as exc:
-            captured_ids = [ref["id"] for ref in observation_refs]
             if captured_ids:
                 self._mark_observations(captured_ids, "failed")
             logger.error(
-                "consolidate_session: LLM call/validation failed for session %s; "
+                "consolidate_session: parallel LLM batch failed for session %s; "
                 "marked %d observations 'failed'. Reason: %s",
                 session_id, len(captured_ids), exc,
             )
             raise
+
+        all_decisions: list[dict] = []
+        for i, raw in enumerate(raw_responses):
+            if isinstance(raw, str) and raw.startswith("[ERROR]"):
+                logger.warning(
+                    "consolidate_session: chunk %d/%d LLM error (skipping): %s",
+                    i + 1, n_chunks, raw[:200],
+                )
+                continue
+            try:
+                chunk_decisions = self._parse_decisions(raw)
+                chunk_decisions = self._validate_decision_ids(chunk_decisions)
+                all_decisions.extend(chunk_decisions)
+            except Exception as exc:
+                logger.warning(
+                    "consolidate_session: chunk %d/%d parse failed (skipping): %s",
+                    i + 1, n_chunks, exc,
+                )
+
+        decisions = all_decisions
 
         # 5. Execute decisions
         kept = []
@@ -1525,6 +1575,54 @@ def _format_markdown(metadata: dict, content: str) -> str:
     lines.append('')
     lines.append(content)
     return '\n'.join(lines)
+
+
+def _assign_semantic_chunks(blocks: list[str], chunk_size: int) -> list[list[int]]:
+    """Cluster observation blocks by embedding into chunk index-groups.
+
+    Topically-related observations — including near-duplicates — land in the
+    same chunk so the consolidation LLM can merge them. Falls back to index
+    slicing when embeddings are unavailable. Deterministic for fixed text.
+    """
+    n = len(blocks)
+    if n == 0:
+        return []
+    if n <= chunk_size:
+        return [list(range(n))]
+
+    def _index_slices() -> list[list[int]]:
+        return [list(range(s, min(s + chunk_size, n))) for s in range(0, n, chunk_size)]
+
+    try:
+        from core.embeddings import embed_text
+        from core.linking import _bytes_to_floats
+        from core.clustering import balance_chunks, cluster_by_embeddings
+    except Exception:  # noqa: BLE001
+        return _index_slices()
+
+    vecs: list = []
+    embeddable: list[int] = []
+    failed: list[int] = []
+    for i, block in enumerate(blocks):
+        eb = embed_text(block)
+        if eb is None:
+            failed.append(i)
+        else:
+            vecs.append(_bytes_to_floats(eb))
+            embeddable.append(i)
+
+    if not vecs:
+        return _index_slices()
+
+    groups: list[list[int]] = [
+        sorted(embeddable[k] for k in cluster)
+        for cluster in cluster_by_embeddings(vecs, threshold=0.5)
+    ]
+    groups.extend([i] for i in failed)
+
+    balanced = [sorted(g) for g in balance_chunks(groups, chunk_size)]
+    balanced.sort(key=lambda g: g[0] if g else 0)
+    return balanced
 
 
 def _split_observation_blocks(content: str) -> list[str]:

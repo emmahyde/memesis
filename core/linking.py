@@ -44,7 +44,7 @@ LINK_AUTO_PROMOTE_THRESHOLD: float = float(os.environ.get("MEMESIS_AUTO_PROMOTE_
 # LLM duplicate-confirmation call. The LLM pass fires only when a near-miss
 # exists, so cost stays bounded — most KEEPs have no candidate in the band.
 LINK_LLM_REVIEW_FLOOR: float = float(os.environ.get("MEMESIS_DEDUP_LLM_FLOOR", "0.70"))
-LINK_MAX_NEIGHBORS: int = 3
+LINK_MAX_NEIGHBORS: int = 5
 LINK_MIN_NEIGHBORS: int = 0  # may return empty list
 
 _TRACE_PATH = Path(
@@ -377,6 +377,35 @@ def link_memory(memory, db_session=None) -> list[str]:
         memory.save()
     except Exception as exc:
         logger.warning("Could not save linked_observation_ids for %s: %s", memory.id, exc)
+
+    # Emit bidirectional similar edges in memory_edges for each linked pair.
+    # These are incremental edges (not rebuilt by compute_edges) and are
+    # resolution_state=resolved — similar edges need no LLM review.
+    if selected_entries:
+        from .models import MemoryEdge
+        mid_str = str(memory.id)
+        for entry in selected_entries:
+            lid = entry["id"]
+            score = entry["score"]
+            for src, tgt in [(mid_str, lid), (lid, mid_str)]:
+                exists = (
+                    MemoryEdge.select()
+                    .where(
+                        MemoryEdge.source_id == src,
+                        MemoryEdge.target_id == tgt,
+                        MemoryEdge.edge_type == "similar",
+                    )
+                    .count()
+                )
+                if not exists:
+                    MemoryEdge.create(
+                        source_id=src,
+                        target_id=tgt,
+                        edge_type="similar",
+                        weight=round(score, 4),
+                        resolution_state="resolved",
+                        metadata=json.dumps({"cosine": round(score, 4), "source": "cosine_linking"}),
+                    )
 
     # Observability trace
     _emit_trace(

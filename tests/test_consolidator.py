@@ -135,8 +135,8 @@ class TestConsolidateKeep:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-001")
 
         assert len(result["kept"]) == 1
@@ -164,8 +164,8 @@ class TestConsolidateKeep:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-002")
 
         assert len(result["kept"]) == 1
@@ -186,8 +186,8 @@ class TestConsolidateKeep:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-003")
 
         memory_id = result["kept"][0]
@@ -220,8 +220,8 @@ class TestConsolidatePrune:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-004")
 
         assert result["pruned"] == [
@@ -257,8 +257,8 @@ class TestConsolidatePrune:
                 "target_path": None, "reinforces": None, "contradicts": None,
             },
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-005")
 
         assert len(result["pruned"]) == 2
@@ -288,8 +288,8 @@ class TestConsolidatePromote:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-006")
 
         assert result["promoted"] == [mem.id]
@@ -308,8 +308,8 @@ class TestConsolidatePromote:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-008")
 
         assert result["promoted"] == []
@@ -327,8 +327,8 @@ class TestConsolidatePromote:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-009")
 
         assert result["promoted"] == []
@@ -359,8 +359,10 @@ class TestConsolidateConflicts:
                 "contradicts": mem.id,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_batch, \
+             patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_batch.return_value = [_llm_response_text(decisions)]
+            mock_transport.return_value = "not valid json"  # resolution skipped
             result = consolidator.consolidate_session(ephemeral_file, "sess-010")
 
         assert len(result["conflicts"]) == 1
@@ -381,8 +383,8 @@ class TestConsolidateConflicts:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-011")
 
         assert result["conflicts"] == []
@@ -409,22 +411,21 @@ class TestMalformedJsonHandling:
                 }
             ]
         )
-        bad_text = "This is not JSON at all."
-
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = [bad_text, good_text]
+        # Bad JSON chunk is skipped gracefully; no retry in the batch path.
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = ["not json at all"]
             result = consolidator.consolidate_session(ephemeral_file, "sess-013")
 
-        assert len(result["kept"]) == 1
-        assert mock_transport.call_count == 2
+        # Chunk skipped → 0 kept, no exception
+        assert len(result["kept"]) == 0
 
-    def test_raises_on_two_consecutive_bad_responses(self, consolidator, ephemeral_file):
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = "not json"
-            with pytest.raises(ValueError, match="malformed JSON on both attempts"):
-                consolidator.consolidate_session(ephemeral_file, "sess-014")
+    def test_all_chunks_bad_json_produces_empty_result(self, consolidator, ephemeral_file):
+        # The batch path skips bad chunks — no ValueError raised.
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = ["not json"]
+            result = consolidator.consolidate_session(ephemeral_file, "sess-014")
 
-        assert mock_transport.call_count == 2
+        assert len(result["kept"]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +454,8 @@ class TestMixedDecisions:
                 "target_path": None, "reinforces": None, "contradicts": None,
             },
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-015")
 
         assert len(result["kept"]) == 1
@@ -497,8 +498,8 @@ class TestMixedDecisions:
                 "contradicts": None,
             },
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-016")
 
         assert len(result["kept"]) == 1
@@ -548,11 +549,10 @@ class TestContradictionResolution:
             }
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = [
-                _llm_response_text(decisions),
-                _resolution_response_text(MOCK_RESOLUTION),
-            ]
+        with patch("core.consolidator._call_llm_batch") as mock_batch, \
+             patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_batch.return_value = [_llm_response_text(decisions)]
+            mock_transport.return_value = _resolution_response_text(MOCK_RESOLUTION)
             result = consolidator.consolidate_session(ephemeral_file, "sess-020")
 
         assert len(result["resolved"]) == 1
@@ -586,11 +586,10 @@ class TestContradictionResolution:
 
         low_confidence = {**MOCK_RESOLUTION, "confidence": 0.2}
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = [
-                _llm_response_text(decisions),
-                _resolution_response_text(low_confidence),
-            ]
+        with patch("core.consolidator._call_llm_batch") as mock_batch, \
+             patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_batch.return_value = [_llm_response_text(decisions)]
+            mock_transport.return_value = _resolution_response_text(low_confidence)
             result = consolidator.consolidate_session(ephemeral_file, "sess-021")
 
         assert len(result["conflicts"]) == 1
@@ -620,11 +619,10 @@ class TestContradictionResolution:
             }
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = [
-                _llm_response_text(decisions),
-                _resolution_response_text(MOCK_RESOLUTION),
-            ]
+        with patch("core.consolidator._call_llm_batch") as mock_batch, \
+             patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_batch.return_value = [_llm_response_text(decisions)]
+            mock_transport.return_value = _resolution_response_text(MOCK_RESOLUTION)
             result = consolidator.consolidate_session(ephemeral_file, "sess-022")
 
         rows = list(
@@ -653,8 +651,8 @@ class TestContradictionResolution:
             }
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-023")
 
         assert len(result["conflicts"]) == 1
@@ -681,11 +679,10 @@ class TestContradictionResolution:
             }
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = [
-                _llm_response_text(decisions),
-                "not json at all",
-            ]
+        with patch("core.consolidator._call_llm_batch") as mock_batch, \
+             patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_batch.return_value = [_llm_response_text(decisions)]
+            mock_transport.return_value = "not json at all"
             result = consolidator.consolidate_session(ephemeral_file, "sess-024")
 
         assert len(result["conflicts"]) == 1
@@ -706,8 +703,8 @@ class TestContradictionResolution:
             }
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "sess-025")
 
         assert result["resolved"] == []
@@ -741,11 +738,10 @@ class TestContradictionResolution:
             "confidence": 0.9,
         }
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = [
-                _llm_response_text(decisions),
-                _resolution_response_text(superseded_resolution),
-            ]
+        with patch("core.consolidator._call_llm_batch") as mock_batch, \
+             patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_batch.return_value = [_llm_response_text(decisions)]
+            mock_transport.return_value = _resolution_response_text(superseded_resolution)
             result = consolidator.consolidate_session(ephemeral_file, "sess-030")
 
         assert len(result["resolved"]) == 1
@@ -793,11 +789,10 @@ class TestContradictionResolution:
             "confidence": 0.85,
         }
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.side_effect = [
-                _llm_response_text(decisions),
-                _resolution_response_text(scoped_resolution),
-            ]
+        with patch("core.consolidator._call_llm_batch") as mock_batch, \
+             patch("core.consolidator._call_llm_transport") as mock_transport:
+            mock_batch.return_value = [_llm_response_text(decisions)]
+            mock_transport.return_value = _resolution_response_text(scoped_resolution)
             result = consolidator.consolidate_session(ephemeral_file, "sess-031")
 
         assert len(result["resolved"]) == 1
@@ -840,8 +835,8 @@ class TestCardToMemoryPromotion:
 
     def test_temporal_scope_promoted(self, consolidator, base, ephemeral_file):
         decision = self._card_decision(scope="cross-session-durable")
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "card-001")
 
         assert len(result["kept"]) == 1
@@ -850,8 +845,8 @@ class TestCardToMemoryPromotion:
 
     def test_confidence_promoted_high(self, consolidator, base, ephemeral_file):
         decision = self._card_decision(knowledge_type_confidence="high")
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "card-002")
 
         assert len(result["kept"]) == 1
@@ -860,8 +855,8 @@ class TestCardToMemoryPromotion:
 
     def test_affect_valence_promoted(self, consolidator, base, ephemeral_file):
         decision = self._card_decision(user_affect_valence="friction")
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "card-003")
 
         assert len(result["kept"]) == 1
@@ -872,8 +867,8 @@ class TestCardToMemoryPromotion:
         decision = self._card_decision(
             evidence_quotes=["Emma approved the design."],
         )
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "card-004")
 
         assert len(result["kept"]) == 1
@@ -882,8 +877,8 @@ class TestCardToMemoryPromotion:
 
     def test_actor_null_when_no_quote(self, consolidator, base, ephemeral_file):
         decision = self._card_decision(evidence_quotes=[])
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "card-005")
 
         assert len(result["kept"]) == 1
@@ -904,8 +899,8 @@ class TestCardToMemoryPromotion:
             "contradicts": None,
             # No scope, evidence_quotes — not a card
         }
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "card-006")
 
         assert len(result["kept"]) == 1
@@ -948,8 +943,8 @@ class TestCardImportance:
     def test_card_importance_flows_from_card_dict(self, consolidator, base, ephemeral_file):
         """Card decision uses card.importance as base, not somatic boost-based formula."""
         decision = self._card_decision(importance=0.8, user_affect_valence="neutral")
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cimp-001")
 
         assert len(result["kept"]) == 1
@@ -960,8 +955,8 @@ class TestCardImportance:
     def test_friction_valence_triggers_kensinger_bump(self, consolidator, base, ephemeral_file):
         """Card with affect_valence=friction gets +0.05 Kensinger bump."""
         decision = self._card_decision(importance=0.8, user_affect_valence="friction")
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cimp-002")
 
         assert len(result["kept"]) == 1
@@ -971,8 +966,8 @@ class TestCardImportance:
     def test_non_friction_card_does_not_get_kensinger_bump(self, consolidator, base, ephemeral_file):
         """Card with affect_valence=delight does NOT get the +0.05 bump."""
         decision = self._card_decision(importance=0.8, user_affect_valence="delight")
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cimp-003")
 
         assert len(result["kept"]) == 1
@@ -995,8 +990,8 @@ class TestCardImportance:
         core_logger = logging.getLogger("core.consolidator")
         core_logger.addHandler(handler)
         try:
-            with patch("core.consolidator._call_llm_transport") as mock_transport:
-                mock_transport.return_value = _llm_response_text([decision])
+            with patch("core.consolidator._call_llm_batch") as mock_transport:
+                mock_transport.return_value = [_llm_response_text([decision])]
                 result = consolidator.consolidate_session(ephemeral_file, "cimp-004")
         finally:
             core_logger.removeHandler(handler)
@@ -1026,8 +1021,8 @@ class TestCardImportance:
             # No card-shape fields (no scope, no evidence_quotes)
             "importance": 0.8,  # this value must NOT flow through for non-card
         }
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cimp-005")
 
         assert len(result["kept"]) == 1
@@ -1080,8 +1075,8 @@ class TestCardFieldsNewWiring:
     def test_criterion_weights_stored_as_json(self, consolidator, base, ephemeral_file):
         """criterion_weights from card decision stored as JSON string on Memory."""
         decision = self._decision_card()
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cfw-001")
 
         assert len(result["kept"]) == 1
@@ -1094,8 +1089,8 @@ class TestCardFieldsNewWiring:
     def test_rejected_options_stored_as_json(self, consolidator, base, ephemeral_file):
         """rejected_options from card decision stored as JSON string on Memory."""
         decision = self._decision_card()
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cfw-002")
 
         assert len(result["kept"]) == 1
@@ -1108,8 +1103,8 @@ class TestCardFieldsNewWiring:
         """json.loads(mem.criterion_weights) returns the original dict exactly."""
         cw = {"latency": "hard_veto", "cost": "strong", "dx": "mentioned"}
         decision = self._decision_card(criterion_weights=cw)
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cfw-003")
 
         mem = Memory.get_by_id(result["kept"][0])
@@ -1118,8 +1113,8 @@ class TestCardFieldsNewWiring:
     def test_affect_valence_neutral_default_for_card(self, consolidator, base, ephemeral_file):
         """Card decision with no explicit valence (or neutral) stores affect_valence='neutral'."""
         decision = self._decision_card(user_affect_valence="neutral")
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cfw-004")
 
         assert len(result["kept"]) == 1
@@ -1130,8 +1125,8 @@ class TestCardFieldsNewWiring:
         """Card decision without criterion_weights stores NULL (not empty JSON)."""
         decision = self._decision_card()
         del decision["criterion_weights"]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cfw-005")
 
         mem = Memory.get_by_id(result["kept"][0])
@@ -1141,8 +1136,8 @@ class TestCardFieldsNewWiring:
         """Card decision without rejected_options stores NULL (not empty JSON)."""
         decision = self._decision_card()
         del decision["rejected_options"]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text([decision])
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text([decision])]
             result = consolidator.consolidate_session(ephemeral_file, "cfw-006")
 
         mem = Memory.get_by_id(result["kept"][0])
@@ -1166,7 +1161,7 @@ class TestPydanticValidation:
                 "rationale": "Should fail.",
             }
         ]})
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
             mock_transport.return_value = bad_response
             # Invalid actions are now skipped per-decision (graceful degradation),
             # not raised as exceptions for the whole batch.
@@ -1189,8 +1184,8 @@ class TestPydanticValidation:
                 "contradicts": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "pydantic-002")
 
         assert len(result["kept"]) == 1
@@ -1217,8 +1212,8 @@ class TestPydanticValidation:
                 "contradicts": None,
             },
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "pydantic-003")
 
         # The promote decision is dropped because the ID doesn't exist.
@@ -1242,8 +1237,8 @@ class TestPydanticValidation:
                 "contradicts": "00000000-0000-4000-8000-000000000001",
             },
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "pydantic-004")
 
         # The keep action still creates a memory; conflict tracked but resolution skipped
@@ -1275,8 +1270,10 @@ class TestPendingDelete:
                 "reinforces": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport, \
+             patch("core.consolidator._call_llm_transport") as _mock_resolution:
+            mock_transport.return_value = [_llm_response_text(decisions)]
+            _mock_resolution.return_value = "not json"  # skip resolution
             consolidator.consolidate_session(ephemeral_file, "pd-001")
 
         updated = Memory.get_by_id(existing.id)
@@ -1298,8 +1295,10 @@ class TestPendingDelete:
                 "reinforces": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport, \
+             patch("core.consolidator._call_llm_transport") as _mock_resolution:
+            mock_transport.return_value = [_llm_response_text(decisions)]
+            _mock_resolution.return_value = "not json"  # skip resolution
             consolidator.consolidate_session(ephemeral_file, "pd-002")
 
         rows = list(
@@ -1325,8 +1324,8 @@ class TestPendingDelete:
                 "reinforces": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result = consolidator.consolidate_session(ephemeral_file, "pd-003")
 
         # Falls back to prune behavior (logged, no memory created)
@@ -1349,8 +1348,10 @@ class TestPendingDelete:
                 "reinforces": None,
             }
         ]
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport, \
+             patch("core.consolidator._call_llm_transport") as _mock_resolution:
+            mock_transport.return_value = [_llm_response_text(decisions)]
+            _mock_resolution.return_value = "not json"  # skip resolution
             consolidator.consolidate_session(ephemeral_file, "pd-004")
 
         # Memory must still exist
@@ -1393,19 +1394,19 @@ class TestBatchConcurrency:
 
         call_count = []
 
-        def _side_effect(prompt, **kwargs):
+        def _side_effect(prompts, **kwargs):
             call_count.append(1)
             # Second call (bad session) raises
             if len(call_count) == 2:
                 raise RuntimeError("Simulated LLM failure")
-            return good_response
+            return [good_response]
 
         sessions = [
             (str(good_file), "batch-good"),
             (str(bad_file), "batch-bad"),
         ]
 
-        with patch("core.consolidator._call_llm_transport", side_effect=_side_effect):
+        with patch("core.consolidator._call_llm_batch", side_effect=_side_effect):
             results = consolidator.consolidate_batch(sessions)
 
         assert len(results) == 2
@@ -1423,7 +1424,7 @@ class TestBatchConcurrency:
         f = tmp_path / "fail.md"
         f.write_text("- Observation.\n", encoding="utf-8")
 
-        with patch("core.consolidator._call_llm_transport", side_effect=RuntimeError("boom")):
+        with patch("core.consolidator._call_llm_batch", side_effect=RuntimeError("boom")):
             results = consolidator.consolidate_batch([(str(f), "fail-sess")])
 
         assert len(results) == 1
@@ -1460,7 +1461,7 @@ class TestBatchConcurrency:
         active = [0]
         lock = threading.Lock()
 
-        def _side_effect(prompt, **kwargs):
+        def _side_effect(prompts, **kwargs):
             with lock:
                 active[0] += 1
                 concurrent_peak[0] = max(concurrent_peak[0], active[0])
@@ -1469,11 +1470,11 @@ class TestBatchConcurrency:
             _time.sleep(0.01)
             with lock:
                 active[0] -= 1
-            return _llm_response_text([decisions[0]])
+            return [_llm_response_text([decisions[0]])]
 
         sessions = [(str(f), f"sem-{i}") for i, f in enumerate(files)]
 
-        with patch("core.consolidator._call_llm_transport", side_effect=_side_effect):
+        with patch("core.consolidator._call_llm_batch", side_effect=_side_effect):
             results = consolidator.consolidate_batch(sessions)
 
         assert len(results) == n
@@ -1511,14 +1512,14 @@ class TestIdempotency:
             }
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             # Use a UNIQUE session_id for first call
             result1 = consolidator.consolidate_session(ephemeral_file, "idem-same-sess")
 
         # Same decisions again with THE SAME session_id → idempotency key matches → skipped
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             result2 = consolidator.consolidate_session(ephemeral_file, "idem-same-sess")
 
         assert len(result1["kept"]) == 1
@@ -1544,8 +1545,8 @@ class TestIdempotency:
         c1 = Consolidator(lifecycle=lifecycle, model="claude-sonnet-4-6")
         c2 = Consolidator(lifecycle=lifecycle, model="claude-sonnet-4-6")
 
-        with patch("core.consolidator._call_llm_transport") as mock_transport:
-            mock_transport.return_value = _llm_response_text(decisions)
+        with patch("core.consolidator._call_llm_batch") as mock_transport:
+            mock_transport.return_value = [_llm_response_text(decisions)]
             r1 = c1.consolidate_session(ephemeral_file, "idem-002a")
 
         # Different instance — fresh _processed_keys
@@ -1867,8 +1868,8 @@ class TestObsIdsHappyPath:
             },
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_llm:
-            mock_llm.return_value = json.dumps({"decisions": decisions})
+        with patch("core.consolidator._call_llm_batch") as mock_llm:
+            mock_llm.return_value = [json.dumps({"decisions": decisions})]
             result = consolidator.consolidate_session(ep, "sess-obsids-001")
 
         assert len(result["kept"]) == 1
@@ -1908,8 +1909,8 @@ class TestObsIdsHappyPath:
             },
         ]
 
-        with patch("core.consolidator._call_llm_transport") as mock_llm:
-            mock_llm.return_value = json.dumps({"decisions": decisions})
+        with patch("core.consolidator._call_llm_batch") as mock_llm:
+            mock_llm.return_value = [json.dumps({"decisions": decisions})]
             result = consolidator.consolidate_session(ep, "sess-obsids-002")
 
         assert len(result["kept"]) == 1

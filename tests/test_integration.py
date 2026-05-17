@@ -142,8 +142,8 @@ class TestFullLifecycleEphemeralToCrystallized:
             session1_file = tmp_path / "session1.md"
             _write_ephemeral(tmp_path, "session1.md", n_obs=10)
 
-            with patch("core.consolidator._call_llm_transport",
-                       return_value=json.dumps({"decisions": _mock_decisions(2, 8)})), \
+            with patch("core.consolidator._call_llm_batch",
+                       return_value=[json.dumps({"decisions": _mock_decisions(2, 8)})]), \
                  patch("core.consolidator.auto_promote_if_dupe", return_value=None):
                 result = consolidator.consolidate_session(str(session1_file), "session-1")
 
@@ -162,8 +162,8 @@ class TestFullLifecycleEphemeralToCrystallized:
 
                 promote_decisions = _promote_decisions_for(kept_ids)
 
-                with patch("core.consolidator._call_llm_transport",
-                           return_value=json.dumps({"decisions": promote_decisions})), \
+                with patch("core.consolidator._call_llm_batch",
+                           return_value=[json.dumps({"decisions": promote_decisions})]), \
                      patch.object(lifecycle, "can_promote",
                                   return_value=(False, "skipped — explicit promotion tested below")):
                     result = consolidator.consolidate_session(
