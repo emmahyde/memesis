@@ -126,6 +126,19 @@ def _apply_py(conn, path: Path) -> None:
     module.up(conn)
 
 
+def migrations_pending(conn) -> bool:
+    """Return True if any migration file is not yet recorded as applied.
+
+    A cheap, DDL-free check (beyond the idempotent ``CREATE TABLE IF NOT
+    EXISTS`` for the tracking table). Callers use it to skip the locking
+    run_migrations() path entirely when the schema is already current — which
+    is the overwhelmingly common case and removes the concurrent-DDL race.
+    """
+    _ensure_migrations_table(conn)
+    applied = _applied_versions(conn)
+    return any(path.stem not in applied for path in _migration_files())
+
+
 def run_migrations(conn, seed_threshold: int = SEED_THRESHOLD) -> None:
     """
     Apply pending migrations to the database.

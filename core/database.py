@@ -6,7 +6,10 @@ defined in core.models, create tables, run migrations, and initialise the
 VecStore singleton.
 """
 
+import contextlib
+import fcntl
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -26,6 +29,8 @@ from .models import (
     Observation,
     RetrievalLog,
     RetrievalCandidate,
+    Rule,
+    SessionDigest,
     ThreadMember,
     db,
 )
@@ -50,6 +55,8 @@ ALL_TABLES = [
     AffectLog,
     EvalRun,
     MemoryEmbedding,
+    Rule,
+    SessionDigest,
 ]
 
 
@@ -71,6 +78,28 @@ def _resolve_db_path(project_context: str = None, base_dir: str = None) -> tuple
         bd = Path.home() / ".claude" / "memory"
 
     return bd, bd / "index.db"
+
+
+@contextlib.contextmanager
+def _migration_lock(db_path: Path):
+    """Exclusive cross-process lock around the migration run.
+
+    Multiple processes (the hourly cron, session hooks, the PreToolUse guard)
+    each call init_db(). Without serialisation they can execute schema DDL
+    concurrently — WAL serialises row writers but not multi-statement DDL plus
+    schema-cache reads, which leaves a partial/stale schema (observed
+    corruption). flock() on a sibling lock file serialises the migration run.
+    """
+    lock_path = db_path.with_name(db_path.name + ".migrate.lock")
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def init_db(
@@ -128,28 +157,63 @@ def init_db(
         },
     )
 
-    # Create tables (safe_create=True → IF NOT EXISTS)
-    db.create_tables(ALL_TABLES, safe=True)
+    # All schema DDL — create_tables, the FTS5 virtual table, and the
+    # migration run — happens under one exclusive cross-process lock.
+    # Concurrent callers (the cron, session hooks, the PreToolUse guard) would
+    # otherwise issue DDL simultaneously and race the schema cache or hit
+    # "database is locked". Serialised, the first caller does the real work and
+    # every later caller's DDL collapses to a cheap idempotent no-op.
+    from .migrations import migrations_pending as _pending, run_migrations as _run_mig
+    with _migration_lock(dp):
+        # Create tables (safe=True → IF NOT EXISTS)
+        db.create_tables(ALL_TABLES, safe=True)
 
-    # FTS5 virtual table
-    _create_fts_table()
+        # FTS5 virtual table
+        _create_fts_table()
 
-    # Schema migrations via core.migrations runner (RISK-10).
-    # Fresh DB: user_version is 0 (SQLite default) after create_tables, but all
-    # columns already exist in the model, so we bump to _SCHEMA_VERSION first so
-    # the runner seeds (records without re-executing) all migration files.
-    _cursor = db.execute_sql("PRAGMA user_version")
-    if _cursor.fetchone()[0] == 0:
-        db.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        # Fresh DB: user_version is 0 (SQLite default) after create_tables, but
+        # all columns already exist in the model, so we bump to _SCHEMA_VERSION
+        # first so the runner seeds (records without re-executing) all files.
+        _cursor = db.execute_sql("PRAGMA user_version")
+        if _cursor.fetchone()[0] == 0:
+            db.execute_sql(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
-    from .migrations import run_migrations as _run_mig
-    _run_mig(db)
+        # Run migrations only when something is actually pending.
+        if _pending(db):
+            _run_mig(db)
 
     # VecStore
     from .vec import VecStore
 
     _vec_store = VecStore(dp)
 
+    return bd
+
+
+def connect_light(base_dir: str = None) -> Path:
+    """Bind the Peewee db without running create_tables or migrations.
+
+    For high-frequency callers (the PreToolUse guard) that read existing
+    tables and at most write a counter. They must not run create_tables or
+    migrations on every invocation — that would add another concurrent DDL
+    writer on every tool call. Row writes are still fine (WAL + busy_timeout).
+    Assumes the schema already exists (a session is already running); callers
+    must fail open if it does not.
+
+    Returns the resolved base_dir Path.
+    """
+    global _db_path, _base_dir
+    bd, dp = _resolve_db_path(base_dir=base_dir)
+    _base_dir = bd
+    _db_path = dp
+    db.init(
+        str(dp),
+        pragmas={
+            "journal_mode": "wal",
+            "synchronous": "normal",
+            "busy_timeout": 5000,
+        },
+    )
     return bd
 
 

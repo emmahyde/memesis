@@ -399,3 +399,60 @@ class TestInitDbIntegration:
             init_db(base_dir=str(tmp_path))
         finally:
             close_db()
+
+
+def _init_db_worker(base_dir, ready, result_q):
+    """Subprocess entry point: barrier-sync with siblings, then call init_db.
+
+    Lives at module scope so the spawn start method can pickle it.
+    """
+    try:
+        ready.wait(timeout=15)
+        from core.database import close_db, init_db
+        init_db(base_dir=base_dir)
+        close_db()
+        result_q.put(("ok", None))
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the parent
+        result_q.put(("err", repr(exc)))
+
+
+class TestConcurrentInitDb:
+    """Phase 0 — init_db() must be safe when several processes race on it."""
+
+    def test_migrations_pending_flips_after_run(self, empty_db):
+        from core.migrations import migrations_pending, run_migrations
+        assert migrations_pending(empty_db) is True
+        run_migrations(empty_db, seed_threshold=2)
+        assert migrations_pending(empty_db) is False
+
+    def test_concurrent_init_db_no_corruption(self, tmp_path):
+        """Four processes calling init_db() at once must not corrupt the DB."""
+        import multiprocessing as mp
+
+        base_dir = str(tmp_path / "memory")
+        ctx = mp.get_context("spawn")
+        ready = ctx.Barrier(4)
+        result_q = ctx.Queue()
+        procs = [
+            ctx.Process(target=_init_db_worker, args=(base_dir, ready, result_q))
+            for _ in range(4)
+        ]
+        for p in procs:
+            p.start()
+        results = [result_q.get(timeout=45) for _ in procs]
+        for p in procs:
+            p.join(timeout=10)
+
+        assert all(status == "ok" for status, _ in results), results
+
+        from core.database import close_db, init_db
+        from core.migrations import _migration_files
+        from core.models import db as peewee_db
+        try:
+            init_db(base_dir=base_dir)
+            # Every migration recorded exactly once — no duplication, no gaps.
+            assert _applied(peewee_db) == {p.stem for p in _migration_files()}
+            integrity = peewee_db.execute_sql("PRAGMA integrity_check").fetchone()[0]
+            assert integrity == "ok"
+        finally:
+            close_db()
