@@ -26,6 +26,7 @@ via `call_llm_batch`.
 
 import asyncio
 import hashlib
+import json
 import os
 import sys
 import shutil
@@ -37,6 +38,7 @@ import anthropic
 try:  # optional — only used on the OAuth subscription path
     from claude_agent_sdk import ClaudeAgentOptions, query as _agent_query
     from claude_agent_sdk.types import ResultMessage
+
     _AGENT_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover
     ClaudeAgentOptions = None  # type: ignore[assignment]
@@ -83,6 +85,7 @@ def _load_system_prompt(spec: str | None) -> tuple[str, str] | None:
 try:
     from core.trace import get_active_writer
 except ImportError:  # pragma: no cover
+
     def get_active_writer() -> None:  # type: ignore[misc]
         return None
 
@@ -93,6 +96,7 @@ def _emit_llm_envelope(
     input_tokens: Optional[int],
     output_tokens: Optional[int],
     response_chars: int,
+    cache_read_input_tokens: Optional[int] = None,
 ) -> None:
     """Emit an ``llm_envelope`` trace event if a TraceWriter is active.
 
@@ -103,7 +107,9 @@ def _emit_llm_envelope(
         if writer is None:
             return
         model_key = model if model is not None else ""
-        prompt_hash = hashlib.sha256((model_key + prompt).encode("utf-8")).hexdigest()[:16]
+        prompt_hash = hashlib.sha256((model_key + prompt).encode("utf-8")).hexdigest()[
+            :16
+        ]
         writer.emit(
             stage="llm",
             event="llm_envelope",
@@ -112,6 +118,7 @@ def _emit_llm_envelope(
                 "model": model_key or DEFAULT_MODEL,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
                 "response_chars": response_chars,
             },
         )
@@ -145,7 +152,9 @@ def _repair_json(raw: str, drop_stats: dict | None = None) -> str | None:
     try:
         _json.loads(cleaned)
         if drop_stats is not None:
-            drop_stats["parse_errors_repaired"] = drop_stats.get("parse_errors_repaired", 0) + 1
+            drop_stats["parse_errors_repaired"] = (
+                drop_stats.get("parse_errors_repaired", 0) + 1
+            )
         return cleaned
     except _json.JSONDecodeError:
         pass
@@ -228,7 +237,7 @@ def _call_via_claude_cli(
     max_attempts: int = 3,
     backoff_base: float = 2.0,
     system_prompt_path: str | None = None,
-) -> str:
+) -> tuple[str, int | None, int | None, int | None]:
     """Call `claude -p` subprocess using OAuth subscription credentials.
 
     The subprocess inherits the parent env minus ANTHROPIC_API_KEY and
@@ -240,6 +249,7 @@ def _call_via_claude_cli(
 
     Retries with exponential backoff on rc!=0 — the OAuth path can
     transiently fail under burst load (rate-limit, token-refresh races).
+    Returns (text, input_tokens, output_tokens, cache_read_input_tokens).
     """
     import time
 
@@ -249,12 +259,17 @@ def _call_via_claude_cli(
             "cannot reach the Anthropic API."
         )
 
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+    }
 
     argv = [
-        "claude", "-p",
-        "--output-format", "text",
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
         "--disable-slash-commands",
         "--disallowed-tools",
         "Bash Edit Write Read Glob Grep Task WebFetch WebSearch",
@@ -274,10 +289,47 @@ def _call_via_claude_cli(
             timeout=timeout,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout
+            try:
+                payload = json.loads(proc.stdout)
+                text = ""
+                usage: dict | None = None
+                if isinstance(payload, dict):
+                    text = (
+                        payload.get("result")
+                        or payload.get("text")
+                        or payload.get("output")
+                        or ""
+                    )
+                    usage_obj = payload.get("usage")
+                    if isinstance(usage_obj, dict):
+                        usage = usage_obj
+                elif isinstance(payload, list):
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        if not text and isinstance(item.get("result"), str):
+                            text = item["result"]
+                        if not text and isinstance(item.get("text"), str):
+                            text = item["text"]
+                        usage_obj = item.get("usage")
+                        if isinstance(usage_obj, dict):
+                            usage = usage_obj
+                            break
+                if text:
+                    in_toks = usage.get("input_tokens") if usage else None
+                    out_toks = usage.get("output_tokens") if usage else None
+                    cache_read_toks = (
+                        usage.get("cache_read_input_tokens") if usage else None
+                    )
+                    return text, in_toks, out_toks, cache_read_toks
+            except json.JSONDecodeError:
+                if proc.stdout.strip():
+                    return proc.stdout, None, None, None
+            if proc.stdout.strip():
+                return proc.stdout, None, None, None
         last_err = (proc.stderr.strip() or proc.stdout.strip())[:500]
         if attempt < max_attempts:
-            time.sleep(backoff_base ** attempt)
+            time.sleep(backoff_base**attempt)
     raise RuntimeError(
         f"claude -p subprocess failed after {max_attempts} attempts "
         f"(last rc={proc.returncode}): {last_err}"
@@ -292,13 +344,15 @@ def _strip_oauth_env() -> dict[str, str]:
     the parent env force API-key mode and break OAuth-only login.
     """
     return {
-        k: v for k, v in os.environ.items()
+        k: v
+        for k, v in os.environ.items()
         if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
     }
 
 
 async def _call_via_agent_sdk(
-    prompt: str, system_prompt: str | None = None,
+    prompt: str,
+    system_prompt: str | None = None,
 ) -> tuple[str, int | None, int | None]:
     """Single-shot LLM call via claude-agent-sdk on OAuth credentials.
 
@@ -343,9 +397,7 @@ async def _call_via_agent_sdk(
                 # ResultMessage.result holds the final assistant text in
                 # current SDK versions; older builds expose .text. Try both.
                 result_text = (
-                    getattr(msg, "result", None)
-                    or getattr(msg, "text", None)
-                    or ""
+                    getattr(msg, "result", None) or getattr(msg, "text", None) or ""
                 )
                 usage = getattr(msg, "usage", None)
                 if isinstance(usage, dict):
@@ -383,7 +435,8 @@ async def call_llm_async(
     if not use_bedrock and not _have_api_key() and _AGENT_SDK_AVAILABLE:
         _sp = _load_system_prompt(system_prompt_file)
         raw_text, in_toks, out_toks = await _call_via_agent_sdk(
-            prompt, _sp[1] if _sp else None,
+            prompt,
+            _sp[1] if _sp else None,
         )
         result = strip_markdown_fences(raw_text)
         _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
@@ -428,7 +481,10 @@ def call_llm_batch(
         async with sem:
             try:
                 return await call_llm_async(
-                    p, max_tokens=max_tokens, temperature=temperature, model=model,
+                    p,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    model=model,
                     system_prompt_file=system_prompt_file,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -495,9 +551,18 @@ def call_llm(
                 # Fall through to subprocess path in that case.
                 if "asyncio.run" not in str(exc) and "running" not in str(exc).lower():
                     raise
-        raw = _call_via_claude_cli(prompt, system_prompt_path=_sp_path)
+        raw, in_toks, out_toks, cache_read_toks = _call_via_claude_cli(
+            prompt, system_prompt_path=_sp_path
+        )
         result = strip_markdown_fences(raw)
-        _emit_llm_envelope(model, prompt, None, None, len(result))
+        _emit_llm_envelope(
+            model,
+            prompt,
+            in_toks,
+            out_toks,
+            len(result),
+            cache_read_input_tokens=cache_read_toks,
+        )
         return result
 
     client = _make_client()

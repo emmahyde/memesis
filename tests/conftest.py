@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -27,36 +28,54 @@ _REAL_HOME = os.environ.get("HOME", os.path.expanduser("~"))
 _REAL_MEMORY_DB = Path(_REAL_HOME) / ".claude" / "memory" / "index.db"
 
 
-def _real_store_fingerprint():
-    """Size+mtime of the real memory DB and its WAL sidecars, or None each."""
-    parts = []
-    for suffix in ("", "-wal", "-shm"):
-        p = Path(str(_REAL_MEMORY_DB) + suffix)
-        if p.exists():
-            st = p.stat()
-            parts.append((st.st_size, st.st_mtime_ns))
-        else:
-            parts.append(None)
-    return tuple(parts)
+@pytest.fixture(autouse=True)
+def _redirect_home_to_tmp(monkeypatch, tmp_path):
+    """Default HOME to a per-test temp dir so global DB path stays isolated."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
+def _is_real_home(value: str | None) -> bool:
+    """Return True when HOME points at the real user home directory."""
+    if not value:
+        return False
+    try:
+        return (
+            Path(value).expanduser().resolve()
+            == Path(_REAL_HOME).expanduser().resolve()
+        )
+    except Exception:
+        return Path(value).expanduser() == Path(_REAL_HOME).expanduser()
 
 
 @pytest.fixture(autouse=True)
-def _guard_real_memory_store():
-    """Fail any test that mutates the real ~/.claude/memory store.
+def _guard_subprocess_home(monkeypatch):
+    """Fail fast if a test subprocess attempts to use the real HOME."""
+    orig_run = subprocess.run
+    orig_popen = subprocess.Popen
 
-    The pollution vector is hook subprocesses inheriting the real HOME.
-    Detection here pinpoints the offending test instead of letting test
-    rows accumulate silently in the production DB (CLAUDE.md Rule 3).
-    """
-    before = _real_store_fingerprint()
-    yield
-    after = _real_store_fingerprint()
-    if before != after:
-        pytest.fail(
-            f"Test mutated the real memory store at {_REAL_MEMORY_DB}. "
-            "Redirect HOME to a tmp_path before running code that resolves "
-            "the memory store (see CLAUDE.md Rule 3)."
+    def _assert_safe_home(kwargs):
+        env = kwargs.get("env")
+        home = (
+            os.environ.get("HOME")
+            if env is None
+            else env.get("HOME", os.environ.get("HOME"))
         )
+        if _is_real_home(home):
+            pytest.fail(
+                "Subprocess attempted to use real HOME; set HOME to tmp_path in test env."
+            )
+
+    def _guarded_run(*args, **kwargs):
+        _assert_safe_home(kwargs)
+        return orig_run(*args, **kwargs)
+
+    def _guarded_popen(*args, **kwargs):
+        _assert_safe_home(kwargs)
+        return orig_popen(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _guarded_run)
+    monkeypatch.setattr(subprocess, "Popen", _guarded_popen)
+    yield
 
 
 @pytest.fixture
@@ -79,15 +98,15 @@ def memory_store(temp_dir):
 def project_memory_store(temp_dir):
     """Initialize the Peewee database with project context."""
     # Override home to use temp_dir
-    original_home = os.environ.get('HOME')
-    os.environ['HOME'] = str(temp_dir)
+    original_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(temp_dir)
 
     try:
-        init_db(project_context='/Users/test/my-project')
+        init_db(project_context="/Users/test/my-project")
         yield temp_dir
     finally:
         close_db()
         if original_home:
-            os.environ['HOME'] = original_home
+            os.environ["HOME"] = original_home
         else:
-            del os.environ['HOME']
+            del os.environ["HOME"]

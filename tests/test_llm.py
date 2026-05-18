@@ -6,6 +6,7 @@ OAuth. These tests mock the SDK path (`_call_via_agent_sdk`) and the Bedrock
 client; they never exercise an API-key codepath.
 """
 
+import json
 import os
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ import pytest
 
 from core.llm import (
     BEDROCK_MODEL,
+    _call_via_claude_cli,
     _make_client,
     call_llm,
     strip_markdown_fences,
@@ -82,6 +84,45 @@ class TestMakeClient:
 
 
 # ---------------------------------------------------------------------------
+# _call_via_claude_cli JSON usage parsing
+# ---------------------------------------------------------------------------
+
+
+class TestCallViaClaudeCli:
+    def test_parses_json_usage_payload(self):
+        payload = {
+            "result": "hello",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 7,
+            },
+        }
+        proc = MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+        with (
+            patch("core.llm.shutil.which", return_value="/usr/bin/claude"),
+            patch("core.llm.subprocess.run", return_value=proc),
+        ):
+            text, in_toks, out_toks, cache_read = _call_via_claude_cli("prompt")
+        assert text == "hello"
+        assert in_toks == 12
+        assert out_toks == 5
+        assert cache_read == 7
+
+    def test_falls_back_when_stdout_is_not_json(self):
+        proc = MagicMock(returncode=0, stdout="plain text response", stderr="")
+        with (
+            patch("core.llm.shutil.which", return_value="/usr/bin/claude"),
+            patch("core.llm.subprocess.run", return_value=proc),
+        ):
+            text, in_toks, out_toks, cache_read = _call_via_claude_cli("prompt")
+        assert text == "plain text response"
+        assert in_toks is None
+        assert out_toks is None
+        assert cache_read is None
+
+
+# ---------------------------------------------------------------------------
 # call_llm — OAuth (agent-SDK) path
 #
 # call_llm runs `asyncio.run(_call_via_agent_sdk(...))` then
@@ -92,24 +133,31 @@ class TestMakeClient:
 
 def _async_return_sdk(text, in_toks=None, out_toks=None):
     """Mock for _call_via_agent_sdk: returns the (text, in, out) tuple shape."""
+
     async def _coro(*_args, **_kwargs):
         return text, in_toks, out_toks
+
     return _coro
 
 
 def _async_raise(exc):
     async def _coro(*_args, **_kwargs):
         raise exc
+
     return _coro
 
 
 class TestCallLlmOAuthPath:
     def test_returns_stripped_text(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_USE_BEDROCK"}
-        with patch.dict(os.environ, env, clear=True), \
-             patch("core.llm._AGENT_SDK_AVAILABLE", True), \
-             patch("core.llm._call_via_agent_sdk",
-                   side_effect=_async_return_sdk('```json\n{"result": true}\n```')):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("core.llm._AGENT_SDK_AVAILABLE", True),
+            patch(
+                "core.llm._call_via_agent_sdk",
+                side_effect=_async_return_sdk('```json\n{"result": true}\n```'),
+            ),
+        ):
             assert call_llm("test prompt") == '{"result": true}'
 
     def test_passes_prompt_to_sdk(self):
@@ -117,31 +165,43 @@ class TestCallLlmOAuthPath:
         captured = {}
 
         async def _spy(
-            prompt: str, system_prompt: str | None = None,
+            prompt: str,
+            system_prompt: str | None = None,
         ) -> tuple[str, int | None, int | None]:
             captured["prompt"] = prompt
             return "ok", None, None
 
-        with patch.dict(os.environ, env, clear=True), \
-             patch("core.llm._AGENT_SDK_AVAILABLE", True), \
-             patch("core.llm._call_via_agent_sdk", side_effect=_spy):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("core.llm._AGENT_SDK_AVAILABLE", True),
+            patch("core.llm._call_via_agent_sdk", side_effect=_spy),
+        ):
             call_llm("test prompt")
             assert captured["prompt"] == "test prompt"
 
     def test_exceptions_propagate(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_USE_BEDROCK"}
-        with patch.dict(os.environ, env, clear=True), \
-             patch("core.llm._AGENT_SDK_AVAILABLE", True), \
-             patch("core.llm._call_via_agent_sdk",
-                   side_effect=_async_raise(ValueError("SDK error"))):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("core.llm._AGENT_SDK_AVAILABLE", True),
+            patch(
+                "core.llm._call_via_agent_sdk",
+                side_effect=_async_raise(ValueError("SDK error")),
+            ),
+        ):
             with pytest.raises(ValueError, match="SDK error"):
                 call_llm("test")
 
     def test_falls_back_to_cli_when_sdk_unavailable(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_USE_BEDROCK"}
-        with patch.dict(os.environ, env, clear=True), \
-             patch("core.llm._AGENT_SDK_AVAILABLE", False), \
-             patch("core.llm._call_via_claude_cli", return_value="cli-output") as mock_cli:
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("core.llm._AGENT_SDK_AVAILABLE", False),
+            patch(
+                "core.llm._call_via_claude_cli",
+                return_value=("cli-output", None, None, None),
+            ) as mock_cli,
+        ):
             assert call_llm("test") == "cli-output"
             mock_cli.assert_called_once_with("test", system_prompt_path=None)
 
@@ -160,7 +220,9 @@ class TestCallLlmBedrockPath:
     def test_bedrock_model_default(self):
         with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}):
             with patch("core.llm.anthropic.AnthropicBedrock") as mock_cls:
-                mock_cls.return_value.messages.create.return_value = self._mock_response("ok")
+                mock_cls.return_value.messages.create.return_value = (
+                    self._mock_response("ok")
+                )
                 call_llm("test")
                 kwargs = mock_cls.return_value.messages.create.call_args.kwargs
                 assert kwargs["model"] == BEDROCK_MODEL
@@ -170,7 +232,9 @@ class TestCallLlmBedrockPath:
     def test_bedrock_explicit_overrides(self):
         with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}):
             with patch("core.llm.anthropic.AnthropicBedrock") as mock_cls:
-                mock_cls.return_value.messages.create.return_value = self._mock_response("ok")
+                mock_cls.return_value.messages.create.return_value = (
+                    self._mock_response("ok")
+                )
                 call_llm(
                     "test",
                     model="claude-haiku-4-5-20251001",
@@ -187,15 +251,17 @@ class TestCallLlmBedrockPath:
     def test_bedrock_strips_fences(self):
         with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}):
             with patch("core.llm.anthropic.AnthropicBedrock") as mock_cls:
-                mock_cls.return_value.messages.create.return_value = self._mock_response(
-                    '```json\n{"x": 1}\n```'
+                mock_cls.return_value.messages.create.return_value = (
+                    self._mock_response('```json\n{"x": 1}\n```')
                 )
                 assert call_llm("test") == '{"x": 1}'
 
     def test_bedrock_exceptions_propagate(self):
         with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}):
             with patch("core.llm.anthropic.AnthropicBedrock") as mock_cls:
-                mock_cls.return_value.messages.create.side_effect = Exception("API error")
+                mock_cls.return_value.messages.create.side_effect = Exception(
+                    "API error"
+                )
                 with pytest.raises(Exception, match="API error"):
                     call_llm("test")
 
@@ -208,6 +274,7 @@ class TestCallLlmBedrockPath:
 class TestApiKeyTransportDisabled:
     def test_have_api_key_always_false(self):
         from core.llm import _have_api_key
+
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-fake"}):
             assert _have_api_key() is False
 
@@ -220,10 +287,14 @@ class TestApiKeyTransportDisabled:
 class TestLlmEnvelopeTrace:
     """call_llm() emits llm_envelope trace events via core.trace.get_active_writer()."""
 
-    def _make_mock_response(self, text: str, input_tokens: int, output_tokens: int) -> MagicMock:
+    def _make_mock_response(
+        self, text: str, input_tokens: int, output_tokens: int
+    ) -> MagicMock:
         mock_msg = MagicMock()
         mock_msg.content = [MagicMock(text=text)]
-        mock_msg.usage = MagicMock(input_tokens=input_tokens, output_tokens=output_tokens)
+        mock_msg.usage = MagicMock(
+            input_tokens=input_tokens, output_tokens=output_tokens
+        )
         return mock_msg
 
     def _make_mock_writer(self) -> MagicMock:
@@ -238,13 +309,19 @@ class TestLlmEnvelopeTrace:
 
         writer = self._make_mock_writer()
         prompt = "test prompt for envelope"
-        expected_hash = hashlib.sha256((BEDROCK_MODEL + prompt).encode()).hexdigest()[:16]
+        expected_hash = hashlib.sha256((BEDROCK_MODEL + prompt).encode()).hexdigest()[
+            :16
+        ]
 
-        with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}), \
-             patch("core.llm.anthropic.AnthropicBedrock") as mock_cls, \
-             patch("core.llm.get_active_writer", return_value=writer):
-            mock_cls.return_value.messages.create.return_value = self._make_mock_response(
-                "response text", input_tokens=42, output_tokens=17
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}),
+            patch("core.llm.anthropic.AnthropicBedrock") as mock_cls,
+            patch("core.llm.get_active_writer", return_value=writer),
+        ):
+            mock_cls.return_value.messages.create.return_value = (
+                self._make_mock_response(
+                    "response text", input_tokens=42, output_tokens=17
+                )
             )
             call_llm(prompt)
 
@@ -261,11 +338,13 @@ class TestLlmEnvelopeTrace:
 
     def test_no_emit_when_no_active_writer(self):
         """No writer → emit is never called; call_llm still returns result."""
-        with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}), \
-             patch("core.llm.anthropic.AnthropicBedrock") as mock_cls, \
-             patch("core.llm.get_active_writer", return_value=None):
-            mock_cls.return_value.messages.create.return_value = self._make_mock_response(
-                "result", input_tokens=1, output_tokens=1
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}),
+            patch("core.llm.anthropic.AnthropicBedrock") as mock_cls,
+            patch("core.llm.get_active_writer", return_value=None),
+        ):
+            mock_cls.return_value.messages.create.return_value = (
+                self._make_mock_response("result", input_tokens=1, output_tokens=1)
             )
             result = call_llm("prompt")
         assert result == "result"
@@ -280,10 +359,15 @@ class TestLlmEnvelopeTrace:
         expected_hash = hashlib.sha256(("" + prompt).encode()).hexdigest()[:16]
 
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_USE_BEDROCK"}
-        with patch.dict(os.environ, env, clear=True), \
-             patch("core.llm._AGENT_SDK_AVAILABLE", True), \
-             patch("core.llm._call_via_agent_sdk", side_effect=_async_return_sdk("response text")), \
-             patch("core.llm.get_active_writer", return_value=writer):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("core.llm._AGENT_SDK_AVAILABLE", True),
+            patch(
+                "core.llm._call_via_agent_sdk",
+                side_effect=_async_return_sdk("response text"),
+            ),
+            patch("core.llm.get_active_writer", return_value=writer),
+        ):
             call_llm(prompt)
 
         writer.emit.assert_called_once()
@@ -292,13 +376,19 @@ class TestLlmEnvelopeTrace:
         assert payload["input_tokens"] is None
         assert payload["output_tokens"] is None
 
+        assert payload["cache_read_input_tokens"] is None
+
     def test_trace_import_error_does_not_crash_call_llm(self):
         """If core.trace raises unexpectedly, call_llm still returns normally."""
-        with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}), \
-             patch("core.llm.anthropic.AnthropicBedrock") as mock_cls, \
-             patch("core.llm.get_active_writer", side_effect=RuntimeError("trace broken")):
-            mock_cls.return_value.messages.create.return_value = self._make_mock_response(
-                "safe result", input_tokens=5, output_tokens=5
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "true"}),
+            patch("core.llm.anthropic.AnthropicBedrock") as mock_cls,
+            patch(
+                "core.llm.get_active_writer", side_effect=RuntimeError("trace broken")
+            ),
+        ):
+            mock_cls.return_value.messages.create.return_value = (
+                self._make_mock_response("safe result", input_tokens=5, output_tokens=5)
             )
             result = call_llm("prompt")
         assert result == "safe result"

@@ -11,7 +11,13 @@ import pytest
 from core import llm
 
 
-SYSTEM_PROMPT_NAMES = ["base", "extraction", "consolidation", "curation", "classification"]
+SYSTEM_PROMPT_NAMES = [
+    "base",
+    "extraction",
+    "consolidation",
+    "curation",
+    "classification",
+]
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +29,7 @@ def _clear_system_prompt_cache():
 
 
 # --- _load_system_prompt -----------------------------------------------------
+
 
 def test_load_returns_none_for_none():
     assert llm._load_system_prompt(None) is None
@@ -68,6 +75,7 @@ def test_result_is_cached():
 
 # --- call_llm threading ------------------------------------------------------
 
+
 def _force_oauth(monkeypatch):
     monkeypatch.setattr(llm, "_have_api_key", lambda: False)
     monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
@@ -112,7 +120,7 @@ def test_call_llm_passes_system_prompt_path_to_cli(monkeypatch):
 
     def fake_cli(prompt, *, system_prompt_path=None, **kw):
         captured["path"] = system_prompt_path
-        return "cli-result"
+        return "cli-result", None, None, None
 
     _force_oauth(monkeypatch)
     monkeypatch.setattr(llm, "_AGENT_SDK_AVAILABLE", False)
