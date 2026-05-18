@@ -164,7 +164,7 @@ class LifecycleManager:
 
         Returns:
             List of consolidated memories meeting the hybrid crystallization gate
-            (rc >= 3 + spacing, or importance >= CRYSTALLIZE_IMPORTANCE_THRESH + rc >= 2 + spacing)
+            (importance >= CRYSTALLIZE_IMPORTANCE_THRESH at any rc, or rc >= 3 + spacing)
         """
         consolidated_memories = list(Memory.by_stage('consolidated'))
         candidates = []
@@ -281,6 +281,11 @@ class LifecycleManager:
             return True, "Eligible for consolidation"
 
         if current_stage == 'consolidated' and next_stage == 'crystallized':
+            # Stage-gated invariant: a memory must be classified before it can
+            # crystallize. open_question rows are exempt — they are a lifecycle
+            # state, not a knowledge kind, and carry memory_kind=NULL by design.
+            if not memory.memory_kind and memory.kind != 'open_question':
+                return False, "Unclassified: memory_kind is NULL"
             mem_dict = {
                 'id': memory.id,
                 'reinforcement_count': memory.reinforcement_count,
@@ -332,25 +337,23 @@ class LifecycleManager:
         Check if memory meets criteria for promotion to crystallized.
 
         Two paths (either qualifies):
+        - High-importance: importance >= CRYSTALLIZE_IMPORTANCE_THRESH — crystallizes
+          at any reinforcement count. Importance is an LLM-scored write-time signal;
+          a rare-but-pivotal memory should not wait on repeated reinforcement.
         - Standard: rc >= 3 + spaced reinforcements (D-07)
-        - High-importance: importance >= CRYSTALLIZE_IMPORTANCE_THRESH AND rc >= 2 + spaced
 
-        Spacing is required on both paths — single-session burst reinforcement
-        is never enough regardless of importance.
+        Frequency (rc) is the weaker impact signal — it gates only the standard path.
         """
         reinforcement_count = memory.get('reinforcement_count', 0) or 0
         importance = memory.get('importance', 0.0) or 0.0
         thresh = self.CRYSTALLIZE_IMPORTANCE_THRESH
 
-        # High-importance fast path: lower rc bar for high-signal memories
-        if importance >= thresh and reinforcement_count >= 2:
-            spaced, spacing_reason = self._has_spaced_reinforcement(memory['id'])
-            if spaced:
-                return True, (
-                    f"High-importance ({importance:.2f} >= {thresh}) "
-                    f"with {reinforcement_count} reinforcements and adequate spacing"
-                )
-            return False, spacing_reason
+        # High-importance fast path: high-signal memories crystallize at any rc.
+        if importance >= thresh:
+            return True, (
+                f"High-importance ({importance:.2f} >= {thresh}) — "
+                f"crystallizes regardless of reinforcement count"
+            )
 
         # Standard path
         if reinforcement_count < 3:

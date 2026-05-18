@@ -533,24 +533,27 @@ class TestHypothesisPromotion:
         assert can_promote_hypothesis(mem) is True
 
     # ---------------------------------------------------------------------------
-    # Gate: < 2 distinct sessions blocks promotion
+    # Gate: distinct-session requirement was dropped — evidence_count gates alone
     # ---------------------------------------------------------------------------
 
-    def test_single_session_blocks(self, base):
-        """Only one distinct session_id returns False even with count >= 3."""
-        # evidence_count=3 but all same session
+    def test_single_session_no_longer_blocks(self, base):
+        """evidence_count >= 3 promotes even when all evidence is from one session."""
         mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s1", "s1"])
-        assert can_promote_hypothesis(mem) is False
+        assert can_promote_hypothesis(mem) is True
 
     def test_two_distinct_sessions_passes(self, base):
-        """Exactly 2 distinct sessions satisfies the multi-session requirement."""
+        """evidence_count >= 3 across distinct sessions still passes."""
         mem = self._make_hypothesis(evidence_count=3, session_ids=["s1", "s2"])
         assert can_promote_hypothesis(mem) is True
 
-    def test_empty_session_ids_blocks(self, base):
-        """Empty evidence_session_ids returns False (0 distinct sessions)."""
+    def test_empty_session_ids_no_longer_blocks(self, base):
+        """evidence_count >= 3 promotes even with empty evidence_session_ids.
+
+        evidence_count is incremented unconditionally while session ids are
+        appended only conditionally, so the session list is not load-bearing.
+        """
         mem = self._make_hypothesis(evidence_count=3, session_ids=[])
-        assert can_promote_hypothesis(mem) is False
+        assert can_promote_hypothesis(mem) is True
 
     # ---------------------------------------------------------------------------
     # Gate: contradiction edge blocks promotion

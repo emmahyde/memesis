@@ -38,16 +38,29 @@ def crystallizer(base, lifecycle):
     return Crystallizer(lifecycle)
 
 
-def _create_consolidated(title, content, tags=None, reinforcement_count=0):
+def _create_consolidated(title, content, tags=None, reinforcement_count=0, importance=0.65):
     """Helper to create a consolidated memory with specific reinforcement count."""
     now = datetime.now().isoformat()
+    obs_kind = None
+    for tag in tags or []:
+        if tag.startswith("type:") and len(tag) > 5:
+            obs_kind = tag[5:]
+            break
+    kind = {
+        "decision": "decision",
+        "correction": "gotcha",
+        "constraint": "invariant",
+        "preference": "opinion",
+        "finding": "fact",
+    }.get(obs_kind, "fact")
     mem = Memory.create(
         stage="consolidated",
         title=title,
         summary=content[:100],
         content=content,
         tags=json.dumps(tags or []),
-        importance=0.65,
+        memory_kind=kind,
+        importance=importance,
         reinforcement_count=reinforcement_count,
         created_at=now,
         updated_at=now,
@@ -164,8 +177,10 @@ def test_crystallize_single_candidate(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
 
     mem_id = _create_consolidated(
-        "Bedrock Client", "Use AnthropicBedrock() not Anthropic()",
-        tags=["type:correction", "bedrock"], reinforcement_count=3,
+        "Bedrock Client",
+        "Use AnthropicBedrock() not Anthropic()",
+        tags=["type:correction", "bedrock"],
+        reinforcement_count=3,
     )
 
     results = crystallizer.crystallize_candidates()
@@ -187,8 +202,10 @@ def test_crystallize_group(mock_llm, crystallizer, base):
 
     ids = [
         _create_consolidated(
-            f"Bedrock Issue {i}", f"Bedrock problem #{i}",
-            tags=["type:correction", "bedrock"], reinforcement_count=3,
+            f"Bedrock Issue {i}",
+            f"Bedrock problem #{i}",
+            tags=["type:correction", "bedrock"],
+            reinforcement_count=3,
         )
         for i in range(3)
     ]
@@ -204,19 +221,52 @@ def test_crystallize_group(mock_llm, crystallizer, base):
 
 
 @patch("core.crystallizer.call_llm")
-def test_crystallize_preserves_importance(mock_llm, crystallizer, base):
+def test_crystallize_inherits_max_source_importance(mock_llm, crystallizer, base):
+    """The crystal inherits the strongest source memory's importance, not a flat value."""
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
-    _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
+    for imp in (0.65, 0.80, 0.72):
+        _create_consolidated(
+            f"Bedrock {imp}", "Content", tags=["type:correction", "bedrock"],
+            reinforcement_count=3, importance=imp,
+        )
 
     results = crystallizer.crystallize_candidates()
     crystal = Memory.get_by_id(results[0]["crystallized_id"])
-    assert crystal.importance == 0.75
+    assert crystal.importance == 0.80
+
+
+@patch("core.crystallizer.call_llm")
+def test_crystallize_respects_batch_limit(mock_llm, crystallizer, base, monkeypatch):
+    """crystallize_candidates caps per run and drains highest-importance first."""
+    monkeypatch.setattr(Crystallizer, "CRYSTALLIZE_BATCH_LIMIT", 3)
+    mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
+
+    # Five candidates, distinct tags so each forms its own group.
+    importances = {0.60: None, 0.65: None, 0.70: None, 0.75: None, 0.80: None}
+    for i, imp in enumerate(importances):
+        importances[imp] = _create_consolidated(
+            f"Topic {i}", f"Content {i}", tags=[f"topic{i}"],
+            reinforcement_count=3, importance=imp,
+        )
+
+    results = crystallizer.crystallize_candidates()
+    # Exactly CRYSTALLIZE_BATCH_LIMIT source memories processed this run
+    # (grouping may collapse them into fewer crystals).
+    assert sum(r["group_size"] for r in results) == 3
+
+    # Highest-importance three are crystallized (archived); lowest two untouched.
+    for imp in (0.70, 0.75, 0.80):
+        assert Memory.get_by_id(importances[imp]).archived_at is not None
+    for imp in (0.60, 0.65):
+        assert Memory.get_by_id(importances[imp]).archived_at is None
 
 
 @patch("core.crystallizer.call_llm")
 def test_crystallize_tags_include_source_marker(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
-    _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
+    _create_consolidated(
+        "Test", "Content", tags=["type:correction"], reinforcement_count=3
+    )
 
     results = crystallizer.crystallize_candidates()
     crystal = Memory.get_by_id(results[0]["crystallized_id"])
@@ -227,13 +277,13 @@ def test_crystallize_tags_include_source_marker(mock_llm, crystallizer, base):
 @patch("core.crystallizer.call_llm")
 def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, base):
     mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
-    mem_id = _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
+    mem_id = _create_consolidated(
+        "Test", "Content", tags=["type:correction"], reinforcement_count=3
+    )
 
     crystallizer.crystallize_candidates()
 
-    rows = list(
-        ConsolidationLog.select().where(ConsolidationLog.memory_id == mem_id)
-    )
+    rows = list(ConsolidationLog.select().where(ConsolidationLog.memory_id == mem_id))
     actions = [r.action for r in rows]
     assert "subsumed" in actions
 
@@ -243,7 +293,9 @@ def test_crystallize_logs_subsumed_action(mock_llm, crystallizer, base):
 
 @patch("core.crystallizer.call_llm", side_effect=Exception("LLM unavailable"))
 def test_fallback_on_llm_failure(mock_llm, crystallizer, base):
-    mem_id = _create_consolidated("Test", "Content", tags=["type:correction"], reinforcement_count=3)
+    mem_id = _create_consolidated(
+        "Test", "Content", tags=["type:correction"], reinforcement_count=3
+    )
 
     results = crystallizer.crystallize_candidates()
     assert len(results) == 1
@@ -268,35 +320,47 @@ def test_crystallization_prompt_requests_json():
 
 
 @patch("core.crystallizer.call_llm")
-def test_mixed_candidates_produce_separate_crystallizations(mock_llm, crystallizer, base):
+def test_mixed_candidates_produce_separate_crystallizations(
+    mock_llm, crystallizer, base
+):
     mock_llm.side_effect = [
-        json.dumps({
-            "title": "Correction pattern",
-            "insight": "A correction insight",
-            "observation_type": "correction",
-            "tags": ["testing"],
-            "source_pattern": "Testing corrections",
-        }),
-        json.dumps({
-            "title": "Workflow pattern",
-            "insight": "A workflow insight",
-            "observation_type": "workflow_pattern",
-            "tags": ["pr"],
-            "source_pattern": "PR patterns",
-        }),
+        json.dumps(
+            {
+                "title": "Correction pattern",
+                "insight": "A correction insight",
+                "observation_type": "correction",
+                "tags": ["testing"],
+                "source_pattern": "Testing corrections",
+            }
+        ),
+        json.dumps(
+            {
+                "title": "Workflow pattern",
+                "insight": "A workflow insight",
+                "observation_type": "workflow_pattern",
+                "tags": ["pr"],
+                "source_pattern": "PR patterns",
+            }
+        ),
     ]
 
     _create_consolidated(
-        "Test Correction", "Correction content",
-        tags=["type:correction", "testing"], reinforcement_count=3,
+        "Test Correction",
+        "Correction content",
+        tags=["type:correction", "testing"],
+        reinforcement_count=3,
     )
     _create_consolidated(
-        "PR Workflow", "Workflow content",
-        tags=["type:workflow_pattern", "pr"], reinforcement_count=3,
+        "PR Workflow",
+        "Workflow content",
+        tags=["type:workflow_pattern", "pr"],
+        reinforcement_count=3,
     )
     _create_consolidated(
-        "Another Correction", "More correction",
-        tags=["type:correction", "testing"], reinforcement_count=3,
+        "Another Correction",
+        "More correction",
+        tags=["type:correction", "testing"],
+        reinforcement_count=3,
     )
 
     results = crystallizer.crystallize_candidates()
@@ -339,7 +403,6 @@ def _make_embedding_bytes(values):
 
 
 class TestEmbeddingGrouping:
-
     def _make_candidates(self, crystallizer, n=3, tags=None):
         candidates = []
         for i in range(n):
@@ -364,7 +427,9 @@ class TestEmbeddingGrouping:
         }
 
         vec = get_vec_store()
-        with patch.object(vec, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
+        with patch.object(
+            vec, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)
+        ):
             groups = crystallizer._group_candidates(candidates)
 
         group_sets = [frozenset(c.id for c in g) for g in groups]
@@ -381,7 +446,9 @@ class TestEmbeddingGrouping:
         }
 
         vec = get_vec_store()
-        with patch.object(vec, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)):
+        with patch.object(
+            vec, "get_embedding", side_effect=lambda mid: id_to_bytes.get(mid)
+        ):
             groups = crystallizer._group_candidates(candidates)
 
         assert len(groups) == 3
@@ -391,7 +458,12 @@ class TestEmbeddingGrouping:
         # D3: non-card write path must leave criterion_weights, rejected_options, affect_valence as NULL
         with patch("core.crystallizer.call_llm") as mock_llm:
             mock_llm.return_value = json.dumps(MOCK_LLM_RESPONSE)
-            _create_consolidated("Card Fields Test", "Content", tags=["type:correction"], reinforcement_count=3)
+            _create_consolidated(
+                "Card Fields Test",
+                "Content",
+                tags=["type:correction"],
+                reinforcement_count=3,
+            )
             results = crystallizer.crystallize_candidates()
         crystal = Memory.get_by_id(results[0]["crystallized_id"])
         assert crystal.criterion_weights is None
@@ -401,8 +473,11 @@ class TestEmbeddingGrouping:
     def test_embedding_fallback_when_unavailable(self, crystallizer, base):
         ids = [
             _create_consolidated(
-                f"Tagged {i}", f"Content {i}",
-                tags=["type:correction", "shared-tag"] if i < 2 else ["type:correction", "other-tag"],
+                f"Tagged {i}",
+                f"Content {i}",
+                tags=["type:correction", "shared-tag"]
+                if i < 2
+                else ["type:correction", "other-tag"],
                 reinforcement_count=3,
             )
             for i in range(3)

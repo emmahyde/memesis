@@ -20,6 +20,7 @@ detail, generalized into a reusable pattern.
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Optional
@@ -117,6 +118,11 @@ class Crystallizer:
     into denser, pattern-level knowledge.
     """
 
+    # Max memories crystallized per invocation. A large backlog drains over
+    # several cron ticks, highest-importance first, instead of firing dozens
+    # of LLM synthesis calls in one run.
+    CRYSTALLIZE_BATCH_LIMIT = int(os.environ.get("MEMESIS_CRYSTALLIZE_BATCH_LIMIT", "10"))
+
     def __init__(self, lifecycle: LifecycleManager):
         self.lifecycle = lifecycle
 
@@ -124,12 +130,20 @@ class Crystallizer:
         """
         Find promotion candidates, group by theme, synthesize, and promote.
 
+        Candidates are drained highest-importance first and capped at
+        CRYSTALLIZE_BATCH_LIMIT per invocation.
+
         Returns list of crystallization results:
         [{"crystallized_id": ..., "source_ids": [...], "title": ...}, ...]
         """
         candidates = self.lifecycle.get_promotion_candidates()
         if not candidates:
             return []
+
+        # Drain highest-importance first; cap per run so a large backlog
+        # crystallizes gradually instead of in a single cron tick.
+        candidates.sort(key=lambda c: c.get("importance", 0.0) or 0.0, reverse=True)
+        candidates = candidates[: self.CRYSTALLIZE_BATCH_LIMIT]
 
         # Load full memory content for each candidate
         full_candidates = []
@@ -390,13 +404,18 @@ class Crystallizer:
             return self._fallback_promote(group)
 
         now = datetime.now().isoformat()
+        # Inherit the strongest source's importance — a crystal is denser and
+        # more durable than its sources, so its impact signal is at least the
+        # max of theirs. Hardcoding a flat value here discarded that signal and
+        # left crystallized memories stranded below the instinctive gate.
+        crystal_importance = max((m.importance or 0.0) for m in group)
         crystal_mem = Memory.create(
             stage="crystallized",
             title=result["title"],
             summary=result["insight"][:150],
             content=content,   # body only — better FTS, consistent hash
             tags=json.dumps(tags),
-            importance=0.75,
+            importance=crystal_importance,
             reinforcement_count=0,
             created_at=now,
             updated_at=now,

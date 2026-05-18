@@ -672,9 +672,15 @@ def can_promote_hypothesis(memory: Memory) -> bool:
 
     Gate rules (applied only when kind == "hypothesis"):
         1. evidence_count >= 3
-        2. evidence_session_ids encodes >= 2 distinct session identifiers
-        3. No ``contradicts`` edge in ``memory_edges`` touching this memory
+        2. No ``contradicts`` edge in ``memory_edges`` touching this memory
            (checked bidirectionally: source_id == id OR target_id == id)
+
+    A prior distinct-session requirement was dropped: ``evidence_count`` is
+    incremented unconditionally by ``_write_hypothesis`` while
+    ``evidence_session_ids`` is appended only conditionally, so the two can
+    diverge and permanently wedge a well-evidenced hypothesis. evidence_count
+    already encodes repeated observation; the session check was a redundant
+    frequency proxy.
 
     Consolidation caller note (Wave 4.1):
         This function is defined here so the consolidator (core/consolidator.py,
@@ -698,17 +704,6 @@ def can_promote_hypothesis(memory: Memory) -> bool:
     # --- evidence_count check ---
     evidence_count = memory.evidence_count or 0
     if evidence_count < 3:
-        return False
-
-    # --- distinct-session check ---
-    try:
-        session_ids: list = json.loads(memory.evidence_session_ids or "[]")
-        if not isinstance(session_ids, list):
-            session_ids = []
-    except (ValueError, TypeError):
-        session_ids = []
-
-    if len(set(session_ids)) < 2:
         return False
 
     # --- contradiction check (bidirectional) ---

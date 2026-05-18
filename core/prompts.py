@@ -27,32 +27,38 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 
 SESSION_TYPE_GUIDANCE = {
-    # Per-session-type filter applied inside OBSERVATION_EXTRACT_PROMPT.
-    # Callers that invoke OBSERVATION_EXTRACT_PROMPT.format(...) MUST pass
-    # `session_type_guidance=SESSION_TYPE_GUIDANCE.get(session_type, SESSION_TYPE_GUIDANCE["unknown"])`.
-    # Use `format_extract_prompt()` (defined at the bottom of this module) to get
-    # this right automatically.  Invocation sites that need updating in Wave C:
-    #   core/transcript_ingest.py:200  — extract_observations()
-    #   core/transcript_ingest.py:560  — batch prompt list comprehension
-    #   tests/test_prompts.py:131      — smoke-test format call
+    # Per-session-type filter injected into _OBSERVATION_EXTRACT_PROMPT_TEMPLATE at
+    # the {session_type_guidance} placeholder. Single source of truth — there is no
+    # longer a parallel hardcoded block in the prompt body.
+    # Use `format_extract_prompt()` (defined at the bottom of this module); it keys
+    # this dict by session_type automatically.
     "research": (
-        "Target conceptual and metacognitive findings only. Skip tool logs and per-call"
-        " narration. Surface novel framings, deferred questions, and abandoned approaches."
+        "Durable: conceptual outcomes (\"X library uses Y mechanism because Z\"), decisions to"
+        " adopt/reject an approach, comparisons with explicit trade-offs, prior-art findings that"
+        " change future direction. Skip: raw search results, tool calls, page summaries without a"
+        " synthesis, \"looked at X\" with no takeaway. A research session can have many durable"
+        " observations even with no code change — bias toward extracting conceptual findings over"
+        " skipping. Force work_event=null."
     ),
     "writing": (
-        "Target authoring decisions and aesthetic choices (voice, structure, scope). Skip"
-        " word-level edits unless they reveal a stylistic principle."
+        "Durable: authoring decisions (structure, voice, scene order), aesthetic choices with"
+        " rationale, rejected options with reason, style commitments, named characters/locations"
+        " with established traits. Skip: aesthetic preferences without rationale, one-off word"
+        " choices, summaries of what was written."
     ),
     "code": (
-        "Target current behavior — corrections, gotchas, decisions, library/API choices,"
-        " debugging insights. Skip routine implementation steps."
+        "Durable: bugfixes with diagnosed root cause, refactor decisions with rationale,"
+        " performance findings, API/contract corrections, build/test gotchas, configuration"
+        " constraints, tooling wins (commands that save time, flags that simplify workflow),"
+        " workflow discoveries (shortcuts, defaults, implicit behaviors). Skip: green test runs"
+        " with no finding, file navigation, tool-call traces without a conclusion."
     ),
     "agent_driven": (
         "Target task structure, decisions, and surprising agent failures. Skip per-tool-call"
         " narration and routine progress updates."
     ),
     "unknown": (
-        "Use general extraction heuristics. No session-type-specific filter applied."
+        "Apply the QUALITY GATE directly with no session-type-specific bias."
     ),
 }
 
@@ -248,21 +254,42 @@ You have more context than Stage 1 did. Re-score `importance` independently usin
 buffer and manifest. Do not just copy the Stage 1 score — you should diverge when context
 justifies it.
 
-Importance anchors:
-  0.2  routine finding (re-derivable, low stakes)
-  0.5  useful context (saves time but not load-bearing)
-  0.9  load-bearing decision or hard constraint (getting this wrong causes real problems)
-  0.95 correction or must-know to avoid repeating a mistake
+The importance score is not an abstract quality rating — it directly gates the memory's
+lifecycle. Score against the consequences:
+
+  0.00–0.30  ROUTINE — re-derivable from code, git log, types, or CI. The memory expires.
+             Default here unless a higher band's test below clearly passes.
+  0.30–0.55  CONTEXT — saves time on recall, but getting it wrong costs only a minor
+             detour, never rework. Stays a short-lived consolidated memory.
+  0.55–0.74  SIGNIFICANT — a material finding, but scoped or contingent: true for one
+             project, one tool version, or one session. Stays consolidated; never
+             becomes permanent.
+  0.75–0.84  LOAD-BEARING — getting this wrong causes real rework or repeats a mistake,
+             AND it applies beyond the session it came from. A score in this band
+             CRYSTALLIZES the memory: it is synthesized into a permanent record and
+             reinjected at session start for months. Do not enter this band casually.
+  0.85–1.00  INVARIANT / CORRECTIVE — an explicit user correction, a hard constraint, or
+             a behavioral rule that should fire unprompted every session. A score here
+             makes the memory eligible to become INSTINCTIVE — an always-on rule that
+             never expires. Reserve for memories that are wrong to ever forget.
+
+KIND SETS THE DEFAULT BAND (soft — override with a stated reason in `rationale`):
+  correction, constraint  → default to the 0.85–1.00 band
+  decision, preference    → default to the 0.75–0.84 band
+  open_question           → default to 0.30–0.55, UNLESS it carries an action item
+                            ("should X", "needs Y"), then 0.75–0.84
+  finding                 → no default shift; score purely on the band tests above
+You may move a memory off its kind's default band, but when you do, the `rationale`
+must say why (e.g. "decision, but scoped to a throwaway spike — CONTEXT band").
 
 SPREAD THE SCORES. A distribution where most observations land at 0.5–0.6 carries no
-ranking signal. Commit to a judgment: if an observation is genuinely routine, score it
-low (0.2–0.35); if it is genuinely load-bearing, score it high (0.85+). Avoid the
-0.45–0.65 middle unless the observation truly is middling.
+ranking signal. Commit to a judgment. Avoid the 0.55–0.74 band unless the memory truly
+is significant-but-not-permanent — it is the band, not the safe default.
 
-Push the score UP for: an explicit action item ("should X", "needs Y", an unresolved
-question), numeric evidence backing the claim, or alignment with established engineering
-practice. Push it DOWN for: subject matter owned by a third-party package we do not
-maintain, or anything already enforced mechanically by a test, hook, type, or CI check.
+Push toward a HIGHER band for: numeric evidence backing the claim, alignment with
+established engineering practice, or an explicit unresolved action item. Push toward a
+LOWER band for: subject matter owned by a third-party package we do not maintain, or
+anything already enforced mechanically by a test, hook, type, or CI check.
 
 ---
 
@@ -341,7 +368,7 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "tags": ["2-4 lowercase topic tags for retrieval (e.g., 'embeddings', 'workflow', 'consolidation')"],
       "action": "keep|prune|promote|supersede|archive",
       "observation": "human-readable summary of the observation (not load-bearing — use obs_ids for pairing)",
-      "rationale": "why this decision",
+      "rationale": "why this decision — and for importance, name the band the score lands in and the band-test it passed",
       "target_path": "category/filename.md (keep only)",
       "reinforces": "memory_id or null (required when action=promote)",
       "contradicts": "memory_id or null (required when action=archive)",
@@ -487,32 +514,6 @@ freely, without requiring a friction or problem frame to justify inclusion.
 
 ---
 
-SESSION_TYPE GUIDANCE — what counts as durable depends on session_type:
-
-  code      — durable: bugfixes with diagnosed root cause, refactor decisions with
-              rationale, performance findings, API/contract corrections, build/test
-              gotchas, configuration constraints, tooling wins (commands that save
-              time, flags that simplify workflow), workflow discoveries (shortcuts,
-              defaults, implicit behaviors). Skip: green test runs with no finding,
-              file navigation, tool call traces without a conclusion.
-
-  research  — durable: conceptual outcomes ("X library uses Y mechanism because Z"),
-              decisions to adopt/reject an approach, comparisons with explicit
-              trade-offs, prior-art findings that change future direction. Skip: raw
-              search results, tool calls, summaries of pages without a synthesis,
-              "looked at X" without a takeaway. A research session can have many
-              durable observations even if no code changed — bias toward extracting
-              conceptual findings over skipping. Force work_event=null.
-
-  writing   — durable: authoring decisions (structure, voice, scene order), aesthetic choices
-              with rationale, rejected options with reason, style commitments, named characters/locations
-              with established traits. Skip: aesthetic preferences without rationale,
-              one-off word choices, summaries of what was written.
-
-  general   — apply the QUALITY GATE directly without session-type bias.
-
----
-
 KIND AXIS — what type of claim is this? (pick the best fit; kind and knowledge_type are
 independent dimensions — do not collapse them)
 
@@ -612,42 +613,30 @@ WINDOW-LOCAL SALIENCE ANCHORS:
 
 ---
 
-SKIP DISCIPLINE: Before deciding to skip a window, name one specific
-observation you evaluated and rejected (with your reason). A skip without
-a named candidate is a refusal to engage, not a judgment.
-
 SKIP PROTOCOL:
-A skip is a real cost: the LLM call to read this window has already happened.
-Before skipping, sweep the slice once more for ANY durable signal — a passing aside,
-a constraint mentioned in passing, a rejected option, a configuration value used.
+
+A skip is a real cost — the LLM call to read this window already happened. Before
+skipping, sweep the slice once more for ANY durable signal: a passing aside, a
+constraint mentioned in passing, a rejected option, a configuration value used.
 Bias toward extracting one low-importance observation over skipping outright.
 
-If — after that sweep — the slice still has no qualifying observation, you MUST
-return a structured skip with `considered` listing every candidate fact you swept
-and rejected. The `considered` list must be non-empty — if you can name nothing
-you looked at, that signals the sweep was skipped, not the window.
+If — after that sweep — the slice still has no qualifying observation, return a
+structured skip. The `considered` list is REQUIRED and must be non-empty: name
+every candidate fact you swept and rejected, each with the gate it failed.
+A skip whose `considered` is empty or absent is treated as a downgraded skip —
+the affect signal is preserved and logged as a warning, not silently discarded.
 
   {{"skipped": true,
     "failed_gate": "<falsifiable|durable|novel|load_bearing>",
     "reason": "<one sentence naming what the slice contained instead>",
-    "considered": ["brief description of each fact/span you evaluated and rejected"]}}
+    "considered": ["<candidate> — failed <gate_name>", ...]}}
 
-The failed_gate field MUST be the FIRST quality-gate criterion the slice failed.
-Do NOT return an empty array — that signals extraction failure, not intentional skip.
+`failed_gate` MUST be the FIRST quality-gate criterion the slice failed.
+
 Affect signals (pushback / repetition / non-neutral valence) override skip: if the
-AFFECT HINT shows any of those, you MUST extract at least one observation.
-User interruptions (ctrl-c, "stop", "cancel", request cancelled mid-execution) also
+AFFECT HINT shows any of those, you MUST extract at least one observation. User
+interruptions (ctrl-c, "stop", "cancel", request cancelled mid-execution) also
 override skip — treat them as behavioral friction regardless of the affect score.
-
-A skip without `considered`, or where `considered` is empty, will be treated by the
-parser as a downgraded skip — the affect signal is preserved and logged as a warning
-rather than silently discarded.
-
-- Before listing items in `considered:[]`, name the FIRST rejected candidate explicitly
-  and state which gate it failed (importance < threshold? duplicate? off-topic? out of scope?).
-  Format: `considered: ["<first_candidate> — failed <gate_name>", ...]`. This raises the cost
-  of reflexive skipping on ambiguous windows; if you cannot name even one candidate, you may
-  skip without it but the absence flags a low-signal slice rather than a routine skip.
 
 ---
 

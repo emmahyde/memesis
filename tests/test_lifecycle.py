@@ -45,6 +45,9 @@ def _create_memory(stage='ephemeral', title='Test Memory', content='Test content
         importance=kwargs.get('importance', 0.5),
         reinforcement_count=kwargs.get('reinforcement_count', 0),
         usage_count=kwargs.get('usage_count', 0),
+        # Classified by default so consolidated rows clear the can_promote
+        # memory_kind gate; tests exercising the gate pass memory_kind=None.
+        memory_kind=kwargs.get('memory_kind', 'fact'),
         created_at=now,
         updated_at=now,
     )
@@ -648,7 +651,11 @@ class TestExpiryWiring:
 
 @pytest.mark.usefixtures("base")
 class TestImportanceGatedCrystallization:
-    """Hybrid gate: high-importance memories crystallize at rc=2; standard path at rc=3."""
+    """Hybrid gate: high-importance memories crystallize at any rc; standard path at rc=3.
+
+    The ``_setup`` fixture keeps spacing active (MIN_REINFORCEMENT_SPAN_DAYS=2)
+    specifically to prove the high-importance path ignores it.
+    """
 
     @pytest.fixture(autouse=True)
     def _setup(self, monkeypatch):
@@ -656,19 +663,51 @@ class TestImportanceGatedCrystallization:
         monkeypatch.setattr(LifecycleManager, "MIN_REINFORCEMENT_SPAN_DAYS", 2)
         monkeypatch.setattr(LifecycleManager, "CRYSTALLIZE_IMPORTANCE_THRESH", 0.75)
 
-    def test_high_importance_rc2_spaced_promotes(self, manager):
-        """importance >= thresh AND rc=2 AND spaced -> promotes to crystallized."""
-        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.80)
-        base = datetime(2026, 3, 1, 10, 0)
-        _add_reinforcement_log(memory_id, base, "s1")
-        _add_reinforcement_log(memory_id, base + timedelta(days=2), "s2")
+    def test_high_importance_rc0_promotes(self, manager):
+        """importance >= thresh promotes at rc=0 — no reinforcement required."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=0, importance=0.80)
 
         can, reason = manager.can_promote(memory_id)
         assert can is True
         assert 'high-importance' in reason.lower()
 
+    def test_high_importance_rc1_promotes(self, manager):
+        """importance >= thresh promotes at rc=1."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=1, importance=0.80)
+        _add_reinforcement_log(memory_id, datetime(2026, 3, 1, 10, 0), "s1")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+        assert 'high-importance' in reason.lower()
+
+    def test_high_importance_ignores_spacing(self, manager):
+        """High-importance path promotes even with same-day (unspaced) reinforcements."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.90)
+        same_day = datetime(2026, 3, 15, 9, 0)
+        _add_reinforcement_log(memory_id, same_day, "s1")
+        _add_reinforcement_log(memory_id, same_day.replace(hour=14), "s2")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+        assert 'high-importance' in reason.lower()
+
+    def test_importance_at_threshold_qualifies(self, manager):
+        """importance == thresh exactly is accepted (>= boundary), at rc=0."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=0, importance=0.75)
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+
+    def test_low_importance_rc0_blocks(self, manager):
+        """importance < thresh AND rc=0 -> blocked on standard path (need 3+)."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=0, importance=0.60)
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is False
+        assert 'need 3+' in reason.lower()
+
     def test_low_importance_rc2_blocks(self, manager):
-        """importance < thresh AND rc=2 -> blocked on standard path (need 3+)."""
+        """importance < thresh AND rc=2 -> still blocked on standard path (need 3+)."""
         memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.60)
         base = datetime(2026, 3, 1, 10, 0)
         _add_reinforcement_log(memory_id, base, "s1")
@@ -688,39 +727,15 @@ class TestImportanceGatedCrystallization:
         can, reason = manager.can_promote(memory_id)
         assert can is True
 
-    def test_high_importance_rc2_single_day_blocks(self, manager):
-        """High importance + rc=2 but same-day reinforcements -> spacing blocks regardless."""
-        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.90)
-        same_day = datetime(2026, 3, 15, 9, 0)
-        _add_reinforcement_log(memory_id, same_day, "s1")
-        _add_reinforcement_log(memory_id, same_day.replace(hour=14), "s2")
-
-        can, reason = manager.can_promote(memory_id)
-        assert can is False
-        assert 'spacing' in reason.lower() or 'distinct day' in reason.lower()
-
-    def test_importance_at_threshold_qualifies(self, manager):
-        """importance == thresh exactly is accepted (>= boundary)."""
-        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.75)
-        base = datetime(2026, 3, 1, 10, 0)
-        _add_reinforcement_log(memory_id, base, "s1")
-        _add_reinforcement_log(memory_id, base + timedelta(days=3), "s2")
-
-        can, reason = manager.can_promote(memory_id)
-        assert can is True
-
-    def test_get_promotion_candidates_includes_high_importance_rc2(self, manager):
-        """get_promotion_candidates returns high-importance rc=2 memories."""
+    def test_get_promotion_candidates_filters_by_importance(self, manager):
+        """get_promotion_candidates returns high-importance memories at any rc, not low ones."""
         hi_id = _create_memory(
-            stage='consolidated', title='High importance', reinforcement_count=2, importance=0.80
+            stage='consolidated', title='High importance', reinforcement_count=0, importance=0.80
         )
-        base = datetime(2026, 3, 1, 10, 0)
-        _add_reinforcement_log(hi_id, base, "s1")
-        _add_reinforcement_log(hi_id, base + timedelta(days=2), "s2")
-
         lo_id = _create_memory(
             stage='consolidated', title='Low importance', reinforcement_count=2, importance=0.50
         )
+        base = datetime(2026, 3, 1, 10, 0)
         _add_reinforcement_log(lo_id, base, "s3")
         _add_reinforcement_log(lo_id, base + timedelta(days=2), "s4")
 
