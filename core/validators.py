@@ -17,6 +17,7 @@ Written locally here; refactor to use core/observability.py once WS-A lands.
 import json
 import re
 import string
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +82,61 @@ def derive_memory_kind(observation_kind, evidence_count: int = 0) -> str | None:
     if k == "finding":
         return "lesson" if (evidence_count or 0) >= 2 else "fact"
     return _OBSERVATION_TO_MEMORY_KIND.get(k)
+
+
+# Human-readable definition per curated memory_kind — used to build the
+# classification prompt. Keep keys in sync with MEMORY_KIND_VALUES.
+_MEMORY_KIND_DEFINITIONS = {
+    "decision": "chose between alternatives; has rationale and rejected options",
+    "lesson": "pattern extracted from 2+ incidents; prescribes future behavior",
+    "gotcha": "a trap that bit us; concrete and reproducible",
+    "goal": "north-star statement that shapes future decisions",
+    "invariant": "fragile coupling future refactors must preserve",
+    "opinion": "stance on whether something is right or wrong, with rationale",
+    "bias": "systematic LLM/system failure mode (anti-checklist)",
+    "todo": "action item with a concrete done-state predicate",
+    "debt": "known issue or cleanup, status-bearing",
+    "fact": "small, code-derivable detail worth pinning",
+}
+
+
+def classify_memory_kind(title: str, content: str) -> str | None:
+    """Classify a memory into a curated memory_kind via the LLM.
+
+    Fallback for memories whose observation kind does not deterministically
+    map through derive_memory_kind — goal/bias/todo/debt, or a missing kind.
+    Returns a value from MEMORY_KIND_VALUES, or None when the LLM is
+    unavailable or returns something outside the allowed set.
+    """
+    from .llm import call_llm  # lazy import — avoids validators->llm cycle
+
+    catalogue = "\n".join(
+        f"- {kind}: {desc}" for kind, desc in _MEMORY_KIND_DEFINITIONS.items()
+    )
+    prompt = textwrap.dedent(f"""\
+        Classify the memory below into exactly one kind.
+
+        Kinds:
+        {catalogue}
+
+        Respond with the bare kind word and nothing else.
+
+        ## Memory
+        Title: {title}
+
+        {content}
+    """)
+    try:
+        raw = call_llm(
+            prompt,
+            max_tokens=16,
+            temperature=0,
+            system_prompt_file="classification",
+        )
+    except Exception:  # noqa: BLE001 — classification is best-effort
+        return None
+    label = (raw or "").strip().strip(".").lower()
+    return label if label in MEMORY_KIND_VALUES else None
 
 
 KNOWLEDGE_TYPE_VALUES = frozenset({
