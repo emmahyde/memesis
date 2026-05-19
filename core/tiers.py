@@ -19,10 +19,13 @@ that should not be pruned on activation alone.  T3/T4 floors are set higher
 
 Decay tau values (from compute_activation docstring in core/observability.py)
 ------------------------------------------------------------------------------
-T1: 720h (30 days) — very slow decay; instinctive memories stay salient
-T2: 168h (7 days)  — moderate decay; crystallized memories fade weekly
-T3:  48h (2 days)  — fast decay; consolidated memories need regular access
-T4:  12h           — very fast decay; ephemeral memories fade in half a day
+τ is the *time constant* — at age=τ, recency = 1/e ≈ 0.368 (NOT the half-life).
+Actual half-life = τ × ln(2) ≈ 0.693τ.  See observability.py §C6 correction.
+
+T1: 720h (30d τ; half-life ≈ 21d)  — very slow decay; instinctive memories stay salient
+T2: 168h ( 7d τ; half-life ≈  5d)  — moderate decay; crystallized memories stay weeks
+T3:  48h ( 2d τ; half-life ≈ 33h)  — fast decay; consolidated memories need regular access
+T4:  12h (0.5d τ; half-life ≈  8h) — very fast decay; ephemeral memories fade in hours
 """
 
 # ---------------------------------------------------------------------------

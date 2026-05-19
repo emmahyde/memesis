@@ -14,7 +14,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from .database import get_base_dir
+from .database import get_base_dir, get_project
 from .llm import call_llm as _call_llm_transport
 from .models import ConsolidationLog, Memory, db
 from .prompts import SELF_REFLECTION_PROMPT
@@ -407,6 +407,7 @@ class SelfReflector:
             reinforcement_count=0,
             created_at=now,
             updated_at=now,
+            project=get_project(),
             # Hypothesis schema fields (RISK-12)
             kind="hypothesis",
             evidence_count=1,
@@ -469,7 +470,7 @@ class SelfReflector:
             title=COMPACTION_GUIDANCE_TITLE,
             summary=COMPACTION_GUIDANCE_SUMMARY,
             tags=["meta-cognition", "compaction", "kind:preference", "knowledge_type:procedural"],
-            importance=0.80,
+            importance=0.90,
         )
 
     def _create_instinctive_memory(
@@ -500,6 +501,10 @@ class SelfReflector:
             existing = Memory.select().where(Memory.content_hash == content_hash).first()
             return existing.id
 
+        # Extract W5 enrichment fields encoded in tags ("kind:X", "knowledge_type:Y").
+        kind_tag = next((t.split(":", 1)[1] for t in tags if t.startswith("kind:")), None)
+        kt_tag = next((t.split(":", 1)[1] for t in tags if t.startswith("knowledge_type:")), None)
+
         now = datetime.now().isoformat()
         mem = Memory.create(
             stage="instinctive",
@@ -512,6 +517,12 @@ class SelfReflector:
             created_at=now,
             updated_at=now,
             content_hash=content_hash,
+            project=get_project(),
+            # W5 schema fields — parsed from tag conventions used by seeders
+            kind=kind_tag,
+            knowledge_type=kt_tag,
+            knowledge_type_confidence="high" if kt_tag else None,
+            subtitle=summary or None,
             # Defensive nulls — self_reflection is a non-card write path (D3)
             temporal_scope=None,
             confidence=None,
@@ -661,9 +672,15 @@ def can_promote_hypothesis(memory: Memory) -> bool:
 
     Gate rules (applied only when kind == "hypothesis"):
         1. evidence_count >= 3
-        2. evidence_session_ids encodes >= 2 distinct session identifiers
-        3. No ``contradicts`` edge in ``memory_edges`` touching this memory
+        2. No ``contradicts`` edge in ``memory_edges`` touching this memory
            (checked bidirectionally: source_id == id OR target_id == id)
+
+    A prior distinct-session requirement was dropped: ``evidence_count`` is
+    incremented unconditionally by ``_write_hypothesis`` while
+    ``evidence_session_ids`` is appended only conditionally, so the two can
+    diverge and permanently wedge a well-evidenced hypothesis. evidence_count
+    already encodes repeated observation; the session check was a redundant
+    frequency proxy.
 
     Consolidation caller note (Wave 4.1):
         This function is defined here so the consolidator (core/consolidator.py,
@@ -687,17 +704,6 @@ def can_promote_hypothesis(memory: Memory) -> bool:
     # --- evidence_count check ---
     evidence_count = memory.evidence_count or 0
     if evidence_count < 3:
-        return False
-
-    # --- distinct-session check ---
-    try:
-        session_ids: list = json.loads(memory.evidence_session_ids or "[]")
-        if not isinstance(session_ids, list):
-            session_ids = []
-    except (ValueError, TypeError):
-        session_ids = []
-
-    if len(set(session_ids)) < 2:
         return False
 
     # --- contradiction check (bidirectional) ---

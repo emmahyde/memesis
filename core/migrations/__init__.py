@@ -100,8 +100,15 @@ def _apply_sql(conn, path: Path) -> None:
             conn.execute_sql(stmt)
         except Exception as exc:
             msg = str(exc).lower()
-            # Tolerate "duplicate column name" and "index already exists"
-            if "duplicate column" in msg or "already exists" in msg:
+            # Tolerate idempotent re-application failures:
+            #   - duplicate column name / already exists: ADD already happened
+            #   - no such column: DROP target never existed (e.g., seeded init)
+            if (
+                "duplicate column" in msg
+                or "already exists" in msg
+                or "no such column" in msg
+                or "orphan index" in msg
+            ):
                 logger.debug("Skipping already-applied statement in %s: %s", path.name, exc)
             else:
                 raise
@@ -117,6 +124,19 @@ def _apply_py(conn, path: Path) -> None:
     if not callable(getattr(module, "up", None)):
         raise AttributeError(f"Migration {path.name} must export an up(conn) callable")
     module.up(conn)
+
+
+def migrations_pending(conn) -> bool:
+    """Return True if any migration file is not yet recorded as applied.
+
+    A cheap, DDL-free check (beyond the idempotent ``CREATE TABLE IF NOT
+    EXISTS`` for the tracking table). Callers use it to skip the locking
+    run_migrations() path entirely when the schema is already current — which
+    is the overwhelmingly common case and removes the concurrent-DDL race.
+    """
+    _ensure_migrations_table(conn)
+    applied = _applied_versions(conn)
+    return any(path.stem not in applied for path in _migration_files())
 
 
 def run_migrations(conn, seed_threshold: int = SEED_THRESHOLD) -> None:

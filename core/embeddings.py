@@ -9,7 +9,14 @@ memory_embeddings. Query-time embedding uses the same function.
 """
 
 import logging
+import os
 import threading
+
+# fastembed's ONNX tokenizer (Rust-backed huggingface tokenizers) emits a
+# fork-safety warning whenever a process that has touched it goes on to fork
+# a subprocess (pytest guard suites, replay workers). Disable the rust
+# threadpool before any tokenizer load. Use setdefault so users can override.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 logger = logging.getLogger(__name__)
 

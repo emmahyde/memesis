@@ -75,7 +75,11 @@ class TestConsolidationDecisionAction:
 
     def test_unknown_action_string_rejected(self):
         with pytest.raises(ValidationError):
-            ConsolidationDecision(**_keep_decision(action="supersede"))
+            ConsolidationDecision(**_keep_decision(action="unrecognized_action"))
+
+    def test_supersede_action_accepted(self):
+        d = ConsolidationDecision(**_keep_decision(action="supersede"))
+        assert d.action == "supersede"
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +122,8 @@ class TestConsolidationDecisionImportance:
         d = ConsolidationDecision(**data)
         assert d.importance is None
 
-    def test_raw_importance_validated_same_way(self):
-        with pytest.raises(ValidationError):
-            ConsolidationDecision(**_keep_decision(raw_importance=2.0))
+    # raw_importance removed: field dropped from Memory schema + ConsolidationDecision
+    # (write-only field with no read path; see migration 0007).
 
 
 # ---------------------------------------------------------------------------

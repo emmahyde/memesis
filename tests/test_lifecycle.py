@@ -14,8 +14,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.lifecycle import LifecycleManager
-from core.database import init_db, close_db, get_base_dir, get_db_path
-from core.models import Memory, ConsolidationLog, RetrievalLog, db
+from core.database import init_db, close_db
+from core.models import Memory, ConsolidationLog, RetrievalLog
 from core.tiers import stage_to_tier, tier_ttl
 
 
@@ -45,6 +45,9 @@ def _create_memory(stage='ephemeral', title='Test Memory', content='Test content
         importance=kwargs.get('importance', 0.5),
         reinforcement_count=kwargs.get('reinforcement_count', 0),
         usage_count=kwargs.get('usage_count', 0),
+        # Classified by default so consolidated rows clear the can_promote
+        # memory_kind gate; tests exercising the gate pass memory_kind=None.
+        memory_kind=kwargs.get('memory_kind', 'fact'),
         created_at=now,
         updated_at=now,
     )
@@ -92,7 +95,8 @@ def _record_usage(memory_id, session_id):
     ).execute()
 
 
-def test_promote_ephemeral_to_consolidated(base, manager):
+@pytest.mark.usefixtures("base")
+def test_promote_ephemeral_to_consolidated(manager):
     """Test promotion from ephemeral to consolidated stage."""
     memory_id = _create_memory(stage='ephemeral', title='Test Memory')
 
@@ -113,7 +117,8 @@ def test_promote_ephemeral_to_consolidated(base, manager):
     assert row.rationale == 'Ready for consolidation'
 
 
-def test_promote_consolidated_to_crystallized_with_reinforcement(base, manager):
+@pytest.mark.usefixtures("base")
+def test_promote_consolidated_to_crystallized_with_reinforcement(manager):
     """Test promotion to crystallized requires 3+ reinforcements (D-07)."""
     memory_id = _create_memory(
         stage='consolidated',
@@ -128,7 +133,8 @@ def test_promote_consolidated_to_crystallized_with_reinforcement(base, manager):
     assert new_stage == 'crystallized'
 
 
-def test_cannot_promote_without_reinforcement(base, manager):
+@pytest.mark.usefixtures("base")
+def test_cannot_promote_without_reinforcement(manager):
     """Test promotion to crystallized blocked without 3 reinforcements."""
     memory_id = _create_memory(
         stage='consolidated',
@@ -143,7 +149,8 @@ def test_cannot_promote_without_reinforcement(base, manager):
         manager.promote(memory_id, rationale='Trying to promote')
 
 
-def test_promote_crystallized_to_instinctive(base, manager):
+@pytest.mark.usefixtures("base")
+def test_promote_crystallized_to_instinctive(manager):
     """Test promotion to instinctive requires importance > 0.85 and 10+ sessions."""
     memory_id = _create_memory(
         stage='crystallized',
@@ -166,7 +173,8 @@ def test_promote_crystallized_to_instinctive(base, manager):
     assert new_stage == 'instinctive'
 
 
-def test_cannot_promote_low_importance_to_instinctive(base, manager):
+@pytest.mark.usefixtures("base")
+def test_cannot_promote_low_importance_to_instinctive(manager):
     """Test promotion to instinctive blocked by low importance."""
     memory_id = _create_memory(
         stage='crystallized',
@@ -184,7 +192,8 @@ def test_cannot_promote_low_importance_to_instinctive(base, manager):
     assert 'too low' in reason.lower()
 
 
-def test_cannot_skip_stages_on_promotion(base, manager):
+@pytest.mark.usefixtures("base")
+def test_cannot_skip_stages_on_promotion(manager):
     """Test that promotion cannot skip stages."""
     _create_memory(stage='ephemeral')
 
@@ -195,7 +204,8 @@ def test_cannot_skip_stages_on_promotion(base, manager):
     assert is_valid is False
 
 
-def test_demote_memory(base, manager):
+@pytest.mark.usefixtures("base")
+def test_demote_memory(manager):
     """Test demotion of memory to lower stage."""
     memory_id = _create_memory(stage='crystallized')
 
@@ -216,7 +226,8 @@ def test_demote_memory(base, manager):
     assert row.rationale == 'Low usage'
 
 
-def test_demotion_can_skip_stages(base, manager):
+@pytest.mark.usefixtures("base")
+def test_demotion_can_skip_stages(manager):
     """Test that demotion can skip stages (unlike promotion)."""
     is_valid = manager.validate_transition('instinctive', 'consolidated')
     assert is_valid is True
@@ -225,7 +236,8 @@ def test_demotion_can_skip_stages(base, manager):
     assert is_valid is True
 
 
-def test_deprecate_memory(base, manager):
+@pytest.mark.usefixtures("base")
+def test_deprecate_memory(manager):
     """Test deprecation moves memory to archived directory."""
     memory_id = _create_memory(stage='ephemeral')
 
@@ -245,7 +257,8 @@ def test_deprecate_memory(base, manager):
     assert row.to_stage == 'archived'
 
 
-def test_get_promotion_candidates(base, manager):
+@pytest.mark.usefixtures("base")
+def test_get_promotion_candidates(manager):
     """Test retrieval of memories eligible for promotion to crystallized."""
     memory_1 = _create_memory(
         stage='consolidated',
@@ -274,7 +287,8 @@ def test_get_promotion_candidates(base, manager):
     assert memory_2 not in candidate_ids
 
 
-def test_get_demotion_candidates(base, manager):
+@pytest.mark.usefixtures("base")
+def test_get_demotion_candidates(manager):
     """Test retrieval of memories with high injection but no usage (D-09)."""
     memory_id = _create_memory(
         stage='crystallized',
@@ -294,7 +308,8 @@ def test_get_demotion_candidates(base, manager):
     assert 'never used' in candidates[0]['reason'].lower()
 
 
-def test_get_demotion_candidates_ignores_used_memories(base, manager):
+@pytest.mark.usefixtures("base")
+def test_get_demotion_candidates_ignores_used_memories(manager):
     """Test that demotion candidates exclude memories that are actually used."""
     memory_id = _create_memory(
         stage='crystallized',
@@ -311,7 +326,8 @@ def test_get_demotion_candidates_ignores_used_memories(base, manager):
     assert len(candidates) == 0
 
 
-def test_get_deprecation_candidates(base, manager):
+@pytest.mark.usefixtures("base")
+def test_get_deprecation_candidates(manager):
     """Test retrieval of stale memories for deprecation."""
     memory_id = _create_memory(
         stage='ephemeral',
@@ -329,7 +345,8 @@ def test_get_deprecation_candidates(base, manager):
     assert 'No activity' in candidates[0]['reason']
 
 
-def test_cannot_promote_from_highest_stage(base, manager):
+@pytest.mark.usefixtures("base")
+def test_cannot_promote_from_highest_stage(manager):
     """Test that instinctive memories cannot be promoted further."""
     memory_id = _create_memory(stage='instinctive')
 
@@ -341,7 +358,8 @@ def test_cannot_promote_from_highest_stage(base, manager):
         manager.promote(memory_id, rationale='Trying to promote')
 
 
-def test_cannot_demote_from_lowest_stage(base, manager):
+@pytest.mark.usefixtures("base")
+def test_cannot_demote_from_lowest_stage(manager):
     """Test that ephemeral memories cannot be demoted further."""
     memory_id = _create_memory(stage='ephemeral')
 
@@ -361,7 +379,8 @@ def test_validate_transition_same_stage(manager):
     assert manager.validate_transition('consolidated', 'consolidated') is False
 
 
-def test_promotion_updates_stage(base, manager):
+@pytest.mark.usefixtures("base")
+def test_promotion_updates_stage(manager):
     """Test that promotion updates the stage."""
     memory_id = _create_memory(stage='ephemeral')
 
@@ -374,7 +393,8 @@ def test_promotion_updates_stage(base, manager):
     assert updated.stage == 'consolidated'
 
 
-def test_multiple_promotions_in_sequence(base, manager):
+@pytest.mark.usefixtures("base")
+def test_multiple_promotions_in_sequence(manager):
     """Test promoting a memory through multiple stages."""
     memory_id = _create_memory(
         stage='ephemeral',
@@ -413,10 +433,22 @@ def test_multiple_promotions_in_sequence(base, manager):
 # -------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("base")
 class TestSpacingEffect:
     """Test brain-inspired spacing effect for promotion quality."""
 
-    def test_burst_reinforcement_blocked(self, base, manager):
+    @pytest.fixture(autouse=True)
+    def _enable_spacing_gate(self, monkeypatch):
+        """The spacing gate is globally disabled (commit 065d1d0 set MIN_REINFORCEMENT_SPAN_DAYS=0).
+
+        These tests exist to verify the gate works *when enabled*. Re-enable
+        per-test via monkeypatch so the gate's behavior is exercised without
+        flipping the global default.
+        """
+        from core.lifecycle import LifecycleManager
+        monkeypatch.setattr(LifecycleManager, "MIN_REINFORCEMENT_SPAN_DAYS", 2)
+
+    def test_burst_reinforcement_blocked(self, manager):
         """3 reinforcements on the same day should NOT qualify for promotion."""
         memory_id = _create_memory(
             stage='consolidated',
@@ -436,7 +468,7 @@ class TestSpacingEffect:
         assert can_promote is False
         assert 'spacing' in reason.lower() or 'distinct day' in reason.lower()
 
-    def test_spaced_reinforcement_allowed(self, base, manager):
+    def test_spaced_reinforcement_allowed(self, manager):
         """3 reinforcements across 3 different days should qualify."""
         memory_id = _create_memory(
             stage='consolidated',
@@ -455,7 +487,7 @@ class TestSpacingEffect:
         assert can_promote is True
         assert 'distinct days' in reason.lower() or 'reinforcement' in reason.lower()
 
-    def test_two_days_is_minimum_spacing(self, base, manager):
+    def test_two_days_is_minimum_spacing(self, manager):
         """Reinforcements spanning exactly 2 distinct days should pass."""
         memory_id = _create_memory(
             stage='consolidated',
@@ -471,7 +503,7 @@ class TestSpacingEffect:
         can_promote, reason = manager.can_promote(memory_id)
         assert can_promote is True
 
-    def test_no_log_entries_fallback(self, base, manager):
+    def test_no_log_entries_fallback(self, manager):
         """Legacy memories with no consolidation log entries should still promote."""
         memory_id = _create_memory(
             stage='consolidated',
@@ -481,7 +513,7 @@ class TestSpacingEffect:
         can_promote, reason = manager.can_promote(memory_id)
         assert can_promote is True
 
-    def test_spacing_does_not_affect_count_check(self, base, manager):
+    def test_spacing_does_not_affect_count_check(self, manager):
         """Count check still applies -- 2 reinforcements fail even if spaced."""
         memory_id = _create_memory(
             stage='consolidated',
@@ -496,7 +528,7 @@ class TestSpacingEffect:
         assert can_promote is False
         assert 'need 3+' in reason.lower()
 
-    def test_get_promotion_candidates_respects_spacing(self, base, manager):
+    def test_get_promotion_candidates_respects_spacing(self, manager):
         """get_promotion_candidates should filter out burst-reinforced memories."""
         # Memory with spaced reinforcement
         spaced_id = _create_memory(
@@ -529,12 +561,13 @@ class TestSpacingEffect:
 # -------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("base")
 class TestExpiryWiring:
     """Test that promote/demote set expires_at via set_expiry (B2)."""
 
     SLACK = 10  # seconds of tolerance for timestamp comparisons
 
-    def test_promote_sets_expires_at(self, base, manager):
+    def test_promote_sets_expires_at(self, manager):
         """After promote(), expires_at is non-null and approximately now + T3 TTL."""
         memory_id = _create_memory(stage='ephemeral')
 
@@ -550,7 +583,7 @@ class TestExpiryWiring:
         assert memory.expires_at is not None
         assert before + expected_ttl - self.SLACK <= memory.expires_at <= after + expected_ttl + self.SLACK
 
-    def test_demote_sets_expires_at_to_lower_tier(self, base, manager):
+    def test_demote_sets_expires_at_to_lower_tier(self, manager):
         """After demote(), expires_at reflects the lower tier TTL."""
         memory_id = _create_memory(stage='crystallized')
 
@@ -566,7 +599,7 @@ class TestExpiryWiring:
         assert memory.expires_at is not None
         assert before + expected_ttl - self.SLACK <= memory.expires_at <= after + expected_ttl + self.SLACK
 
-    def test_promote_to_instinctive_sets_expires_at_none(self, base, manager):
+    def test_promote_to_instinctive_sets_expires_at_none(self, manager):
         """T1 (instinctive) promotion sets expires_at = None (never expire)."""
         memory_id = _create_memory(
             stage='crystallized',
@@ -584,7 +617,7 @@ class TestExpiryWiring:
         assert memory.stage == 'instinctive'
         assert memory.expires_at is None
 
-    def test_demote_from_instinctive_sets_expires_at(self, base, manager):
+    def test_demote_from_instinctive_sets_expires_at(self, manager):
         """Demoting from instinctive (T1) to crystallized (T2) sets expires_at."""
         memory_id = _create_memory(stage='instinctive')
 
@@ -600,7 +633,7 @@ class TestExpiryWiring:
         assert memory.expires_at is not None
         assert before + expected_ttl - self.SLACK <= memory.expires_at <= after + expected_ttl + self.SLACK
 
-    def test_deprecate_does_not_call_set_expiry(self, base, manager):
+    def test_deprecate_does_not_call_set_expiry(self, manager):
         """deprecate() (archive path) must NOT set expires_at — archived_at handles exclusion."""
         memory_id = _create_memory(stage='ephemeral')
 
@@ -609,3 +642,104 @@ class TestExpiryWiring:
 
         with pytest.raises(Memory.DoesNotExist):
             Memory.get_by_id(memory_id)
+
+
+# -------------------------------------------------------------------
+# Importance-gated hybrid crystallization gate
+# -------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("base")
+class TestImportanceGatedCrystallization:
+    """Hybrid gate: high-importance memories crystallize at any rc; standard path at rc=3.
+
+    The ``_setup`` fixture keeps spacing active (MIN_REINFORCEMENT_SPAN_DAYS=2)
+    specifically to prove the high-importance path ignores it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch):
+        from core.lifecycle import LifecycleManager
+        monkeypatch.setattr(LifecycleManager, "MIN_REINFORCEMENT_SPAN_DAYS", 2)
+        monkeypatch.setattr(LifecycleManager, "CRYSTALLIZE_IMPORTANCE_THRESH", 0.75)
+
+    def test_high_importance_rc0_promotes(self, manager):
+        """importance >= thresh promotes at rc=0 — no reinforcement required."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=0, importance=0.80)
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+        assert 'high-importance' in reason.lower()
+
+    def test_high_importance_rc1_promotes(self, manager):
+        """importance >= thresh promotes at rc=1."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=1, importance=0.80)
+        _add_reinforcement_log(memory_id, datetime(2026, 3, 1, 10, 0), "s1")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+        assert 'high-importance' in reason.lower()
+
+    def test_high_importance_ignores_spacing(self, manager):
+        """High-importance path promotes even with same-day (unspaced) reinforcements."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.90)
+        same_day = datetime(2026, 3, 15, 9, 0)
+        _add_reinforcement_log(memory_id, same_day, "s1")
+        _add_reinforcement_log(memory_id, same_day.replace(hour=14), "s2")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+        assert 'high-importance' in reason.lower()
+
+    def test_importance_at_threshold_qualifies(self, manager):
+        """importance == thresh exactly is accepted (>= boundary), at rc=0."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=0, importance=0.75)
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+
+    def test_low_importance_rc0_blocks(self, manager):
+        """importance < thresh AND rc=0 -> blocked on standard path (need 3+)."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=0, importance=0.60)
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is False
+        assert 'need 3+' in reason.lower()
+
+    def test_low_importance_rc2_blocks(self, manager):
+        """importance < thresh AND rc=2 -> still blocked on standard path (need 3+)."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=2, importance=0.60)
+        base = datetime(2026, 3, 1, 10, 0)
+        _add_reinforcement_log(memory_id, base, "s1")
+        _add_reinforcement_log(memory_id, base + timedelta(days=2), "s2")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is False
+        assert 'need 3+' in reason.lower()
+
+    def test_rc3_promotes_regardless_of_importance(self, manager):
+        """rc >= 3 with low importance still crystallizes via standard path."""
+        memory_id = _create_memory(stage='consolidated', reinforcement_count=3, importance=0.40)
+        base = datetime(2026, 3, 1, 10, 0)
+        for i in range(3):
+            _add_reinforcement_log(memory_id, base + timedelta(days=i * 2), f"s{i}")
+
+        can, reason = manager.can_promote(memory_id)
+        assert can is True
+
+    def test_get_promotion_candidates_filters_by_importance(self, manager):
+        """get_promotion_candidates returns high-importance memories at any rc, not low ones."""
+        hi_id = _create_memory(
+            stage='consolidated', title='High importance', reinforcement_count=0, importance=0.80
+        )
+        lo_id = _create_memory(
+            stage='consolidated', title='Low importance', reinforcement_count=2, importance=0.50
+        )
+        base = datetime(2026, 3, 1, 10, 0)
+        _add_reinforcement_log(lo_id, base, "s3")
+        _add_reinforcement_log(lo_id, base + timedelta(days=2), "s4")
+
+        candidates = manager.get_promotion_candidates()
+        ids = [c['id'] for c in candidates]
+        assert hi_id in ids
+        assert lo_id not in ids

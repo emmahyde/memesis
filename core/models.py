@@ -67,6 +67,7 @@ class Memory(BaseModel):
     content = TextField(null=True)
     tags = TextField(null=True)  # JSON string
     importance = FloatField(default=0.5, null=True)
+    raw_importance = FloatField(null=True)          # Stage 1 score before Stage 2 re-scoring (C7)
     reinforcement_count = IntegerField(default=0, null=True)
     created_at = TextField(null=True)
     updated_at = TextField(null=True)
@@ -75,7 +76,10 @@ class Memory(BaseModel):
     injection_count = IntegerField(default=0, null=True)
     usage_count = IntegerField(default=0, null=True)
     project_context = TextField(null=True)
+    project = TextField(null=True)            # slug: -Users-emmahyde-projects-memesis
     source_session = TextField(null=True)
+    source_pr = TextField(null=True)                  # PR associated with this memory (reserved; set post-hoc)
+    commit_ref = TextField(null=True)                  # git short SHA at creation time — provenance trace
     content_hash = TextField(null=True)
     archived_at = TextField(null=True)
     subsumed_by = TextField(null=True)
@@ -86,7 +90,8 @@ class Memory(BaseModel):
     files_modified = TextField(null=True, default="[]")  # JSON array of relative paths
 
     # W2 schema additions
-    kind = TextField(null=True)                       # decision | finding | preference | constraint | correction | open_question
+    kind = TextField(null=True)                       # observation-extraction taxonomy: decision | finding | preference | constraint | correction | open_question
+    memory_kind = TextField(null=True, index=True)    # curated taxonomy (canvas review §1): decision|lesson|gotcha|goal|invariant|opinion|bias|todo|debt|fact — see core/validators.py
     knowledge_type = TextField(null=True)             # factual | conceptual | procedural | metacognitive
     knowledge_type_confidence = TextField(null=True)  # low | high
     subject = TextField(null=True)                    # self | user | system | collaboration | workflow | aesthetic | domain
@@ -94,7 +99,6 @@ class Memory(BaseModel):
     subtitle = TextField(null=True)                   # ≤24 words retrieval card
     cwd = TextField(null=True)                        # multi-project attribution
     session_type = TextField(null=True)               # code | writing | research | null (Sprint B forward-compat)
-    raw_importance = FloatField(null=True)            # Stage 1 importance, preserved for audit (C7)
     linked_observation_ids = TextField(null=True)     # JSON-serialized list of UUIDs
 
     # WS-H: open_question lifecycle fields (Sprint B DS-F9)
@@ -102,11 +106,9 @@ class Memory(BaseModel):
     resolved_at = DateTimeField(null=True)         # when this question was resolved (set on question row)
     is_pinned = IntegerField(default=0, null=True) # 1 = exempt from auto-pruning (open_questions)
 
-    # DS-F3 forward-compat: shadow-prune logger fields
-    access_count = IntegerField(default=0, null=True)
+    # DS-F3 forward-compat: shadow-prune logger fields.
+    # access_count + w2_created_at dropped in migration 0007: 0% set, no readers.
     last_accessed_at = DateTimeField(null=True)
-    # NOTE: created_at already exists as TextField; w2_created_at captures timezone-aware value
-    w2_created_at = DateTimeField(null=True, default=lambda: datetime.now(timezone.utc))
 
     # Agentic-memory BLOCKER set (B4 + E3)
     expires_at = IntegerField(null=True)          # Unix timestamp; NULL = never expires (T1)
@@ -131,6 +133,16 @@ class Memory(BaseModel):
     # kind is already defined above (W2 schema); evidence_count and evidence_session_ids are new.
     evidence_count = IntegerField(default=0, null=True)          # number of sessions that observed this hypothesis
     evidence_session_ids = TextField(default='[]', null=True)    # JSON array of session IDs that contributed evidence
+
+    # Verifier sweep: declarative staleness predicate (see core/verifier.py)
+    verify_kind = TextField(null=True)   # grep_present | grep_absent | file_exists | test_passes
+    verify_arg = TextField(null=True)    # predicate argument: regex, repo-relative path, or pytest node id
+
+    # Cluster anchoring: named cluster slug; retrieval expands 1-hop to siblings
+    cluster = TextField(null=True, index=True)  # see core/graph.py:expand_clusters
+
+    # Bundled-row decomposer: 1 once the decomposer sweep has audited this row
+    decompose_checked = IntegerField(default=0, null=True)  # see core/decomposer.py
 
     class Meta:
         table_name = "memories"
@@ -158,6 +170,34 @@ class Memory(BaseModel):
             return value if isinstance(value, list) else []
         except (ValueError, TypeError):
             return []
+
+    # -- Construction safeguard ----------------------------------------
+
+    def __init__(self, *args, **kwargs):
+        """Warn on unknown kwargs to catch silent-accept gotcha.
+
+        Peewee accepts arbitrary keyword arguments to Model.create() / __init__,
+        setting unknown names as instance attributes that never persist to DB.
+        Production code reading via Memory.select() / get_by_id() then sees None,
+        producing tests that pass-by-accident.
+        """
+        if kwargs:
+            field_names = set(self._meta.fields.keys()) if hasattr(self, "_meta") else set()
+            # Allow Peewee internal kwargs (e.g., __data__, __dirty__) and known non-column attrs
+            allowed_extras = {"embedding"}  # vec store backed attr — see core/linking.py:_get_embedding_bytes
+            unknown = [
+                k for k in kwargs
+                if k not in field_names
+                and not k.startswith("__")
+                and k not in allowed_extras
+            ]
+            if unknown:
+                logger.warning(
+                    "Memory.__init__: unknown kwargs %s — will NOT persist to DB. "
+                    "If you meant to inject for testing, set as attribute AFTER construction.",
+                    unknown,
+                )
+        super().__init__(*args, **kwargs)
 
     # -- Scopes --------------------------------------------------------
 
@@ -525,12 +565,37 @@ class MemoryEdge(BaseModel):
     edge_type = TextField()
     weight = FloatField(default=1.0)
     metadata = TextField(null=True)  # JSON: evidence, affect, timestamps
+    resolution_state = TextField(default='unresolved')
 
     class Meta:
         table_name = "memory_edges"
 
     # Edge types that compute_edges() rebuilds from scratch each run.
     RECOMPUTABLE_TYPES = {"thread_neighbor", "tag_cooccurrence"}
+
+
+# ---------------------------------------------------------------------------
+# ContradictionReview
+# ---------------------------------------------------------------------------
+
+
+class ContradictionReview(BaseModel):
+    """Queued human-review rows for BLOCK verdicts from the contradiction resolver."""
+
+    id = AutoField()
+    memory_id = TextField()
+    edge_id = IntegerField()
+    other_memory_id = TextField()
+    project = TextField(null=True)
+    llm_rationale = TextField(null=True)
+    status = TextField(default='open')
+    created_at = TextField()
+    recheck_fingerprint = TextField(null=True)
+    retry_count = IntegerField(default=0)
+    resolved_at = TextField(null=True)
+
+    class Meta:
+        table_name = "contradiction_reviews"
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +661,13 @@ class ConsolidationLog(BaseModel):
 
 
 class Observation(BaseModel):
-    """Raw and filtered observations captured before consolidation decisions."""
+    """Raw and filtered observations captured before consolidation decisions.
+
+    Note: `ordinal` is 0-indexed by historical convention (first observation = 0).
+    The consolidator's runtime ref dicts use 1-indexed ordinals (see _record_observations).
+    Diagnostic queries joining on Observation.ordinal must add 1 to match the LLM-visible
+    OBSERVATION_ID values echoed back in obs_ids.
+    """
 
     id = AutoField()
     created_at = TextField(default=lambda: datetime.now().isoformat())
@@ -609,6 +680,7 @@ class Observation(BaseModel):
     status = TextField(null=True)
     memory_id = TextField(null=True)
     metadata = TextField(null=True)
+    project = TextField(null=True)            # slug: -Users-emmahyde-projects-memesis
 
     class Meta:
         table_name = "observations"
@@ -695,3 +767,69 @@ class MemoryEmbedding(BaseModel):
 
     class Meta:
         table_name = "memory_embeddings"
+
+
+# ---------------------------------------------------------------------------
+# Rule
+# ---------------------------------------------------------------------------
+
+
+class Rule(BaseModel):
+    """An enforced behavioural guardrail — distinct from a Memory.
+
+    A rule is born from a memory (LLM-proposed) or authored directly by the
+    user. Unlike memories it has no stage progression and no decay: it carries
+    a machine-checkable predicate (``check_kind`` + ``check_arg``) that the
+    PreToolUse guard evaluates against every tool call, soft-blocking
+    violations.
+
+    check_kind values:
+      forbid_bash_pattern — check_arg is a regex matched against Bash commands
+      forbid_path_edit    — check_arg is a glob matched against Edit/Write paths
+      require_absent      — check_arg is a regex that must not appear in input
+      semantic            — check_arg is a natural-language rule, LLM-judged
+
+    severity: ``block`` (deny the call), ``ask`` (defer to the user), ``warn``
+    (surface only). status: ``proposed`` (inert), ``active`` (enforced),
+    ``disabled``. scope: NULL = global, else a project slug or path glob.
+    """
+
+    id = TextField(primary_key=True, default=lambda: uuid.uuid4().hex)
+    text = TextField()
+    check_kind = TextField()
+    check_arg = TextField(null=True)
+    severity = TextField(default="block")
+    status = TextField(default="proposed", index=True)
+    scope = TextField(null=True)
+    source_memory_id = TextField(null=True)
+    violation_count = IntegerField(default=0)
+    commit_ref = TextField(null=True)
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+    updated_at = TextField(default=lambda: datetime.now().isoformat())
+
+    class Meta:
+        table_name = "rules"
+
+
+# ---------------------------------------------------------------------------
+# SessionDigest
+# ---------------------------------------------------------------------------
+
+
+class SessionDigest(BaseModel):
+    """A short topic label + summary for one session, written at PreCompact.
+
+    Two consumers: the SessionStart panel groups memories per session using
+    ``topic``, and the post-compact session reads ``summary`` to recover what
+    the pre-compact session was doing. ``memory_ids`` is a JSON array of the
+    memories consolidated from that session.
+    """
+
+    session_id = TextField(primary_key=True)
+    topic = TextField()
+    summary = TextField(null=True)
+    memory_ids = TextField(null=True)
+    created_at = TextField(default=lambda: datetime.now().isoformat())
+
+    class Meta:
+        table_name = "session_digest"

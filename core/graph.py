@@ -103,7 +103,7 @@ def expand_neighbors(
 
     Returns neighbor IDs not already in seed_ids, limited to max_expansion.
     Causal edge types are prioritised over structural ones.  Within the
-    same priority tier, neighbors are ordered by sqlite-vec cosine
+    same priority tier, neighbors are ordered by vec store cosine
     similarity to the seed set centroid (when available).
     """
     if not get_flag("graph_expansion") or not seed_ids:
@@ -141,6 +141,43 @@ def expand_neighbors(
             ranked = _rerank_with_similarity(ranked, similarities)
 
     return [tid for tid, _ in ranked[:max_expansion]]
+
+
+def expand_clusters(seed_ids: list[str], max_expansion: int = 10) -> list[str]:
+    """Expand seed memory IDs to their cluster siblings (cluster anchoring).
+
+    When hybrid search surfaces any memory carrying a ``cluster`` value, its
+    sibling members in the same cluster are pulled into the candidate pool so a
+    coherent cluster surfaces together rather than one member at a time.
+
+    Returns sibling IDs not already in seed_ids, bounded by max_expansion.
+    Gated on the same ``graph_expansion`` flag as expand_neighbors.
+    """
+    if not get_flag("graph_expansion") or not seed_ids:
+        return []
+
+    seed_set = set(seed_ids)
+    clusters = {
+        m.cluster
+        for m in Memory.select(Memory.cluster).where(
+            Memory.id.in_(seed_ids), Memory.cluster.is_null(False)
+        )
+    }
+    clusters.discard(None)
+    clusters.discard("")
+    if not clusters:
+        return []
+
+    siblings = (
+        Memory.select(Memory.id)
+        .where(
+            Memory.cluster.in_(list(clusters)),
+            Memory.id.not_in(seed_ids),
+            Memory.archived_at.is_null(),
+        )
+        .limit(max_expansion)
+    )
+    return [m.id for m in siblings if m.id not in seed_set][:max_expansion]
 
 
 def _centroid_similarities(

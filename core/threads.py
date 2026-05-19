@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_embeddings(memories: list):
-    """Retrieve stored embeddings from vec_memories."""
+    """Retrieve stored embeddings from memory_embeddings."""
     try:
         import struct
         import numpy as np
@@ -561,6 +561,7 @@ def _create_thread_contradiction_edges(
                 edge_type="contradicts",
                 weight=0.3,
                 metadata=meta,
+                resolution_state='resolved',
             )
             logger.info(
                 "Thread contradiction edge: %s -[contradicts]-> %s (thread=%s)",

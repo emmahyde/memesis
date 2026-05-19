@@ -18,18 +18,33 @@ import os
 import struct
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 from .models import Memory
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration — OD-D: threshold parameterized via env var (default 0.90)
+# Configuration — OD-D: threshold parameterized via env var.
+# Recalibrated 2026-05-13 for bge-small-en-v1.5 @ 384d (was 0.90 for Titan @ 1024d).
+# Empirical distribution on N=300 pairs from this corpus: mean=0.645, stdev=0.046,
+# max=0.927. 0.72 ≈ mean + 1.5σ — captures genuine semantic neighbors while staying
+# clear of the dense background-similarity floor.
 # ---------------------------------------------------------------------------
 
-LINK_COSINE_THRESHOLD: float = float(os.environ.get("MEMESIS_LINK_THRESHOLD", "0.90"))
-LINK_MAX_NEIGHBORS: int = 3
+LINK_COSINE_THRESHOLD: float = float(os.environ.get("MEMESIS_LINK_THRESHOLD", "0.72"))
+# Auto-promote: when a newly KEPT memory is this close to an existing one,
+# treat it as a duplicate. Bump the existing memory's reinforcement_count and
+# archive the new dupe instead of leaving both in the store. Tighter than the
+# link threshold because the action is destructive (subsumes the new memory).
+LINK_AUTO_PROMOTE_THRESHOLD: float = float(os.environ.get("MEMESIS_AUTO_PROMOTE_THRESHOLD", "0.85"))
+# Paraphrase-aware dedup: embeddings of reworded duplicates often land *below*
+# the auto-promote threshold. Candidates whose cosine falls in the near-miss
+# band [LINK_LLM_REVIEW_FLOOR, LINK_AUTO_PROMOTE_THRESHOLD) are escalated to an
+# LLM duplicate-confirmation call. The LLM pass fires only when a near-miss
+# exists, so cost stays bounded — most KEEPs have no candidate in the band.
+LINK_LLM_REVIEW_FLOOR: float = float(os.environ.get("MEMESIS_DEDUP_LLM_FLOOR", "0.70"))
+LINK_MAX_NEIGHBORS: int = 5
 LINK_MIN_NEIGHBORS: int = 0  # may return empty list
 
 _TRACE_PATH = Path(
@@ -66,11 +81,24 @@ def _get_embedding_bytes(memory) -> bytes | None:
     """
     Retrieve raw embedding bytes for a Memory.
 
-    Tries VecStore (sqlite-vec) first, then falls back to the inline
-    ``embedding`` attribute if present (test injection path).
+    Precedence — inline first, then VecStore:
+      1. ``memory.embedding`` attribute (list[float] or bytes). Test-injection path.
+      2. VecStore lookup keyed by memory.id. Production path. VecStore is the
+         numpy-over-Peewee-BlobField implementation in core/vec.py (replaced
+         sqlite-vec + apsw); 384-dim float32 blobs.
+
+    GOTCHA: inline only works for memories the caller constructed and held a
+    reference to. Memories returned by ``Memory.select()`` / ``Memory.get_by_id()``
+    are fresh instances with no inline ``embedding`` attribute, so they fall
+    through to VecStore. Tests that need similarity matching across multiple
+    memories (e.g. ``link_memory``, ``auto_promote_if_dupe``, both of which
+    fetch candidates via ``Memory.select()``) MUST persist embeddings via
+    ``vec_store.store_embedding(memory_id, bytes)`` — setting ``mem.embedding``
+    inline on the test fixture is not enough.
+
+    See ``tests/test_linking.py::_persist_with_embedding`` for the canonical
+    pattern.
     """
-    # Test-injection path: Memory objects in tests may carry a synthetic
-    # ``embedding`` attribute that is already a list[float] or bytes.
     inline = getattr(memory, "embedding", None)
     if inline is not None:
         if isinstance(inline, (bytes, bytearray)):
@@ -175,6 +203,107 @@ def detect_topic_drift(new_memory, linked_memory) -> bool:
     return new_kind != lnk_kind and new_subject != lnk_subject and new_kt != lnk_kt
 
 
+def _llm_confirms_duplicate(mem_a, mem_b) -> bool:
+    """Ask the LLM whether two near-miss memories are duplicates.
+
+    Returns False on any error — a failed confirmation must never trigger the
+    destructive subsumption. Compares all text fields (title + summary + content)
+    so paraphrases that embeddings miss can still be caught.
+    """
+    try:
+        from .llm import call_llm
+        from .prompts import DEDUP_CONFIRM_PROMPT
+
+        prompt = DEDUP_CONFIRM_PROMPT.format(
+            a_title=mem_a.title or "",
+            a_summary=mem_a.summary or "",
+            a_content=(mem_a.content or "")[:1500],
+            b_title=mem_b.title or "",
+            b_summary=mem_b.summary or "",
+            b_content=(mem_b.content or "")[:1500],
+        )
+        raw = call_llm(prompt, max_tokens=16, temperature=0)
+    except Exception as exc:  # noqa: BLE001 — never let dedup confirmation crash a KEEP
+        logger.warning("dedup LLM confirmation failed: %s", exc)
+        return False
+    verdict = (raw or "").strip().upper()
+    return verdict.startswith("DUPLICATE") or "DUPLICATE" in verdict
+
+
+def auto_promote_if_dupe(memory) -> Optional[str]:
+    """
+    If a newly created memory is near-identical (cosine >= LINK_AUTO_PROMOTE_THRESHOLD)
+    to an existing non-archived memory, treat it as a duplicate KEEP:
+      - bump the existing memory's reinforcement_count
+      - archive the new memory and set subsumed_by to the survivor
+    Returns the survivor's id if subsumption occurred, else None.
+
+    Called from the consolidator after link_memory() to collapse semantic dupes
+    that the LLM didn't recognize as PROMOTE-worthy.
+    """
+    from datetime import datetime
+    try:
+        candidates = list(
+            Memory.select().where(
+                Memory.archived_at.is_null(),
+                Memory.id != str(memory.id),
+            )
+        )
+    except Exception as exc:
+        logger.warning("auto_promote_if_dupe: candidate load failed for %s: %s", memory.id, exc)
+        return None
+    if not candidates:
+        return None
+    neighbors = find_links_for_observation(
+        memory,
+        candidates,
+        threshold=LINK_AUTO_PROMOTE_THRESHOLD,
+        top_k=1,
+    )
+    if neighbors:
+        target_id, score = neighbors[0]
+    else:
+        # Near-miss band: cosine missed it, but a paraphrase may still be a
+        # duplicate. Escalate the best near-miss to an LLM judgment call.
+        near = find_links_for_observation(
+            memory,
+            candidates,
+            threshold=LINK_LLM_REVIEW_FLOOR,
+            top_k=1,
+        )
+        if not near:
+            return None
+        cand_id, cand_score = near[0]
+        if cand_score >= LINK_AUTO_PROMOTE_THRESHOLD:
+            return None  # would have been caught above; defensive
+        try:
+            cand = Memory.get_by_id(cand_id)
+        except Memory.DoesNotExist:
+            return None
+        if not _llm_confirms_duplicate(memory, cand):
+            return None
+        logger.info(
+            "AUTO-PROMOTE: LLM confirmed paraphrase duplicate %s ~ %s (cosine=%.3f)",
+            str(memory.id)[:8], str(cand_id)[:8], cand_score,
+        )
+        target_id, score = cand_id, cand_score
+    try:
+        target = Memory.get_by_id(target_id)
+    except Memory.DoesNotExist:
+        return None
+    target.reinforcement_count = (target.reinforcement_count or 0) + 1
+    target.save()
+    Memory.update(
+        archived_at=datetime.now().isoformat(),
+        subsumed_by=target_id,
+    ).where(Memory.id == str(memory.id)).execute()
+    logger.info(
+        "AUTO-PROMOTE: %s subsumed by %s (cosine=%.3f, target rc=%d)",
+        str(memory.id)[:8], str(target_id)[:8], score, target.reinforcement_count,
+    )
+    return target_id
+
+
 def link_memory(memory, db_session=None) -> list[str]:
     """
     High-level wrapper: compute cosine links for a newly created Memory,
@@ -248,6 +377,35 @@ def link_memory(memory, db_session=None) -> list[str]:
         memory.save()
     except Exception as exc:
         logger.warning("Could not save linked_observation_ids for %s: %s", memory.id, exc)
+
+    # Emit bidirectional similar edges in memory_edges for each linked pair.
+    # These are incremental edges (not rebuilt by compute_edges) and are
+    # resolution_state=resolved — similar edges need no LLM review.
+    if selected_entries:
+        from .models import MemoryEdge
+        mid_str = str(memory.id)
+        for entry in selected_entries:
+            lid = entry["id"]
+            score = entry["score"]
+            for src, tgt in [(mid_str, lid), (lid, mid_str)]:
+                exists = (
+                    MemoryEdge.select()
+                    .where(
+                        MemoryEdge.source_id == src,
+                        MemoryEdge.target_id == tgt,
+                        MemoryEdge.edge_type == "similar",
+                    )
+                    .count()
+                )
+                if not exists:
+                    MemoryEdge.create(
+                        source_id=src,
+                        target_id=tgt,
+                        edge_type="similar",
+                        weight=round(score, 4),
+                        resolution_state="resolved",
+                        metadata=json.dumps({"cosine": round(score, 4), "source": "cosine_linking"}),
+                    )
 
     # Observability trace
     _emit_trace(

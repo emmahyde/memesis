@@ -84,9 +84,9 @@ class TestStage1PromptStructure:
         assert '"reason"' in OBSERVATION_EXTRACT_PROMPT
 
     def test_no_empty_array_for_skip(self):
-        # Must instruct to use skip signal, not empty array
+        # Must instruct that the skip `considered` list is required and non-empty
         lower = OBSERVATION_EXTRACT_PROMPT.lower()
-        assert "do not return an empty array" in lower or "not return an empty array" in lower
+        assert "must be non-empty" in lower
 
     def test_verb_anchor_list(self):
         # At least a subset of the required verbs from claude-mem code.json
@@ -155,8 +155,7 @@ class TestStage2PromptStructure:
         lower = CONSOLIDATION_PROMPT.lower()
         assert "re-score" in lower or "re score" in lower or "independently" in lower
 
-    def test_raw_importance_field(self):
-        assert "raw_importance" in CONSOLIDATION_PROMPT
+    # raw_importance dropped in migration 0007 (write-only, no readers)
 
     def test_importance_field(self):
         assert '"importance"' in CONSOLIDATION_PROMPT
@@ -236,24 +235,29 @@ class TestStage2PromptStructure:
 
 class TestSessionTypeGuidance:
     def test_research_guidance_present(self):
-        assert "research" in OBSERVATION_EXTRACT_PROMPT
-        # work_event=null guidance must appear in the prompt (via SESSION_TYPE GUIDANCE)
-        assert "work_event=null" in OBSERVATION_EXTRACT_PROMPT
+        # work_event=null guidance lives in SESSION_TYPE_GUIDANCE['research'] and is
+        # injected only when session_type='research' is rendered.
+        formatted = format_extract_prompt(
+            transcript="sample", session_type="research", affect_hint="",
+        )
+        assert "work_event=null" in formatted
 
     def test_writing_guidance_present(self):
-        assert "writing" in OBSERVATION_EXTRACT_PROMPT
-        assert "aesthetic choices" in OBSERVATION_EXTRACT_PROMPT
+        formatted = format_extract_prompt(
+            transcript="sample", session_type="writing", affect_hint="",
+        )
+        assert "aesthetic choices" in formatted
 
     def test_skip_friction_present(self):
-        # "name one specific" must appear before the skip sentinel ({{"skipped": true, ...}})
+        # SKIP PROTOCOL friction text must appear before the skip sentinel.
         skip_sentinel = '{{"skipped": true,'
-        friction_phrase = "name one specific"
+        friction_phrase = "SKIP PROTOCOL"
         prompt = OBSERVATION_EXTRACT_PROMPT
         assert friction_phrase in prompt, f"'{friction_phrase}' not found in OBSERVATION_EXTRACT_PROMPT"
         friction_pos = prompt.index(friction_phrase)
         sentinel_pos = prompt.index(skip_sentinel)
         assert friction_pos < sentinel_pos, (
-            "SKIP DISCIPLINE ('name one specific') must appear before the skip sentinel"
+            "SKIP PROTOCOL must appear before the skip sentinel"
         )
 
     def test_no_new_format_placeholders(self):
@@ -267,7 +271,9 @@ class TestSessionTypeGuidance:
         )
 
     def test_session_type_guidance_block_header(self):
-        assert "SESSION_TYPE GUIDANCE" in OBSERVATION_EXTRACT_PROMPT or "SESSION-TYPE EXTRACTION GUIDANCE" in OBSERVATION_EXTRACT_PROMPT
+        # Session-type guidance is injected via the {session_type_guidance}
+        # placeholder; the labelled line must be present in the rendered prompt.
+        assert "Session-type guidance:" in OBSERVATION_EXTRACT_PROMPT
 
     def test_code_session_type_guidance_present(self):
         assert "code" in OBSERVATION_EXTRACT_PROMPT

@@ -3,6 +3,8 @@ from pathlib import Path
 from datetime import date
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.cursors import CursorStore
@@ -17,7 +19,20 @@ from core.transcript_ingest import (  # type: ignore[import]
     _refine_observations,
     discover_transcripts,
     append_to_ephemeral,
+    global_memory_dir,
 )
+
+
+@pytest.fixture(autouse=True)
+def _home_in_tmp(tmp_path, monkeypatch):
+    """Redirect HOME into tmp_path.
+
+    tick() / append_to_ephemeral resolve the global store via
+    transcript_ingest.global_memory_dir() -> ~/.claude/memory. Without this
+    redirect, tests would stage ephemeral buffers in the real user store
+    (CLAUDE.md Rule 3).
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def test_new_session_seeds_cursor_at_eof(tmp_path):
@@ -60,7 +75,12 @@ def test_known_session_with_delta_extracts_observations(tmp_path):
     assert results["processed"] == 1
     assert results["observations_total"] == 1
 
-    buffer = tmp_path / "projects" / "proj-hash" / "memory" / "ephemeral" / f"session-{date.today().isoformat()}.md"
+    # Single global store: buffer stages under
+    # ~/.claude/memory/ephemeral/<project-slug>/ (slug = projects/<slug> dir).
+    buffer = (
+        global_memory_dir() / "ephemeral" / "proj-hash"
+        / f"session-{date.today().isoformat()}.md"
+    )
     assert buffer.exists()
     assert "Auth uses JWT" in buffer.read_text()
 
@@ -133,7 +153,7 @@ def test_extract_observations_array_with_obs_returns_filtered_list():
     assert result[0]["content"] == "Auth uses JWT"
 
 
-def test_extract_observations_skipped_dict_returns_empty_list(tmp_path, caplog):
+def test_extract_observations_skipped_dict_returns_empty_list(caplog):
     """{"skipped": true, "reason": "..."} → empty list, skip trace logged."""
     import logging
     import json
@@ -177,7 +197,7 @@ def test_extract_observations_passes_session_type_to_prompt():
     obs = [{"content": "finding", "mode": "finding", "importance": 0.6, "tags": []}]
     captured_prompts: list[str] = []
 
-    def fake_llm(prompt: str) -> str:
+    def fake_llm(prompt: str, **kwargs) -> str:
         captured_prompts.append(prompt)
         return json.dumps(obs)
 
@@ -198,19 +218,20 @@ def test_tick_attaches_session_type_to_observations(tmp_path):
     with CursorStore(cursors_db) as store:
         store.upsert("session-st1", str(transcript), 0)
 
-    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/projects/sector",
-                     "message": {"role": "user", "content": "hello"}}]
+    fake_entries = [{"role": "user", "text": "hello"}]
     # Observation without session_type — tick should add it
     fake_obs = [{"content": "some finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
-    def fake_append(mem_dir, observations, dry_run=False):
+    def fake_append(*args, **kwargs):
+        observations = args[1]
         captured_obs.append(list(observations))
         return len(observations)
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, "/Users/emmahyde/projects/sector")), \
+         patch("core.transcript_ingest.extract_tool_uses", return_value=[]), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -232,18 +253,19 @@ def test_tick_code_cwd_produces_code_session_type(tmp_path):
     with CursorStore(cursors_db) as store:
         store.upsert("session-st2", str(transcript), 0)
 
-    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/projects/sector",
-                     "message": {"role": "user", "content": "hello"}}]
+    fake_entries = [{"role": "user", "text": "hello"}]
     fake_obs = [{"content": "code finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
-    def fake_append(mem_dir, observations, dry_run=False):
+    def fake_append(*args, **kwargs):
+        observations = args[1]
         captured_obs.append(list(observations))
         return len(observations)
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, "/Users/emmahyde/projects/sector")), \
+         patch("core.transcript_ingest.extract_tool_uses", return_value=[]), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -263,18 +285,19 @@ def test_tick_writing_cwd_produces_writing_session_type(tmp_path):
     with CursorStore(cursors_db) as store:
         store.upsert("session-st3", str(transcript), 0)
 
-    fake_entries = [{"type": "user", "cwd": "/Users/emmahyde/manuscript/chapter-01",
-                     "message": {"role": "user", "content": "hello"}}]
+    fake_entries = [{"role": "user", "text": "hello"}]
     fake_obs = [{"content": "writing finding", "mode": "finding", "importance": 0.7, "tags": []}]
     captured_obs: list[list[dict]] = []
 
-    def fake_append(mem_dir, observations, dry_run=False):
+    def fake_append(*args, **kwargs):
+        observations = args[1]
         captured_obs.append(list(observations))
         return len(observations)
 
     with patch("core.transcript_ingest.discover_transcripts", return_value=[transcript]), \
          patch("core.transcript_ingest.CursorStore", lambda: CursorStore(cursors_db)), \
-         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, None)), \
+         patch("core.transcript_ingest.read_transcript_from", return_value=(fake_entries, transcript.stat().st_size, "/Users/emmahyde/manuscript/chapter-01")), \
+         patch("core.transcript_ingest.extract_tool_uses", return_value=[]), \
          patch("core.transcript_ingest.summarize", return_value="summarized text"), \
          patch("core.transcript_ingest.extract_observations", return_value=fake_obs), \
          patch("core.transcript_ingest.append_to_ephemeral", side_effect=fake_append):
@@ -402,7 +425,7 @@ class TestJsonRepair:
         import json
         drop_stats: dict = {}
         raw = json.dumps([{"content": "clean obs", "importance": 0.6}])
-        obs, reason = _parse_extract_response(raw, drop_stats=drop_stats)
+        obs, _ = _parse_extract_response(raw, drop_stats=drop_stats)
         assert len(obs) == 1
         assert obs[0]["content"] == "clean obs"
         assert drop_stats.get("parse_errors_repaired", 0) == 0
@@ -413,7 +436,7 @@ class TestJsonRepair:
         raw = "totally not json at all }{]["
         obs, reason = _parse_extract_response(raw, drop_stats=drop_stats)
         assert obs == []
-        assert reason is None
+        assert reason is not None and "[parse_error]" in reason
         # Repair counter should NOT increment for garbage that can't be repaired
         assert drop_stats.get("parse_errors_repaired", 0) == 0
 
@@ -654,8 +677,7 @@ class TestPrefilterResearchNeutral:
 
     def test_research_zero_affect_skipped(self):
         """Research session + max_boost==0.0 → windows skipped, call_llm_batch not called for them."""
-        import json
-        from unittest.mock import patch, call as mock_call
+        from unittest.mock import patch
         from core.transcript_ingest import extract_observations_hierarchical
         import core.transcript_ingest as ti
 

@@ -391,3 +391,194 @@ def test_linking_trace_jsonl_schema(in_memory_db, monkeypatch, tmp_path):
     assert isinstance(entry["rejected_above_threshold_due_to_top_k_cap"], list)
     assert isinstance(entry["threshold"], float)
     assert isinstance(entry["candidate_count"], int)
+
+
+# ---------------------------------------------------------------------------
+# auto_promote_if_dupe — the mechanism that makes crystallization reachable
+# ---------------------------------------------------------------------------
+
+
+def _padded_unit(prefix: list[float], dim: int = 384) -> list[float]:
+    """Build a `dim`-D unit vector with `prefix` in leading slots, zeros elsewhere."""
+    if len(prefix) > dim:
+        raise ValueError("prefix too long")
+    padded = list(prefix) + [0.0] * (dim - len(prefix))
+    return _unit(padded)
+
+
+def _persist_with_embedding(values: list[float], **kwargs) -> Memory:
+    """Persist a Memory row AND store its 384-D embedding in the vec table."""
+    from core.database import get_vec_store
+    mem = Memory.create(
+        stage=kwargs.get("stage", "consolidated"),
+        title=kwargs.get("title", "T"),
+        summary=kwargs.get("summary", "S"),
+        content=kwargs.get("content", "C"),
+        importance=kwargs.get("importance", 0.5),
+        reinforcement_count=kwargs.get("reinforcement_count", 0),
+    )
+    padded = _padded_unit(values)
+    vec_store = get_vec_store()
+    if vec_store is not None and vec_store.available:
+        vec_store.store_embedding(mem.id, _make_embedding(padded))
+    mem.embedding = _make_embedding(padded)
+    return mem
+
+
+def test_auto_promote_no_candidates_returns_none(in_memory_db):
+    """Single memory with no peers → no auto-promote."""
+    from core.linking import auto_promote_if_dupe
+    mem = _persist_with_embedding([1.0, 0.0])
+    assert auto_promote_if_dupe(mem) is None
+
+
+def test_auto_promote_below_threshold_returns_none(in_memory_db):
+    """Dissimilar peer (cosine well under 0.85) → no auto-promote."""
+    from core.linking import auto_promote_if_dupe
+    _persist_with_embedding([1.0, 0.0])  # peer
+    new_mem = _persist_with_embedding([0.0, 1.0])  # orthogonal
+    assert auto_promote_if_dupe(new_mem) is None
+
+
+def test_auto_promote_above_threshold_subsumes_new(in_memory_db):
+    """Near-identical peer (cosine ~1.0) → new memory subsumed, peer's rc bumped."""
+    from core.linking import auto_promote_if_dupe
+    peer = _persist_with_embedding([1.0, 0.001], reinforcement_count=1)
+    new_mem = _persist_with_embedding([1.0, 0.0])
+
+    survivor_id = auto_promote_if_dupe(new_mem)
+    assert survivor_id == peer.id
+
+    refreshed_peer = Memory.get_by_id(peer.id)
+    assert refreshed_peer.reinforcement_count == 2
+
+    archived = Memory.get_by_id(new_mem.id)
+    assert archived.archived_at is not None
+    assert archived.subsumed_by == peer.id
+
+
+def test_auto_promote_skips_archived_candidates(in_memory_db):
+    """Archived peers are not candidates even if cosine-similar."""
+    from datetime import datetime
+    from core.linking import auto_promote_if_dupe
+    peer = _persist_with_embedding([1.0, 0.0])
+    Memory.update(archived_at=datetime.now().isoformat()).where(Memory.id == peer.id).execute()
+    new_mem = _persist_with_embedding([1.0, 0.001])
+    assert auto_promote_if_dupe(new_mem) is None
+
+
+def test_auto_promote_between_link_and_auto_thresholds_returns_none(in_memory_db):
+    """Cosine in [0.70, 0.85) → escalates to LLM; an LLM "DISTINCT" → no subsume.
+
+    Near-misses in the band are now LLM-reviewed for paraphrase duplicates
+    (paraphrase-aware dedup). Cosine alone no longer decides: only the 0.85 gate
+    or an LLM "DUPLICATE" confirmation triggers destructive subsumption.
+    """
+    import math
+    from unittest.mock import patch
+    from core.linking import auto_promote_if_dupe
+    # Angle ≈ 30° → cosine ≈ 0.866 — too high. Use ≈ 36° → cosine ≈ 0.809.
+    theta = math.radians(36.0)
+    _persist_with_embedding([1.0, 0.0])
+    new_mem = _persist_with_embedding([math.cos(theta), math.sin(theta)])
+    with patch("core.llm.call_llm", return_value="DISTINCT"):
+        assert auto_promote_if_dupe(new_mem) is None
+
+
+def test_auto_promote_bumps_rc_to_crystallization_threshold(in_memory_db):
+    """Three sequential near-dupes land a memory at rc=3 — ready for crystallizer.
+
+    This is the integration path: each duplicate observation that the LLM
+    failed to mark PROMOTE gets caught by auto_promote_if_dupe and bumps
+    the existing memory's rc. Three of them = ready for crystallization.
+    """
+    from core.linking import auto_promote_if_dupe
+
+    target = _persist_with_embedding([1.0, 0.001], reinforcement_count=0)
+
+    for _ in range(3):
+        new_mem = _persist_with_embedding([1.0, 0.0])
+        survivor = auto_promote_if_dupe(new_mem)
+        assert survivor == target.id
+
+    final = Memory.get_by_id(target.id)
+    assert final.reinforcement_count == 3
+
+
+# ---------------------------------------------------------------------------
+# link_memory — real candidate flow (not the patched-out variant)
+# ---------------------------------------------------------------------------
+
+
+def test_link_memory_real_flow_links_similar_peers(in_memory_db):
+    """link_memory should find similar peers when their embeddings are in the vec store.
+
+    Earlier coverage patched Memory.select to return empty, bypassing the
+    candidate matching path. This test exercises it for real.
+    """
+    from core.linking import link_memory
+
+    # Two near-identical peers (already in the store with vec embeddings)
+    peer_a = _persist_with_embedding([1.0, 0.0], title="peer-a")
+    peer_b = _persist_with_embedding([0.99, 0.01], title="peer-b")
+    # One distant peer that should not link
+    _persist_with_embedding([0.0, 1.0], title="peer-distant")
+    new_mem = _persist_with_embedding([1.0, 0.005], title="new")
+
+    linked = link_memory(new_mem)
+
+    assert peer_a.id in linked
+    assert peer_b.id in linked
+    refreshed = Memory.get_by_id(new_mem.id)
+    stored = json.loads(refreshed.linked_observation_ids or "[]")
+    assert sorted(stored) == sorted(linked)
+
+
+def test_link_memory_real_flow_respects_threshold(in_memory_db):
+    """Below-threshold peers must not appear in linked_observation_ids."""
+    import math
+    from core.linking import link_memory
+
+    # Angle ≈ 60° → cosine ≈ 0.5 — well below LINK_COSINE_THRESHOLD (0.72)
+    theta = math.radians(60.0)
+    _persist_with_embedding([math.cos(theta), math.sin(theta)], title="far-peer")
+    new_mem = _persist_with_embedding([1.0, 0.0], title="new")
+
+    linked = link_memory(new_mem)
+    assert linked == []
+
+
+def test_link_memory_real_flow_excludes_archived(in_memory_db):
+    """Archived peers are excluded by the Memory.select() WHERE clause."""
+    from datetime import datetime
+    from core.linking import link_memory
+
+    peer = _persist_with_embedding([1.0, 0.0], title="archived-peer")
+    Memory.update(archived_at=datetime.now().isoformat()).where(Memory.id == peer.id).execute()
+    new_mem = _persist_with_embedding([1.0, 0.001], title="new")
+
+    linked = link_memory(new_mem)
+    assert peer.id not in linked
+
+
+def test_link_memory_real_flow_caps_at_max_neighbors(in_memory_db):
+    """Top-k cap (LINK_MAX_NEIGHBORS) limits the number of linked peers even when many qualify."""
+    from core.linking import link_memory, LINK_MAX_NEIGHBORS
+
+    # Create more near-identical peers than the cap allows
+    for i in range(LINK_MAX_NEIGHBORS + 2):
+        _persist_with_embedding([1.0, 0.001 * (i + 1)], title=f"peer-{i}")
+    new_mem = _persist_with_embedding([1.0, 0.0], title="new")
+
+    linked = link_memory(new_mem)
+    assert len(linked) <= LINK_MAX_NEIGHBORS
+
+
+def test_link_memory_real_flow_skips_self(in_memory_db):
+    """A memory cannot link to itself even though it's in the DB."""
+    from core.linking import link_memory
+
+    new_mem = _persist_with_embedding([1.0, 0.0], title="solo")
+
+    linked = link_memory(new_mem)
+    assert new_mem.id not in linked

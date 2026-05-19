@@ -505,6 +505,7 @@ def _create_contradiction_edges(
                     edge_type="contradicts",
                     weight=0.7,
                     metadata=meta,
+                    resolution_state='resolved' if resolved else 'unresolved',
                 )
                 logger.info(
                     "Contradiction edge: %s -[contradicts]-> %s (resolved=%s)",
@@ -524,6 +525,7 @@ def _create_contradiction_edges(
                     edge_type="contradicts",
                     weight=0.7,
                     metadata=meta,
+                    resolution_state='resolved' if resolved else 'unresolved',
                 )
                 logger.info(
                     "Contradiction edge: %s -[contradicts]-> %s (resolved=%s)",

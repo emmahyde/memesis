@@ -50,29 +50,34 @@ def _mock_decisions(kept_count: int = 2, prune_count: int = 8) -> list[dict]:
     """Build the list of decision dicts that _call_llm returns."""
     decisions = []
     for i in range(kept_count):
-        decisions.append({
-            "observation": f"Observation {i}",
-            "action": "keep",
-            "rationale": f"Important fact {i}",
-            "title": f"Memory {i}",
-            "summary": f"Summary of memory {i}",
-            "tags": ["test"],
-            "target_path": f"observations/memory_{i}.md",
-            "reinforces": None,
-            "contradicts": None,
-        })
+        decisions.append(
+            {
+                "observation": f"Observation {i}",
+                "action": "keep",
+                "rationale": f"Important fact {i}",
+                "title": f"Memory {i}",
+                "summary": f"Summary of memory {i}",
+                "kind": "correction",
+                "tags": ["type:correction", "test"],
+                "target_path": f"observations/memory_{i}.md",
+                "reinforces": None,
+                "contradicts": None,
+            }
+        )
     for i in range(prune_count):
-        decisions.append({
-            "observation": f"Trivial {i}",
-            "action": "prune",
-            "rationale": "Not worth keeping",
-            "title": None,
-            "summary": None,
-            "tags": [],
-            "target_path": None,
-            "reinforces": None,
-            "contradicts": None,
-        })
+        decisions.append(
+            {
+                "observation": f"Trivial {i}",
+                "action": "prune",
+                "rationale": "Not worth keeping",
+                "title": None,
+                "summary": None,
+                "tags": [],
+                "target_path": None,
+                "reinforces": None,
+                "contradicts": None,
+            }
+        )
     return decisions
 
 
@@ -113,7 +118,7 @@ def _record_injection(memory_id, session_id):
         timestamp=now,
         session_id=session_id,
         memory_id=memory_id,
-        retrieval_type='injected',
+        retrieval_type="injected",
     )
 
 
@@ -123,7 +128,6 @@ def _record_injection(memory_id, session_id):
 
 
 class TestFullLifecycleEphemeralToCrystallized:
-
     def test_full_lifecycle_ephemeral_to_crystallized(self, tmp_path):
         init_db(base_dir=str(tmp_path / "memory"))
         try:
@@ -133,13 +137,25 @@ class TestFullLifecycleEphemeralToCrystallized:
             ephemeral_dir = get_base_dir() / "ephemeral"
             ephemeral_dir.mkdir(parents=True, exist_ok=True)
 
-            # Session 1: 10 observations -> 2 KEEP, 8 PRUNE
+            # Session 1: 10 observations -> 2 KEEP, 8 PRUNE.
+            # Patch auto_promote_if_dupe to None: the mock observations are
+            # semantically near-identical ("Observation 0" / "Observation 1"),
+            # which correctly triggers the dedup path added in the crystallization
+            # commit.  This test covers lifecycle progression, not dedup; isolate
+            # from embedding-similarity behavior to avoid brittleness.
             session1_file = tmp_path / "session1.md"
             _write_ephemeral(tmp_path, "session1.md", n_obs=10)
 
-            with patch("core.consolidator._call_llm_transport",
-                       return_value=json.dumps({"decisions": _mock_decisions(2, 8)})):
-                result = consolidator.consolidate_session(str(session1_file), "session-1")
+            with (
+                patch(
+                    "core.consolidator._call_llm_batch",
+                    return_value=[json.dumps({"decisions": _mock_decisions(2, 8)})],
+                ),
+                patch("core.consolidator.auto_promote_if_dupe", return_value=None),
+            ):
+                result = consolidator.consolidate_session(
+                    str(session1_file), "session-1"
+                )
 
             assert len(result["kept"]) == 2
             assert len(result["pruned"]) == 8
@@ -156,8 +172,20 @@ class TestFullLifecycleEphemeralToCrystallized:
 
                 promote_decisions = _promote_decisions_for(kept_ids)
 
-                with patch("core.consolidator._call_llm_transport",
-                           return_value=json.dumps({"decisions": promote_decisions})):
+                with (
+                    patch(
+                        "core.consolidator._call_llm_batch",
+                        return_value=[json.dumps({"decisions": promote_decisions})],
+                    ),
+                    patch.object(
+                        lifecycle,
+                        "can_promote",
+                        return_value=(
+                            False,
+                            "skipped — explicit promotion tested below",
+                        ),
+                    ),
+                ):
                     result = consolidator.consolidate_session(
                         str(session_file), f"session-{session_num}"
                     )
@@ -168,8 +196,8 @@ class TestFullLifecycleEphemeralToCrystallized:
             rows = list(
                 ConsolidationLog.select()
                 .where(
-                    (ConsolidationLog.action == 'promoted') &
-                    (ConsolidationLog.from_stage == ConsolidationLog.to_stage)
+                    (ConsolidationLog.action == "promoted")
+                    & (ConsolidationLog.from_stage == ConsolidationLog.to_stage)
                 )
                 .order_by(ConsolidationLog.id)
             )
@@ -192,7 +220,9 @@ class TestFullLifecycleEphemeralToCrystallized:
 
             # Promote to crystallized
             for mid in kept_ids:
-                new_stage = lifecycle.promote(mid, rationale="3+ reinforcements reached")
+                new_stage = lifecycle.promote(
+                    mid, rationale="3+ reinforcements reached"
+                )
                 assert new_stage == "crystallized"
 
             crystallized = list(Memory.by_stage("crystallized"))
@@ -279,8 +309,8 @@ class TestForgetMemory:
 
             # Verify deprecation was logged
             row = ConsolidationLog.get_or_none(
-                (ConsolidationLog.memory_id == memory_id) &
-                (ConsolidationLog.action == 'deprecated')
+                (ConsolidationLog.memory_id == memory_id)
+                & (ConsolidationLog.action == "deprecated")
             )
             assert row is not None
         finally:
@@ -338,9 +368,25 @@ class TestManifestReflectsActualState:
     def test_manifest_reflects_actual_state(self, tmp_path):
         init_db(base_dir=str(tmp_path / "memory"))
         try:
-            _create_memory("instinctive", "Core Guideline", "Core behavioral guideline.", summary="Always active.")
-            _create_memory("crystallized", "Crystal Fact", "An important crystallized memory.", summary="Important crystallized knowledge.", importance=0.9)
-            _create_memory("consolidated", "Consolidated Note", "A consolidated observation.", summary="A recent observation.")
+            _create_memory(
+                "instinctive",
+                "Core Guideline",
+                "Core behavioral guideline.",
+                summary="Always active.",
+            )
+            _create_memory(
+                "crystallized",
+                "Crystal Fact",
+                "An important crystallized memory.",
+                summary="Important crystallized knowledge.",
+                importance=0.9,
+            )
+            _create_memory(
+                "consolidated",
+                "Consolidated Note",
+                "A consolidated observation.",
+                summary="A recent observation.",
+            )
 
             manifest_gen = ManifestGenerator()
             manifest_gen.write_manifest()
@@ -389,5 +435,3 @@ class TestFeedbackImportanceUpdates:
             assert updated.importance < 0.5
         finally:
             close_db()
-
-

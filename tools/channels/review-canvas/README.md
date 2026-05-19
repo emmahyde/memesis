@@ -7,6 +7,11 @@ into the running Claude Code session as `<channel source="review-canvas">`
 events. Claude responds via the `reply` tool — replies appear inline in the
 web UI under the comment they answer.
 
+Each comment is a **thread**: after Claude replies, a follow-up box appears
+under the comment so the conversation can continue. Follow-ups POST to
+`/followup`, reach the session as `followup`-tagged channel events keyed by
+the same `comment_id`, and Claude answers again with the `reply` tool.
+
 ## Architecture
 
 - **MCP server** (Bun + `@modelcontextprotocol/sdk`) connects to Claude Code over stdio.

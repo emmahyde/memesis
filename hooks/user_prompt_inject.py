@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hooks._safe import emit_stderr, emit_stdout
+from hooks._safe import emit_context, emit_stderr, emit_stdout
 
 from core.affect import coherence_probe, load_analyzer, save_analyzer, format_guidance
 from core.database import get_base_dir, get_vec_store, init_db
@@ -32,6 +32,11 @@ TOKEN_BUDGET_CHARS = 2000
 
 # Max memories to inject per prompt.
 MAX_MEMORIES = 3
+
+# How many top-ranked matches are injected in full. Lower-ranked matches
+# collapse into a compact pointer line. Corrections are always injected in
+# full, regardless of this rank.
+FULL_INJECT_RANK = 1
 
 # Minimum word length to include in FTS query.
 MIN_WORD_LENGTH = 4
@@ -93,6 +98,39 @@ def get_already_injected(session_id: str) -> set[str]:
     return {r.memory_id for r in rows}
 
 
+def _is_correction(memory) -> bool:
+    """A correction memory — always injected in full, never abbreviated."""
+    return (
+        getattr(memory, "kind", None) == "correction"
+        or getattr(memory, "polarity", None) == "corrective"
+    )
+
+
+def _first_tags(memory, limit: int = 3) -> str:
+    """Comma-joined first few tags of a memory, for the pointer line."""
+    raw = getattr(memory, "tags", None)
+    if not raw:
+        return ""
+    try:
+        tags = json.loads(raw) if isinstance(raw, str) else raw
+        return ", ".join(str(t) for t in list(tags)[:limit])
+    except (ValueError, TypeError):
+        return ""
+
+
+def _format_pointer_line(memories: list) -> str:
+    """A single compact line pointing at weakly-matched memories."""
+    refs = []
+    for m in memories:
+        short_id = (m.id or '')[:8]
+        ref = f"[{short_id}]"
+        tags = _first_tags(m)
+        if tags:
+            ref += f" ({tags})"
+        refs.append(ref)
+    return f"💡 {len(memories)} related — recall {' · '.join(refs)}"
+
+
 def search_and_inject(
     prompt: str,
     session_id: str,
@@ -145,6 +183,7 @@ def search_and_inject(
 
     # --- Tier 3 JIT: all-stage hybrid search (supplements Tier 2) ---
     tier3_candidates: list = []
+    ranked: list = []
     try:
         if engine is None:
             engine = RetrievalEngine()
@@ -185,29 +224,49 @@ def search_and_inject(
     if not candidates:
         return ""
 
-    # Select top memories within token budget
-    selected = []
+    # Partition candidates into full-content injections and compact pointers.
+    # `candidates` is already in merged relevance order. A correction is ALWAYS
+    # injected in full, with stronger framing, and bypasses the per-prompt cap.
+    # Other memories inject in full only for the top FULL_INJECT_RANK by
+    # relevance; weaker matches collapse into a single pointer line.
+    full_blocks: list = []      # (block_text, memory)
+    pointer_mems: list = []
     budget_remaining = TOKEN_BUDGET_CHARS
+    noncorrection_count = 0
+    rank = 0
 
-    for memory in candidates[:MAX_MEMORIES]:
-        content = memory.content or ""
-        summary = memory.summary or ""
+    for memory in candidates:
+        is_correction = _is_correction(memory)
+        if not is_correction and noncorrection_count >= MAX_MEMORIES:
+            continue
+
         title = memory.title or "Memory"
+        display = memory.summary or (memory.content or "")[:300]
 
-        # Prefer summary for brevity; fall back to content
-        display = summary if summary else content[:300]
-        cost = len(display) + len(title) + 20  # overhead for formatting
+        if is_correction:
+            full_blocks.append((f"⛔ CORRECTION — {title}: {display}", memory))
+            continue
 
-        if cost <= budget_remaining:
-            selected.append((title, display, memory))
-            budget_remaining -= cost
+        full = rank < FULL_INJECT_RANK
+        rank += 1
+        if full:
+            block = f"[Memory: {title}] {display}"
+            if len(block) > budget_remaining:
+                continue
+            budget_remaining -= len(block)
+            full_blocks.append((block, memory))
+            noncorrection_count += 1
+        else:
+            pointer_mems.append(memory)
+            noncorrection_count += 1
 
-    if not selected:
+    surfaced = [m for _, m in full_blocks] + pointer_mems
+    if not surfaced:
         return ""
 
-    # Log injections
+    # Log injections — full and pointer alike were surfaced to the agent.
     now = datetime.now().isoformat()
-    for _, _, memory in selected:
+    for memory in surfaced:
         Memory.update(
             last_injected_at=now,
             injection_count=Memory.injection_count + 1,
@@ -221,10 +280,9 @@ def search_and_inject(
             project_context=project_context,
         )
 
-    # Format output
-    lines = []
-    for title, display, _ in selected:
-        lines.append(f"[Memory: {title}] {display}")
+    lines = [block for block, _ in full_blocks]
+    if pointer_mems:
+        lines.append(_format_pointer_line(pointer_mems))
 
     return "\n".join(lines)
 
@@ -284,7 +342,8 @@ def main():
             except Exception:
                 pass  # affect tracking is best-effort
 
-        emit_stdout(result)
+        # Surface JIT injections to both the user and the model.
+        emit_context(result, "UserPromptSubmit")
 
     except Exception as exc:
         # Never crash the user's prompt

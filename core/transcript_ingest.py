@@ -29,6 +29,7 @@ from datetime import date
 from pathlib import Path
 
 from core.transcript import (
+    extract_tool_uses,
     read_transcript_from,
     summarize,
     iter_windows,
@@ -37,12 +38,9 @@ from core.transcript import (
 from core.cursors import CursorStore
 from core.llm import call_llm, call_llm_batch, _repair_json  # noqa: F401
 from core.prompts import (
-    OBSERVATION_EXTRACT_PROMPT,
     OBSERVATION_TYPES,
     format_observation,
     format_extract_prompt,
-    _OBSERVATION_EXTRACT_PROMPT_TEMPLATE,
-    SESSION_TYPE_GUIDANCE,
 )
 from core.session_detector import detect_session_type, RESEARCH_PATH_HINTS_PREPEND
 from core.extraction_affect import aggregate_window_affect, apply_affect_prior, format_affect_hint, WindowAffect
@@ -50,6 +48,7 @@ from core.issue_cards import synthesize_issue_cards
 from core.card_validators import _card_evidence_load_bearing
 from core.rule_registry import ParameterOverrides
 from core.trace import get_active_writer
+from core.validators import validate_stage1_soft
 
 # Module-level prefilter knobs are deprecated — settings now live on
 # `ParameterOverrides` (core.rule_registry) so the closed-loop registry can
@@ -151,7 +150,7 @@ If no refinement is warranted, return {{"refined": <input observations unchanged
 """
 
 
-def discover_transcripts(max_age_hours: int = 25) -> list[Path]:
+def discover_transcripts(max_age_hours: int = 60 * 24) -> list[Path]:
     """Glob JSONL transcripts modified within max_age_hours, sorted newest-first.
 
     Sorted by modification time descending so tick(max_sessions=N) always
@@ -166,9 +165,29 @@ def discover_transcripts(max_age_hours: int = 25) -> list[Path]:
     return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def project_memory_dir(jsonl_path: Path) -> Path:
-    """Return the memory dir for the project containing jsonl_path."""
-    return jsonl_path.parent / "memory"
+# memesis uses ONE global store. Per-project `index.db` files are gone:
+# project identity lives in the `project` column. Ephemeral buffers stage
+# under <global>/ephemeral/<slug>/ so the consolidator can still recover the
+# originating project for each buffer.
+
+
+def global_memory_dir() -> Path:
+    """The single global memory store, ~/.claude/memory.
+
+    Resolved at call time (not import) so tests can redirect HOME — mirrors
+    core.database._resolve_db_path.
+    """
+    return Path.home() / ".claude" / "memory"
+
+
+def transcript_project_slug(jsonl_path: Path) -> str:
+    """Return the Claude Code project slug for a transcript.
+
+    The slug is the `~/.claude/projects/<slug>/` directory name (e.g.
+    `-Users-emmahyde-projects-memesis`); it is stamped into the `project`
+    column and used to scope the ephemeral staging sub-directory.
+    """
+    return jsonl_path.parent.name
 
 
 def _write_ingest_trace(outcome: str, reason: str, raw_excerpt: str) -> None:
@@ -226,9 +245,12 @@ def extract_observations(
         })
 
     # #33: use format_extract_prompt() to inject per-session-type guidance
-    raw = call_llm(format_extract_prompt(
-        transcript=rendered, session_type=session_type, affect_hint=""
-    ))
+    raw = call_llm(
+        format_extract_prompt(
+            transcript=rendered, session_type=session_type, affect_hint=""
+        ),
+        system_prompt_file="extraction",
+    )
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -296,6 +318,29 @@ def extract_observations(
     return []
 
 
+def _soft_validate_window_obs(
+    obs: list[dict],
+    window_index: int,
+    drop_stats: dict | None,
+) -> None:
+    """Run soft validation on a window's observations and log warnings.
+
+    Never drops observations — soft mode for migration period (LLME-F6).
+    Accumulates schema_warnings count in drop_stats if provided.
+    """
+    for o in obs:
+        warnings = validate_stage1_soft(o)[1]
+        if warnings:
+            logger.debug(
+                "stage1 soft-validate window %d obs %r: %s",
+                window_index,
+                str(o.get("kind") or o.get("content", ""))[:40],
+                "; ".join(warnings),
+            )
+            if drop_stats is not None:
+                drop_stats["schema_warnings"] = drop_stats.get("schema_warnings", 0) + len(warnings)
+
+
 def _parse_extract_response(
     raw: str,
     *,
@@ -345,15 +390,22 @@ def _parse_extract_response(
             logger.warning("_parse_extract_response: JSON decode failed: %s", exc)
             if drop_stats is not None:
                 drop_stats["parse_errors"] = drop_stats.get("parse_errors", 0) + 1
-            return [], None
+            return [], skip_reason or "[parse_error] JSON decode failed"
 
     if isinstance(parsed, list):
         kept = [o for o in parsed if o.get("importance", 0) >= 0.3]
+        dropped = len(parsed) - len(kept)
         if drop_stats is not None:
             drop_stats["low_importance_dropped"] = (
-                drop_stats.get("low_importance_dropped", 0)
-                + (len(parsed) - len(kept))
+                drop_stats.get("low_importance_dropped", 0) + dropped
             )
+        if not kept:
+            empty_reason = (
+                f"[importance_gate] all {dropped} observation(s) below 0.3 threshold"
+                if dropped
+                else (skip_reason or "[empty_response] LLM returned no observations")
+            )
+            return [], empty_reason
         return kept, None
 
     if isinstance(parsed, dict):
@@ -378,13 +430,13 @@ def _parse_extract_response(
             "_parse_extract_response: LLM returned a dict without 'skipped' key — treating as malformed"
         )
         _write_ingest_trace("rejected", "dict response without skipped=true", raw_excerpt[:80])
-        return [], None
+        return [], skip_reason or "[malformed_response] dict without skipped=true"
 
     logger.warning(
         "_parse_extract_response: unexpected parsed type %s — discarding",
         type(parsed).__name__,
     )
-    return [], None
+    return [], skip_reason or f"[unexpected_type] {type(parsed).__name__}"
 
 
 def _normalize_for_dedupe(text: str) -> frozenset[str]:
@@ -450,7 +502,7 @@ def _refine_observations(
     )
 
     try:
-        raw = call_llm(prompt, max_tokens=8192)
+        raw = call_llm(prompt, max_tokens=8192, system_prompt_file="consolidation")
     except Exception as exc:  # noqa: BLE001
         logger.warning("_refine_observations: LLM call failed: %s", exc)
         return observations, {"merges": 0, "rescores": 0, "outcome": "llm_error", "error": str(exc)}
@@ -559,6 +611,7 @@ def extract_observations_hierarchical(
     productive_windows = 0
     parse_errors = 0
     cost_calls = 0
+    affect_signal_no_extraction = 0
     drop_stats: dict = {"low_importance_dropped": 0}
 
     # Three-stage cheapest-first prefilter. Each gate records distinct outcome.
@@ -690,6 +743,7 @@ def extract_observations_hierarchical(
 
             raw_list = call_llm_batch(
                 [prompt], max_concurrency=1, max_tokens=overrides.max_tokens_stage1,
+                system_prompt_file="extraction",
             )
             raw = raw_list[0] if raw_list else "[ERROR] empty batch response"
             cost_calls += 1
@@ -729,6 +783,7 @@ def extract_observations_hierarchical(
             if obs:
                 productive_windows += 1
                 apply_affect_prior(obs, affect)
+                _soft_validate_window_obs(obs, i, drop_stats)
 
                 # Embed each new observation and add to the in-session index.
                 # Join facts[] or fall back to content for embedding text.
@@ -761,6 +816,8 @@ def extract_observations_hierarchical(
                 if llm_reason is not None:
                     skip_record["llm_reason"] = llm_reason
                 skips.append(skip_record)
+                if affect.max_boost > 0:
+                    affect_signal_no_extraction += 1
 
             all_obs.extend(obs)
             logger.info(
@@ -802,7 +859,8 @@ def extract_observations_hierarchical(
                     })
             active_prompts = [prompts[i] for i in active_indices]
             active_responses = call_llm_batch(
-                active_prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+                active_prompts, max_concurrency=5, max_tokens=overrides.max_tokens_stage1,
+                system_prompt_file="extraction",
             )
             # Reassemble full-length response list with empty strings for skipped windows
             raw_responses = [""] * len(prompts)
@@ -810,7 +868,8 @@ def extract_observations_hierarchical(
                 raw_responses[dst_i] = active_responses[src_i]
         else:
             raw_responses = call_llm_batch(
-                prompts, max_concurrency=4, max_tokens=overrides.max_tokens_stage1,
+                prompts, max_concurrency=5, max_tokens=overrides.max_tokens_stage1,
+                system_prompt_file="extraction",
             )
 
         for i, (_w, raw, affect) in enumerate(zip(windows, raw_responses, affect_signals)):
@@ -850,6 +909,7 @@ def extract_observations_hierarchical(
             if obs:
                 productive_windows += 1
                 apply_affect_prior(obs, affect)
+                _soft_validate_window_obs(obs, i, drop_stats)
             else:
                 # Attempt to extract llm_reason from the raw response (if LLM emitted {"reason": ...})
                 llm_reason: str | None = None
@@ -871,6 +931,8 @@ def extract_observations_hierarchical(
                 if llm_reason is not None:
                     skip_record["llm_reason"] = llm_reason
                 skips.append(skip_record)
+                if affect.max_boost > 0:
+                    affect_signal_no_extraction += 1
             all_obs.extend(obs)
             logger.info(
                 "hierarchical: window %d/%d → %d obs (affect=%s/%.2f)",
@@ -975,6 +1037,7 @@ def extract_observations_hierarchical(
         "cost_calls": cost_calls,
         "prefilter_skipped_count": len(prefiltered),
         "cross_window_dedup_hits": cross_window_dedup_hits,
+        "windows_with_affect_signal_but_no_card": affect_signal_no_extraction,
     }
 
 
@@ -1082,12 +1145,21 @@ def append_to_ephemeral(
     memory_dir: Path,
     observations: list[dict],
     dry_run: bool = False,
+    project_slug: str | None = None,
 ) -> int:
-    """Append formatted observations to today's ephemeral session buffer."""
+    """Append formatted observations to today's ephemeral session buffer.
+
+    When `project_slug` is given the buffer is staged under
+    `<memory_dir>/ephemeral/<project_slug>/` so the consolidator can recover
+    the originating project. Without it the legacy flat path is used (tests).
+    """
     if not observations:
         return 0
 
-    target = memory_dir / "ephemeral" / f"session-{date.today().isoformat()}.md"
+    eph_dir = memory_dir / "ephemeral"
+    if project_slug:
+        eph_dir = eph_dir / project_slug
+    target = eph_dir / f"session-{date.today().isoformat()}.md"
     lines = []
     for obs in observations:
         # W5 lean schema: facts[] is the canonical field. obs["content"] is
@@ -1175,29 +1247,22 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
                 results["skipped"] += 1
                 continue
 
-            entries, new_offset, _ = read_transcript_from(path, cursor.last_byte_offset)
+            entries, new_offset, transcript_cwd = read_transcript_from(path, cursor.last_byte_offset)
 
             if not entries:
                 if not dry_run:
-                    store.upsert(session_id, str(path), new_offset)
+                    store.upsert(session_id, str(path), new_offset, cwd=transcript_cwd)
                 continue
 
             rendered = summarize(entries)
 
-            # Detect session type from cwd embedded in transcript entries + tool mix
-            session_cwd: str | None = None
-            tool_uses: list[dict] = []
-            for entry in entries:
-                msg = entry.get("message") or {}
-                # cwd lives at top-level or inside message
-                if not session_cwd:
-                    session_cwd = entry.get("cwd") or msg.get("cwd")
-                # Collect tool use entries for tool-mix heuristic
-                if entry.get("type") == "tool_use" or msg.get("type") == "tool_use":
-                    tool_name = entry.get("tool_name") or msg.get("name") or ""
-                    file_path = entry.get("input", {}).get("file_path") or ""
-                    if tool_name:
-                        tool_uses.append({"tool_name": tool_name, "file_path": file_path})
+            # cwd: attachment entries (carrying the cwd field) are filtered by
+            # read_transcript_from(); transcript_cwd comes from _detect_cwd() which
+            # scans the raw file separately.
+            # tool_uses: read_transcript_from() collapses content to {role,text},
+            # stripping tool metadata — scan raw JSONL via extract_tool_uses().
+            session_cwd: str | None = transcript_cwd
+            tool_uses: list[dict] = extract_tool_uses(path)
 
             session_type = detect_session_type(session_cwd, tool_uses or None)
             obs_list = extract_observations(rendered, session_type=session_type)
@@ -1205,16 +1270,70 @@ def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
             # Attach session_type to each observation for downstream validators
             for obs in obs_list:
                 obs.setdefault("session_type", session_type)
-            mem_dir = project_memory_dir(path)
-            n = append_to_ephemeral(mem_dir, obs_list, dry_run=dry_run)
+            project_slug = transcript_project_slug(path)
+            n = append_to_ephemeral(
+                global_memory_dir(), obs_list, dry_run=dry_run,
+                project_slug=project_slug,
+            )
 
             if not dry_run:
-                store.upsert(session_id, str(path), new_offset)
+                store.upsert(session_id, str(path), new_offset, cwd=session_cwd)
 
             logger.info(
                 "tick: session %s — %d observation(s) appended", session_id, n
             )
             results["processed"] += 1
             results["observations_total"] += n
+
+            # ExtractionRunStats bridge: production cron previously ran no
+            # reflection rules, so confirmed_rule_no_action / monotone_knowledge
+            # _lens never fired in the live path. Flat-mode stats have no window
+            # or card data; rules that require those silently no-op, which is OK.
+            if not dry_run:
+                try:
+                    from .self_reflection_extraction import (
+                        ExtractionRunStats,
+                        reflect_on_extraction,
+                    )
+                    ntu = sum(
+                        1 for e in entries
+                        if e.get("role") == "user"
+                        and len(e.get("text", "")) >= 60
+                    )
+                    emitted_kts = {
+                        o.get("knowledge_type") for o in obs_list
+                        if o.get("knowledge_type")
+                    }
+                    stats = ExtractionRunStats(
+                        session_id=session_id,
+                        session_type=session_type,
+                        chunking="flat",
+                        windows=1,
+                        productive_windows=1 if obs_list else 0,
+                        raw_observations=len(obs_list),
+                        final_observations=len(obs_list),
+                        issue_cards=0,
+                        orphans=len(obs_list),
+                        skipped_windows=0,
+                        parse_errors=0,
+                        affect_signals_total=0,
+                        affect_quotes_used=0,
+                        nontrivial_user_turn_count=ntu,
+                        entry_count=len(entries),
+                        cost_calls=1,
+                        unique_knowledge_types_emitted=len(emitted_kts),
+                    )
+                    fired = reflect_on_extraction(stats)
+                    if fired:
+                        logger.info(
+                            "tick: self-reflection fired %d rule(s) for %s (%s)",
+                            len(fired), session_id,
+                            ", ".join(r.rule_id for r in fired),
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "tick: self-reflection failed for %s: %s",
+                        session_id, exc,
+                    )
 
     return results

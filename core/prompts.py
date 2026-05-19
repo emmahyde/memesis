@@ -9,7 +9,7 @@ Token budget guidance (per panel LLME-F8):
 - Stage 1 lean schema: ~150 tokens per observation
   (kind + knowledge_type + confidence + importance + facts + cwd)
 - Stage 2 full schema: ~280 tokens per decision
-  (all Stage 1 fields + subject + work_event + subtitle + raw_importance + action + rationale + links)
+  (all Stage 1 fields + subject + work_event + subtitle + action + rationale + links)
 
 Stage 1 runs on the 15-minute cron (high frequency — keep it lean).
 Stage 2 runs on the hourly cron / PreCompact hook (lower frequency — full enrichment is fine).
@@ -27,32 +27,38 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 
 SESSION_TYPE_GUIDANCE = {
-    # Per-session-type filter applied inside OBSERVATION_EXTRACT_PROMPT.
-    # Callers that invoke OBSERVATION_EXTRACT_PROMPT.format(...) MUST pass
-    # `session_type_guidance=SESSION_TYPE_GUIDANCE.get(session_type, SESSION_TYPE_GUIDANCE["unknown"])`.
-    # Use `format_extract_prompt()` (defined at the bottom of this module) to get
-    # this right automatically.  Invocation sites that need updating in Wave C:
-    #   core/transcript_ingest.py:200  — extract_observations()
-    #   core/transcript_ingest.py:560  — batch prompt list comprehension
-    #   tests/test_prompts.py:131      — smoke-test format call
+    # Per-session-type filter injected into _OBSERVATION_EXTRACT_PROMPT_TEMPLATE at
+    # the {session_type_guidance} placeholder. Single source of truth — there is no
+    # longer a parallel hardcoded block in the prompt body.
+    # Use `format_extract_prompt()` (defined at the bottom of this module); it keys
+    # this dict by session_type automatically.
     "research": (
-        "Target conceptual and metacognitive findings only. Skip tool logs and per-call"
-        " narration. Surface novel framings, deferred questions, and abandoned approaches."
+        "Durable: conceptual outcomes (\"X library uses Y mechanism because Z\"), decisions to"
+        " adopt/reject an approach, comparisons with explicit trade-offs, prior-art findings that"
+        " change future direction. Skip: raw search results, tool calls, page summaries without a"
+        " synthesis, \"looked at X\" with no takeaway. A research session can have many durable"
+        " observations even with no code change — bias toward extracting conceptual findings over"
+        " skipping. Force work_event=null."
     ),
     "writing": (
-        "Target authoring decisions and aesthetic choices (voice, structure, scope). Skip"
-        " word-level edits unless they reveal a stylistic principle."
+        "Durable: authoring decisions (structure, voice, scene order), aesthetic choices with"
+        " rationale, rejected options with reason, style commitments, named characters/locations"
+        " with established traits. Skip: aesthetic preferences without rationale, one-off word"
+        " choices, summaries of what was written."
     ),
     "code": (
-        "Target current behavior — corrections, gotchas, decisions, library/API choices,"
-        " debugging insights. Skip routine implementation steps."
+        "Durable: bugfixes with diagnosed root cause, refactor decisions with rationale,"
+        " performance findings, API/contract corrections, build/test gotchas, configuration"
+        " constraints, tooling wins (commands that save time, flags that simplify workflow),"
+        " workflow discoveries (shortcuts, defaults, implicit behaviors). Skip: green test runs"
+        " with no finding, file navigation, tool-call traces without a conclusion."
     ),
     "agent_driven": (
         "Target task structure, decisions, and surprising agent failures. Skip per-tool-call"
         " narration and routine progress updates."
     ),
     "unknown": (
-        "Use general extraction heuristics. No session-type-specific filter applied."
+        "Apply the QUALITY GATE directly with no session-type-specific bias."
     ),
 }
 
@@ -110,12 +116,14 @@ def format_observation(text: str, obs_type: str | None = None, context: str | No
 
 CONSOLIDATION_PROMPT = """You are reviewing a buffer of Stage 1 observations captured during recent work sessions.
 Your job: review each observation with full context, re-score its importance independently, add
-Stage 2 enrichment fields, and decide KEEP / PRUNE / PROMOTE.
+Stage 2 enrichment fields, and decide KEEP / PRUNE / PROMOTE / SUPERSEDE / ARCHIVE.
 
 THE BEHAVIORAL GATE: For each observation, ask — "Would I do something wrong without this?"
 If the code, git log, or common sense would surface it anyway: PRUNE IT.
 
 SESSION OBSERVATIONS (Stage 1 buffer):
+Each block is prefixed with OBSERVATION_ID: N — echo the relevant N value(s) back in the
+"obs_ids" field of each decision. This is required for accurate pairing.
 {ephemeral_content}
 
 EXISTING MEMORY MANIFEST:
@@ -144,6 +152,58 @@ KEEP gates (in priority order):
    any AI.
 4. WORKFLOW PATTERNS — How this specific person works in ways you wouldn't guess.
 
+PROMOTE gates (use sparingly — only on exact restatement):
+Before deciding KEEP, scan the EXISTING MEMORY MANIFEST above. If a new observation
+EXACTLY DUPLICATES an existing memory's core claim (same fact, same subject, same scope),
+you MAY:
+  - set `action` = "promote"
+  - set `reinforces` = that memory's id (the [uuid] from the manifest)
+  - ALSO populate the Stage 2 enrichment fields (`kind`, `subtitle`, `cwd`,
+    `subject`, `knowledge_type`) from the new observation — these patch any
+    NULL fields on the target memory so reinforcement also enriches.
+  - do NOT also create a duplicate KEEP for the same fact
+
+Observations that merely REFINE, ADD EVIDENCE TO, or EXTEND an existing memory should
+KEEP as new memories — the auto_promote_if_dupe pass and crystallizer handle dedup
+downstream. Defaulting to PROMOTE on partial overlap fragments good memories and
+prevents their enrichment.
+
+Examples of promote-worthy overlap (exact restatement only):
+  - New: "Emma wants ELK renderer for mermaid"  + Manifest: "Mermaid diagram style — ELK renderer..."  → promote
+  - New: "Skip articles in caveman lite mode"   + Manifest: "Caveman mode lite formatting rules"        → promote
+  - New: "Use uv run, not bare python3"         + Manifest: "Python: prefer uv run for uv.lock projects" → promote
+
+Examples that should KEEP (adjacent, not exact):
+  - New: "Emma added ELK edge routing config"   + Manifest: "Mermaid diagram style — ELK renderer"     → keep (extends, not restates)
+  - New: "uv run required when uv.lock exists"  + Manifest: "Python: prefer uv run for uv.lock projects" → keep (adds condition)
+
+SUPERSEDE gates (preferred for contradictions with a replacement fact):
+If a new observation CONTRADICTS or SUPERSEDES an existing memory AND you have a
+replacement fact to store (event happened that invalidates the prior fact — provider
+switched, library replaced, decision reversed, scope narrowed), you MUST emit ONE
+SUPERSEDE decision:
+  - set `action` = "supersede"
+  - set `contradicts` = the obsolete memory's id (the [uuid] from the manifest)
+  - populate ALL the KEEP fields (title, summary, kind, subtitle, cwd,
+    subject, knowledge_type, facts) — these become the replacement memory
+  - do NOT emit a separate ARCHIVE+KEEP pair; SUPERSEDE is atomic
+SUPERSEDE replaces the obsolete memory and creates the new one in one transaction.
+
+ARCHIVE gates (use only when there is NO replacement fact):
+If an existing memory is no longer true and there is nothing to replace it with,
+emit an ARCHIVE decision:
+  - set `action` = "archive"
+  - set `contradicts` = the obsolete memory's id
+ARCHIVE is for pure obsolescence (deprecation with no successor). If there IS a
+replacement fact, use SUPERSEDE instead — do not emit ARCHIVE+KEEP pairs.
+
+Examples of supersede-worthy contradiction:
+  - New: "Switched embeddings to local fastembed bge-small" + Manifest: "Embeddings provider: OpenRouter openai/text-embedding-3-small" → SUPERSEDE old with new
+  - New: "Daemon now auto-managed by plugin"                + Manifest: "Run daemon manually with start.sh"                              → SUPERSEDE old with new
+
+Example of archive-worthy obsolescence (no replacement):
+  - Manifest: "Use legacy auth flow X for the staging endpoint" + Context: staging endpoint was decommissioned, nothing replaces it → ARCHIVE
+
 PRUNE if:
 - Re-derivable from code, git log, docs, or codebase reading
 - One-time task mechanics, file paths, commit hashes, test output
@@ -151,21 +211,85 @@ PRUNE if:
 - Preferences without the WHY (the reasoning is the only keepable part)
 - "I should have done X" without identifying the underlying PATTERN
 
-SELECTIVITY: Let the behavioral gate decide — not a number. A short session may have 0 keeps.
-A dense collaboration may have 10. Trust the gate: quality, not quota.
+SELECTIVITY: Most observations should KEEP. PRUNE only what is trivially derivable from code or git;
+PROMOTE only on exact restatement of an existing memory's core claim. Let the behavioral gate
+decide — not a number. Trust the gate: quality, not quota.
+
+When BEHAVIORAL GATE and SELECTIVITY conflict, prefer SELECTIVITY — keep the observation and let
+the downstream pipeline dedup. PRUNE only when the content is trivially re-derivable from code or
+git, not when it "feels" optional.
+
+---
+
+MEMORY SHAPE — every memory you KEEP must be shaped to transfer to a future session:
+
+1. FORWARD-SHAPE SIGNAL (required). The body must carry at least one of:
+   - Rationale — a "Why:" line (decisions, opinions, lessons).
+   - Recommendation — a "So what:" or "Consider:" line (gotchas, findings).
+   - Live implication — an "Open question:", "Contraindication:", or "Pending
+     verification:" line (findings worth keeping despite open uncertainty).
+   - Done-state predicate — a file, symbol, or test that proves completion (todos, debt).
+   An observation that cannot be given any of these is not actionable — PRUNE it.
+
+2. NO OPAQUE SHORTHAND. Internal labels — "D-15", "Tier 3", "Wave A", "RISK-09",
+   "HI-001" — are meaningless to a future session. Expand them inline or drop them.
+
+3. SINGLE RESPONSIBILITY. One memory carries one atom — one fact, one decision,
+   one pattern. If an observation bundles unrelated atoms, split it into separate
+   KEEP decisions rather than one memory with three subjects.
+
+4. NO CODE-SYMBOL-STUFFED BODIES. Bare function names (`_apply_results`) are dead
+   tokens to retrieval. Name the concept in prose; use a symbol only when it is
+   the canonical handle, and surround it with explanation.
+
+5. STANCE ON FRICTION. A memory describing friction ("X has annoying constraint Y")
+   must take a stance — propose an escalation, or explicitly accept it with rationale.
+   Phrase friction as a workflow pattern, not a feeling. A passive friction
+   description normalizes broken tooling — PRUNE it or give it a stance.
 
 ---
 
 IMPORTANCE RE-SCORING (panel C7):
 You have more context than Stage 1 did. Re-score `importance` independently using the full
-buffer and manifest. Preserve the Stage 1 score as `raw_importance` for audit. Do not just copy
-the Stage 1 score — you should diverge when context justifies it.
+buffer and manifest. Do not just copy the Stage 1 score — you should diverge when context
+justifies it.
 
-Importance anchors:
-  0.2  routine finding (re-derivable, low stakes)
-  0.5  useful context (saves time but not load-bearing)
-  0.8  load-bearing decision (getting this wrong causes real problems)
-  0.95 correction or hard constraint (must-know to avoid repeating a mistake)
+The importance score is not an abstract quality rating — it directly gates the memory's
+lifecycle. Score against the consequences:
+
+  0.00–0.30  ROUTINE — re-derivable from code, git log, types, or CI. The memory expires.
+             Default here unless a higher band's test below clearly passes.
+  0.30–0.55  CONTEXT — saves time on recall, but getting it wrong costs only a minor
+             detour, never rework. Stays a short-lived consolidated memory.
+  0.55–0.74  SIGNIFICANT — a material finding, but scoped or contingent: true for one
+             project, one tool version, or one session. Stays consolidated; never
+             becomes permanent.
+  0.75–0.84  LOAD-BEARING — getting this wrong causes real rework or repeats a mistake,
+             AND it applies beyond the session it came from. A score in this band
+             CRYSTALLIZES the memory: it is synthesized into a permanent record and
+             reinjected at session start for months. Do not enter this band casually.
+  0.85–1.00  INVARIANT / CORRECTIVE — an explicit user correction, a hard constraint, or
+             a behavioral rule that should fire unprompted every session. A score here
+             makes the memory eligible to become INSTINCTIVE — an always-on rule that
+             never expires. Reserve for memories that are wrong to ever forget.
+
+KIND SETS THE DEFAULT BAND (soft — override with a stated reason in `rationale`):
+  correction, constraint  → default to the 0.85–1.00 band
+  decision, preference    → default to the 0.75–0.84 band
+  open_question           → default to 0.30–0.55, UNLESS it carries an action item
+                            ("should X", "needs Y"), then 0.75–0.84
+  finding                 → no default shift; score purely on the band tests above
+You may move a memory off its kind's default band, but when you do, the `rationale`
+must say why (e.g. "decision, but scoped to a throwaway spike — CONTEXT band").
+
+SPREAD THE SCORES. A distribution where most observations land at 0.5–0.6 carries no
+ranking signal. Commit to a judgment. Avoid the 0.55–0.74 band unless the memory truly
+is significant-but-not-permanent — it is the band, not the safe default.
+
+Push toward a HIGHER band for: numeric evidence backing the claim, alignment with
+established engineering practice, or an explicit unresolved action item. Push toward a
+LOWER band for: subject matter owned by a third-party package we do not maintain, or
+anything already enforced mechanically by a test, hook, type, or CI check.
 
 ---
 
@@ -229,7 +353,7 @@ Respond ONLY with valid JSON (no markdown, no explanation):
 {{
   "decisions": [
     {{
-      "raw_importance": 0.0,
+      "obs_ids": [1],
       "importance": 0.0,
       "kind": "decision|finding|preference|constraint|correction|open_question",
       "knowledge_type": "factual|conceptual|procedural|metacognitive",
@@ -238,12 +362,16 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "cwd": "/abs/path/or/null",
       "subject": "self|user|system|collaboration|workflow|aesthetic|domain",
       "work_event": "bugfix|feature|refactor|discovery|change|null",
+      "title": "≤8-word headline naming the durable lesson (no pronouns, action-oriented)",
+      "summary": "REQUIRED. 1–2 sentences elaborating the rule, trigger, and corrective behavior. Must NOT repeat the title — write new information. Used as the retrieval body.",
       "subtitle": "retrieval card no longer than twenty-four words",
-      "action": "keep|prune|promote",
-      "rationale": "why this decision",
+      "tags": ["2-4 lowercase topic tags for retrieval (e.g., 'embeddings', 'workflow', 'consolidation')"],
+      "action": "keep|prune|promote|supersede|archive",
+      "observation": "human-readable summary of the observation (not load-bearing — use obs_ids for pairing)",
+      "rationale": "why this decision — and for importance, name the band the score lands in and the band-test it passed",
       "target_path": "category/filename.md (keep only)",
-      "reinforces": "memory_id or null",
-      "contradicts": "memory_id or null",
+      "reinforces": "memory_id or null (required when action=promote)",
+      "contradicts": "memory_id or null (required when action=archive)",
       "resolves_question_id": "memory_id of the open_question this resolves, or null"
     }}
   ]
@@ -386,32 +514,6 @@ freely, without requiring a friction or problem frame to justify inclusion.
 
 ---
 
-SESSION_TYPE GUIDANCE — what counts as durable depends on session_type:
-
-  code      — durable: bugfixes with diagnosed root cause, refactor decisions with
-              rationale, performance findings, API/contract corrections, build/test
-              gotchas, configuration constraints, tooling wins (commands that save
-              time, flags that simplify workflow), workflow discoveries (shortcuts,
-              defaults, implicit behaviors). Skip: green test runs with no finding,
-              file navigation, tool call traces without a conclusion.
-
-  research  — durable: conceptual outcomes ("X library uses Y mechanism because Z"),
-              decisions to adopt/reject an approach, comparisons with explicit
-              trade-offs, prior-art findings that change future direction. Skip: raw
-              search results, tool calls, summaries of pages without a synthesis,
-              "looked at X" without a takeaway. A research session can have many
-              durable observations even if no code changed — bias toward extracting
-              conceptual findings over skipping. Force work_event=null.
-
-  writing   — durable: authoring decisions (structure, voice, scene order), aesthetic choices
-              with rationale, rejected options with reason, style commitments, named characters/locations
-              with established traits. Skip: aesthetic preferences without rationale,
-              one-off word choices, summaries of what was written.
-
-  general   — apply the QUALITY GATE directly without session-type bias.
-
----
-
 KIND AXIS — what type of claim is this? (pick the best fit; kind and knowledge_type are
 independent dimensions — do not collapse them)
 
@@ -452,6 +554,12 @@ a "decision" can be factual, conceptual, procedural, or metacognitive.
 ---
 
 FACTS ATTRIBUTION:
+
+PRESERVE CORRECTION CONTRAST PAIRS: when a correction names both the wrong location/value and the right one, embed BOTH literal tokens verbatim in the same fact (or adjacent facts) — including leading `~`, angle-bracket placeholders like `<slug>`, `<uuid>`, file extensions, and directory separators. Never drop the rejected token; the contrast between wrong and right is the load-bearing signal that lets future retrieval match either side of the correction.
+
+
+PRESERVE LITERAL IDENTIFIERS: when a correction names a concrete path, URL, glob, placeholder, or token (e.g. `~/.claude/projects`, `<slug>/<uuid>.jsonl`, `config.toml`), embed each such token verbatim — including leading `~`, angle-bracket placeholders, slashes, and file extensions — inside at least one fact, alongside the incorrect token it replaces. Do not paraphrase, normalize, or summarize these literals away; the exact string is the load-bearing signal.
+
 Each fact must begin with a named subject. No pronouns (he/she/it/they/we/I/this/that/the).
 Each fact must stand alone — no implicit context from the surrounding observation.
 Use concrete past-tense action verbs: implemented, fixed, deployed, configured, migrated,
@@ -505,42 +613,30 @@ WINDOW-LOCAL SALIENCE ANCHORS:
 
 ---
 
-SKIP DISCIPLINE: Before deciding to skip a window, name one specific
-observation you evaluated and rejected (with your reason). A skip without
-a named candidate is a refusal to engage, not a judgment.
-
 SKIP PROTOCOL:
-A skip is a real cost: the LLM call to read this window has already happened.
-Before skipping, sweep the slice once more for ANY durable signal — a passing aside,
-a constraint mentioned in passing, a rejected option, a configuration value used.
+
+A skip is a real cost — the LLM call to read this window already happened. Before
+skipping, sweep the slice once more for ANY durable signal: a passing aside, a
+constraint mentioned in passing, a rejected option, a configuration value used.
 Bias toward extracting one low-importance observation over skipping outright.
 
-If — after that sweep — the slice still has no qualifying observation, you MUST
-return a structured skip with `considered` listing every candidate fact you swept
-and rejected. The `considered` list must be non-empty — if you can name nothing
-you looked at, that signals the sweep was skipped, not the window.
+If — after that sweep — the slice still has no qualifying observation, return a
+structured skip. The `considered` list is REQUIRED and must be non-empty: name
+every candidate fact you swept and rejected, each with the gate it failed.
+A skip whose `considered` is empty or absent is treated as a downgraded skip —
+the affect signal is preserved and logged as a warning, not silently discarded.
 
   {{"skipped": true,
     "failed_gate": "<falsifiable|durable|novel|load_bearing>",
     "reason": "<one sentence naming what the slice contained instead>",
-    "considered": ["brief description of each fact/span you evaluated and rejected"]}}
+    "considered": ["<candidate> — failed <gate_name>", ...]}}
 
-The failed_gate field MUST be the FIRST quality-gate criterion the slice failed.
-Do NOT return an empty array — that signals extraction failure, not intentional skip.
+`failed_gate` MUST be the FIRST quality-gate criterion the slice failed.
+
 Affect signals (pushback / repetition / non-neutral valence) override skip: if the
-AFFECT HINT shows any of those, you MUST extract at least one observation.
-User interruptions (ctrl-c, "stop", "cancel", request cancelled mid-execution) also
+AFFECT HINT shows any of those, you MUST extract at least one observation. User
+interruptions (ctrl-c, "stop", "cancel", request cancelled mid-execution) also
 override skip — treat them as behavioral friction regardless of the affect score.
-
-A skip without `considered`, or where `considered` is empty, will be treated by the
-parser as a downgraded skip — the affect signal is preserved and logged as a warning
-rather than silently discarded.
-
-- Before listing items in `considered:[]`, name the FIRST rejected candidate explicitly
-  and state which gate it failed (importance < threshold? duplicate? off-topic? out of scope?).
-  Format: `considered: ["<first_candidate> — failed <gate_name>", ...]`. This raises the cost
-  of reflexive skipping on ambiguous windows; if you cannot name even one candidate, you may
-  skip without it but the absence flags a low-signal slice rather than a routine skip.
 
 ---
 
@@ -636,3 +732,216 @@ def format_extract_prompt(
     if failure_block:
         prompt = failure_block + "\n" + prompt
     return prompt
+
+
+# ---------------------------------------------------------------------------
+# Stored-vs-stored contradiction resolution prompt
+# ---------------------------------------------------------------------------
+
+STORED_CONTRADICTION_RESOLUTION_PROMPT = """\
+You are resolving a detected contradiction between two stored memories.
+
+These memories represent workflow patterns observed across Claude Code sessions.
+Treat any apparent conflict as a *workflow-pattern divergence* — not a contradiction
+in values or feelings. Your job is to determine whether one pattern has superseded
+another, or whether both remain valid in different contexts.
+
+## Memory A
+ID: {memory_a_id}
+Stage: {memory_a_stage}
+Title: {memory_a_title}
+Content:
+{memory_a_content}
+
+## Memory B
+ID: {memory_b_id}
+Stage: {memory_b_stage}
+Title: {memory_b_title}
+Content:
+{memory_b_content}
+
+## Detection rationale
+{detection_rationale}
+
+## Task
+Choose the verdict that best fits:
+
+- **SUPERSEDE**: Memory A or B has been entirely replaced by the other. Specify winner_id.
+- **ARCHIVE**: One memory is stale or wrong and should be dropped. Specify winner_id (the one to KEEP).
+- **REFINE**: Both are partially correct; a merged version captures the full truth. Provide merged_content.
+- **BLOCK**: The conflict is genuinely ambiguous — both patterns may coexist, the evidence
+  is insufficient, or one endpoint is instinctive-stage (top-tier; never auto-archive).
+
+**IMPORTANT GUARDRAIL**: If *both* Memory A and Memory B are at stage `instinctive`,
+you MUST return BLOCK — never auto-archive or supersede a top-tier memory.
+
+Return ONLY valid JSON with no prose outside the JSON block:
+
+{{
+  "verdict": "SUPERSEDE|ARCHIVE|REFINE|BLOCK",
+  "winner_id": "<memory id to keep, or null for REFINE/BLOCK>",
+  "merged_content": "<merged text for REFINE only, else null>",
+  "rationale": "<one sentence explaining the decision>"
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Paraphrase-aware duplicate confirmation prompt
+# ---------------------------------------------------------------------------
+
+DEDUP_CONFIRM_PROMPT = """\
+You are deciding whether two stored memories are duplicates — the same fact or
+workflow pattern expressed differently (paraphrase, reordering, partial
+overlap). Embedding similarity already flagged them as near-misses; yours is
+the final judgment.
+
+## Memory A
+Title: {a_title}
+Summary: {a_summary}
+Content:
+{a_content}
+
+## Memory B
+Title: {b_title}
+Summary: {b_summary}
+Content:
+{b_content}
+
+Two memories are DUPLICATE when one carries no durable information the other
+lacks — a reader holding one gains nothing actionable from the other. They are
+DISTINCT when each carries a fact, rationale, scope, or workflow detail the
+other does not.
+
+Respond with ONLY one word: DUPLICATE or DISTINCT.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Bundled-row decomposition prompt
+# ---------------------------------------------------------------------------
+
+MEMORY_DECOMPOSITION_PROMPT = """\
+You are auditing one stored memory for the bundled-row problem: a memory that
+packs multiple unrelated atoms (for example, an API-key fact buried inside notes
+about user friction). Bundled memories retrieve poorly — each atom dilutes the
+others.
+
+## Memory under audit
+Title: {title}
+Content:
+{content}
+
+A memory is COHERENT when every sentence serves one subject — one fact, one
+decision, one pattern. SPLIT it only when its sentences cluster into two or more
+genuinely unrelated topics, each of which would stand alone as its own memory.
+
+Be conservative. A memory carrying one subject plus its rationale, evidence, or
+implications is COHERENT — do not fragment it. Only split clearly unrelated
+atoms.
+
+If you SPLIT, produce one child per distinct topic. Each child must be
+self-contained: a reader seeing only that child understands it in full.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "verdict": "COHERENT" or "SPLIT",
+  "children": [
+    {{"title": "<short title>", "content": "<self-contained body>",
+      "memory_kind": "decision|lesson|gotcha|goal|invariant|opinion|bias|todo|debt|fact"}}
+  ],
+  "rationale": "<one sentence>"
+}}
+
+children is [] when the verdict is COHERENT. When SPLIT, children has at least
+two entries.
+"""
+
+
+RULE_SEMANTIC_JUDGE_PROMPT = """\
+You are a guardrail judge. A behavioural RULE is in force. Decide whether the
+TOOL CALL the agent is about to make violates it.
+
+## Rule
+{rule}
+
+## Proposed tool call
+Tool: {tool_name}
+Input: {tool_input}
+
+Judge ONLY whether this specific call violates the rule. A call that is merely
+adjacent to the rule's topic, or that the rule does not actually forbid, is OK.
+Be precise — a false VIOLATION blocks legitimate work.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "verdict": "VIOLATION" or "OK",
+  "confidence": <0.0-1.0>,
+  "reason": "<one sentence — why it does or does not violate the rule>"
+}}
+"""
+
+
+RULE_PROPOSAL_PROMPT = """\
+You are deciding whether one stored memory encodes an enforceable behavioural
+RULE — a guardrail the agent must obey on every future tool call, not just a
+fact worth remembering.
+
+## Memory under review
+Kind: {kind}
+Title: {title}
+Content:
+{content}
+
+A memory is a RULE only when it prescribes or forbids a concrete action ("never
+edit the lockfile by hand", "always run tests before committing"). A memory
+that merely records a fact, a decision, or a preference is NOT a rule.
+
+If it IS a rule, express a machine-checkable predicate. Pick the narrowest
+check_kind that fits:
+  forbid_bash_pattern — check_arg is a regex matched against Bash commands
+  forbid_path_edit    — check_arg is a glob matched against edited file paths
+  require_absent      — check_arg is a regex that must not appear in tool input
+  semantic            — fuzzy rule with no clean pattern; check_arg is the rule
+                        text itself, judged by an LLM at enforcement time
+
+Be conservative — a false rule blocks legitimate work. When unsure, is_rule
+is false.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "is_rule": true or false,
+  "text": "<imperative one-line rule statement>",
+  "check_kind": "forbid_bash_pattern|forbid_path_edit|require_absent|semantic",
+  "check_arg": "<regex, glob, or rule text>",
+  "severity": "block|ask|warn",
+  "rationale": "<one sentence>"
+}}
+
+When is_rule is false, the other fields may be empty.
+"""
+
+
+SESSION_DIGEST_PROMPT = """\
+Summarise one work session for a memory index.
+
+## Session observations
+{content}
+
+Produce:
+- topic: a short noun phrase naming what the session was about — at most 8
+  words, no trailing punctuation. It labels a group of memories, so make it
+  specific ("Rules engine and PreToolUse enforcement", not "Coding work").
+- summary: 2-4 sentences a future session can read to recover where this one
+  left off — what was done, what is in progress, what is unresolved.
+
+Return ONLY valid JSON, no prose outside it:
+
+{{
+  "topic": "<short noun phrase>",
+  "summary": "<2-4 sentences>"
+}}
+"""

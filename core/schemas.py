@@ -17,16 +17,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from core.validators import KIND_VALUES
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 ALLOWED_ACTIONS: frozenset[str] = frozenset(
-    {"keep", "update", "merge", "archive", "prune", "promote"}
+    {"keep", "update", "merge", "archive", "prune", "promote", "supersede"}
 )
 
-DESTRUCTIVE_ACTIONS: frozenset[str] = frozenset({"prune", "archive"})
+DESTRUCTIVE_ACTIONS: frozenset[str] = frozenset({"prune", "archive", "supersede"})
 
 # Valid stage transition map: stage → set of stages it may transition to.
 # "*" is represented as any source stage may transition to pending_delete.
@@ -116,7 +118,6 @@ class ConsolidationDecision(BaseModel):
     rationale: str = ""
 
     # Importance — optional because promote decisions may omit it
-    raw_importance: float | None = None
     importance: float | None = None
 
     # Keep-specific fields
@@ -143,6 +144,11 @@ class ConsolidationDecision(BaseModel):
     subtitle: str | None = None
     resolves_question_id: str | None = None  # memory UUID4 or None
 
+    # Stable ordinal back-reference: echo back the OBSERVATION_ID(s) this decision covers.
+    # When present and non-empty, consolidator uses ordinal lookup instead of substring matching.
+    # Optional (default []) for back-compat with callers that don't supply obs_ids.
+    obs_ids: list[int] = Field(default_factory=list)
+
     # Card-shaped optional fields (present when "scope" or "evidence_quotes" in dict)
     scope: str | None = None
     evidence_quotes: list[str] | None = None
@@ -166,7 +172,23 @@ class ConsolidationDecision(BaseModel):
             )
         return normalised
 
-    @field_validator("importance", "raw_importance", mode="before")
+    @field_validator("knowledge_type", mode="before")
+    @classmethod
+    def normalize_knowledge_type(cls, v: Any) -> Any:
+        """Coerce common LLM truncations to canonical values."""
+        if not isinstance(v, str):
+            return v
+        normalised = v.strip().lower()
+        # Common LLM mistakes: "procedure" → "procedural", "fact" → "factual", etc.
+        synonyms = {
+            "procedure": "procedural",
+            "fact": "factual",
+            "concept": "conceptual",
+            "metacognition": "metacognitive",
+        }
+        return synonyms.get(normalised, normalised)
+
+    @field_validator("importance", mode="before")
     @classmethod
     def validate_importance(cls, v: Any) -> float | None:
         if v is None:
@@ -220,6 +242,40 @@ class ConsolidationDecision(BaseModel):
             )
         return self
 
+    @field_validator("kind", mode="before")
+    @classmethod
+    def validate_kind(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        normalised = str(v).strip().lower()
+        if normalised not in KIND_VALUES:
+            raise ValueError(
+                f"invalid kind {v!r}; expected one of {sorted(KIND_VALUES)}"
+            )
+        return normalised
+
+    @field_validator("subtitle", mode="before")
+    @classmethod
+    def validate_subtitle(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        v = str(v).strip()
+        if len(v.split()) > 24:
+            raise ValueError(
+                f"subtitle exceeds 24 words ({len(v.split())} words): {v!r}"
+            )
+        return v or None
+
+    @field_validator("cwd", mode="before")
+    @classmethod
+    def validate_cwd(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        v = str(v).strip()
+        if "\x00" in v:
+            raise ValueError("cwd contains null byte")
+        return v or None
+
 
 # ---------------------------------------------------------------------------
 # Consolidation response envelope
@@ -262,3 +318,34 @@ class ContradictionResolution(BaseModel):
                 f"confidence must be in [0.0, 1.0], got {fv}"
             )
         return fv
+
+
+# ---------------------------------------------------------------------------
+# Stored-vs-stored contradiction resolution verdict
+# ---------------------------------------------------------------------------
+
+
+class StoredContradictionVerdict(BaseModel):
+    """LLM verdict from the stored-vs-stored contradiction resolver (core/promoter.py).
+
+    JSON shape:
+    {
+      "verdict": "SUPERSEDE|ARCHIVE|REFINE|BLOCK",
+      "winner_id": "<memory id or null>",
+      "merged_content": "<string, REFINE only, else null>",
+      "rationale": "<string, required>"
+    }
+    """
+
+    verdict: Literal["SUPERSEDE", "ARCHIVE", "REFINE", "BLOCK"]
+    winner_id: str | None = None
+    merged_content: str | None = None
+    rationale: str
+
+    @model_validator(mode="after")
+    def validate_fields(self) -> "StoredContradictionVerdict":
+        if self.verdict in ("SUPERSEDE", "ARCHIVE", "REFINE") and self.winner_id is None:
+            raise ValueError(f"winner_id required for verdict {self.verdict}")
+        if self.verdict == "REFINE" and not self.merged_content:
+            raise ValueError("merged_content required for verdict REFINE")
+        return self

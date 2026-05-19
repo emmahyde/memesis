@@ -2,10 +2,14 @@
 """
 Hourly cron — full memory lifecycle outside any Claude Code session.
 
-Scans all project memory directories for ephemeral buffers with observations,
-runs LLM-based consolidation via Bedrock, then runs the full lifecycle:
-crystallization, thread building, relevance maintenance, and periodic
-self-reflection.
+Scans ~/.claude/memory/ephemeral/<project-slug>/ for ephemeral buffers with
+observations, runs LLM-based consolidation against the single global store,
+then runs the full lifecycle: crystallization, thread building, relevance
+maintenance, and periodic self-reflection.
+
+LLM transport: defaults to the agent-SDK / OAuth path used by interactive
+Claude Code sessions. To opt into Bedrock, set CLAUDE_CODE_USE_BEDROCK=1
+in the cron environment.
 
 Usage:
     python3 /path/to/consolidate_cron.py
@@ -17,7 +21,6 @@ Install as cron:
 import fcntl
 import json
 import logging
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.consolidator import Consolidator
 from core.crystallizer import Crystallizer
-from core.database import close_db, get_base_dir, get_vec_store, init_db
+from core.database import close_db, get_vec_store, init_db
 from core.embeddings import embed_for_memory
 from core.feedback import FeedbackLoop
 from core.lifecycle import LifecycleManager
@@ -42,30 +45,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Ensure Bedrock credentials are available
-os.environ.setdefault("AWS_PROFILE", "bedrock-users")
-os.environ.setdefault("AWS_REGION", "us-west-2")
-os.environ.setdefault("CLAUDE_CODE_USE_BEDROCK", "true")
-
 # Run self-reflection every N consolidations.
 REFLECTION_INTERVAL = 5
 STALENESS_INTERVAL = 20  # Run staleness detection every 20 cron consolidations (~daily at hourly cron)
 
 
 def find_ephemeral_buffers() -> list[Path]:
-    """Find all ephemeral session files with actual observations."""
-    projects_dir = Path.home() / ".claude" / "projects"
-    if not projects_dir.exists():
+    """Find all ephemeral session files with actual observations.
+
+    Single global store: buffers stage under
+    `~/.claude/memory/ephemeral/<project-slug>/session-*.md`. The slug
+    sub-directory carries project identity (see process_buffer).
+    """
+    ephemeral_root = Path.home() / ".claude" / "memory" / "ephemeral"
+    if not ephemeral_root.exists():
         return []
 
     buffers = []
-    for memory_dir in projects_dir.glob("*/memory/ephemeral"):
-        project_dir_name = memory_dir.parent.parent.name
-        if not project_dir_name.startswith("-"):
-            logger.warning("Skipping rogue project directory (no leading dash): %s", project_dir_name)
+    for slug_dir in ephemeral_root.iterdir():
+        if not slug_dir.is_dir():
+            continue
+        if not slug_dir.name.startswith("-"):
+            logger.warning("Skipping rogue ephemeral directory (no leading dash): %s", slug_dir.name)
             continue
 
-        for session_file in memory_dir.glob("session-*.md"):
+        for session_file in slug_dir.glob("session-*.md"):
             content = session_file.read_text(encoding="utf-8").strip()
             lines = [l for l in content.splitlines() if l.strip() and not l.startswith("# Session")]
             if lines:
@@ -96,8 +100,13 @@ def _increment_consolidation_count(base_dir: Path) -> int:
 
 
 def process_buffer(ephemeral_path: Path) -> dict | None:
-    """Run full lifecycle on a single ephemeral buffer."""
-    memory_dir = ephemeral_path.parent.parent  # up from ephemeral/ to memory/
+    """Run full lifecycle on a single ephemeral buffer.
+
+    Layout: ~/.claude/memory/ephemeral/<project-slug>/session-*.md
+    The slug sub-directory names the project; it is stamped into the
+    `project` column via init_db(project=...).
+    """
+    project_slug = ephemeral_path.parent.name
     lock_path = ephemeral_path.parent / ".lock"
     date_str = ephemeral_path.stem.replace("session-", "")
     header = f"# Session Observations — {date_str}\n\n"
@@ -119,7 +128,7 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
     snapshot_path.write_text(content, encoding="utf-8")
 
     try:
-        base_dir = init_db(base_dir=str(memory_dir))
+        base_dir = init_db(project=project_slug)
         lifecycle = LifecycleManager()
         consolidator = Consolidator(lifecycle)
         manifest = ManifestGenerator()
@@ -128,11 +137,22 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
 
         session_id = f"cron-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-        # Derive project context from memory_dir path
-        project_context = str(memory_dir.parent)
+        # Project identity is the ephemeral sub-directory slug.
+        project_context = project_slug
 
         # --- Consolidation ---
+        obs_in_buffer = sum(
+            1 for line in content.splitlines() if line.startswith("## [")
+        )
         result = consolidator.consolidate_session(str(snapshot_path), session_id)
+        logger.info(
+            "Baseline stats: obs_in=%d kept=%d pruned=%d orphaned=%d promoted=%d",
+            obs_in_buffer,
+            len(result.get("kept", [])),
+            len(result.get("pruned", [])),
+            len(result.get("orphaned", [])),
+            len(result.get("promoted", [])),
+        )
         feedback.update_importance_scores(session_id)
 
         vec_store = get_vec_store()
@@ -225,6 +245,54 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
                     summary_parts.append(f"{contradicted_n} hyp contradicted")
         except Exception as e:
             logger.warning("Hypothesis reconsolidation error (non-fatal): %s", e)
+
+        # --- Stored-vs-stored contradiction resolution ---
+        try:
+            from core.promoter import resolve_contradictions_pass
+            cr_result = resolve_contradictions_pass(session_id)
+            if any(cr_result.values()):
+                parts = [f"{v} {k}" for k, v in cr_result.items() if v]
+                summary_parts.append(f"contradictions: {', '.join(parts)}")
+        except Exception as e:
+            logger.warning("Contradiction resolution error (non-fatal): %s", e)
+
+        # --- Verifier sweep (auto-archive stale memories) ---
+        try:
+            from core.verifier import run_verifier_sweep
+            vr_result = run_verifier_sweep(project_context)
+            if vr_result["archived"]:
+                summary_parts.append(f"verifier: {vr_result['archived']} archived")
+        except Exception as e:
+            logger.warning("Verifier sweep error (non-fatal): %s", e)
+
+        # --- Bundled-row decomposer ---
+        try:
+            from core.decomposer import run_decomposer_sweep
+            dc_result = run_decomposer_sweep()
+            if dc_result["split"]:
+                summary_parts.append(f"decomposer: {dc_result['split']} split")
+        except Exception as e:
+            logger.warning("Decomposer sweep error (non-fatal): %s", e)
+
+        # --- Rule sync: auto-activate invariant memories as semantic rules ---
+        try:
+            from core.rules import sync_rules_from_memories
+            rs_result = sync_rules_from_memories()
+            if rs_result["created"] or rs_result["updated"] or rs_result["deactivated"]:
+                summary_parts.append(
+                    f"rule-sync: +{rs_result['created']} ~{rs_result['updated']} -{rs_result['deactivated']}"
+                )
+        except Exception as e:
+            logger.warning("Rule sync error (non-fatal): %s", e)
+
+        # --- Rule proposal (candidate guardrails from memories) ---
+        try:
+            from core.rule_proposal import run_rule_proposal_sweep
+            rp_result = run_rule_proposal_sweep()
+            if rp_result["proposed"]:
+                summary_parts.append(f"rules: {rp_result['proposed']} proposed")
+        except Exception as e:
+            logger.warning("Rule proposal error (non-fatal): %s", e)
 
         # --- Relevance maintenance ---
         relevance = RelevanceEngine()
@@ -337,9 +405,41 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
         close_db()
 
         logger.info("  %s", ", ".join(summary_parts))
-        return result
-    finally:
         snapshot_path.unlink(missing_ok=True)
+        return result
+    except Exception:
+        # Restore the snapshot content back to the ephemeral buffer so the
+        # next cron run gets a chance to reprocess. Without this, a single
+        # LLM failure permanently drops every observation in the snapshot
+        # (the buffer was cleared under lock before consolidation ran).
+        try:
+            with open(lock_path, "w") as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                try:
+                    current = ephemeral_path.read_text(encoding="utf-8") \
+                        if ephemeral_path.exists() else header
+                    # Append snapshot body (minus header) so concurrent writes survive.
+                    body = "\n".join(
+                        line for line in content.splitlines()
+                        if line.strip() and not line.startswith("# Session")
+                    )
+                    ephemeral_path.write_text(
+                        current.rstrip() + "\n" + body + "\n",
+                        encoding="utf-8",
+                    )
+                    logger.warning(
+                        "Restored %d byte(s) to ephemeral buffer after failure",
+                        len(body),
+                    )
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception as restore_exc:
+            logger.exception(
+                "CRITICAL: snapshot restore failed; observations lost: %s",
+                restore_exc,
+            )
+        snapshot_path.unlink(missing_ok=True)
+        raise
 
 
 def main():
@@ -368,6 +468,7 @@ def main():
 
     logger.info("Found %d buffer(s) with observations", len(buffers))
 
+    failed_buffers = 0
     for buf in buffers:
         project_hash = buf.parent.parent.parent.name
         logger.info("Processing %s (project: %s)", buf.name, project_hash)
@@ -376,6 +477,7 @@ def main():
             if result is None:
                 logger.info("  (empty after lock — skipped)")
         except Exception as exc:
+            failed_buffers += 1
             logger.exception("  Failed to process %s", buf)
             # Persist a structured error record so db_check / observability
             # can surface failed cron runs that would otherwise vanish into
@@ -400,6 +502,11 @@ def main():
                 pass  # error-logging is best-effort
 
     logger.info("Lifecycle run complete")
+    if failed_buffers:
+        logger.error(
+            "Lifecycle run completed with %d buffer failure(s)", failed_buffers
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

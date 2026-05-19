@@ -5,7 +5,18 @@
       "Bash(rm /Users/emmahyde/.claude/memory/index.db)",
       "Bash(rtk ls *)",
       "Bash(rtk git *)",
-      "Bash(rtk grep *)"
+      "Bash(rtk grep *)",
+      "Bash(uv run *)",
+      "Bash(git stash *)",
+      "Bash(git worktree *)",
+      "Bash(rtk read *)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "firecrawl",
+    "lightpanda",
+    "openrouter-harness",
+    "reddit",
+    "codemode"
+  ]
 }

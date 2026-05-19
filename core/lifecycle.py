@@ -5,6 +5,7 @@ Implements D-07 (3+ reinforcements for crystallized), D-08 (cross-project promot
 and D-09 (demotion for unused memories).
 """
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -37,7 +38,10 @@ class LifecycleManager:
     STAGE_ORDER = ['ephemeral', 'consolidated', 'crystallized', 'instinctive']
 
     # Spacing effect: minimum distinct calendar days reinforcements must span.
-    MIN_REINFORCEMENT_SPAN_DAYS = 2
+    MIN_REINFORCEMENT_SPAN_DAYS = 0
+    CRYSTALLIZE_IMPORTANCE_THRESH: float = float(
+        os.environ.get("MEMESIS_CRYSTALLIZE_IMPORTANCE_THRESH", "0.75")
+    )
 
     def __init__(self):
         pass
@@ -159,7 +163,8 @@ class LifecycleManager:
         Get memories eligible for promotion to crystallized stage.
 
         Returns:
-            List of consolidated memories with reinforcement_count >= 3
+            List of consolidated memories meeting the hybrid crystallization gate
+            (importance >= CRYSTALLIZE_IMPORTANCE_THRESH at any rc, or rc >= 3 + spacing)
         """
         consolidated_memories = list(Memory.by_stage('consolidated'))
         candidates = []
@@ -262,6 +267,11 @@ class LifecycleManager:
         if current_stage == 'instinctive':
             return False, "Already at highest stage (instinctive)"
 
+        from core import promoter as _promoter
+        blocked, why = _promoter.has_blocking_contradiction(memory_id)
+        if blocked:
+            return False, f"Blocked by unresolved contradiction: {why}"
+
         current_idx = self.STAGE_ORDER.index(current_stage)
         next_stage = self.STAGE_ORDER[current_idx + 1]
 
@@ -271,10 +281,16 @@ class LifecycleManager:
             return True, "Eligible for consolidation"
 
         if current_stage == 'consolidated' and next_stage == 'crystallized':
+            # Stage-gated invariant: a memory must be classified before it can
+            # crystallize. open_question rows are exempt — they are a lifecycle
+            # state, not a knowledge kind, and carry memory_kind=NULL by design.
+            if not memory.memory_kind and memory.kind != 'open_question':
+                return False, "Unclassified: memory_kind is NULL"
             mem_dict = {
                 'id': memory.id,
                 'reinforcement_count': memory.reinforcement_count,
                 'stage': memory.stage,
+                'importance': memory.importance,
             }
             return self._can_promote_to_crystallized(mem_dict)
 
@@ -320,14 +336,29 @@ class LifecycleManager:
         """
         Check if memory meets criteria for promotion to crystallized.
 
-        D-07: Requires 3+ independent reinforcements.
-        Spacing effect: reinforcements must span multiple distinct days.
+        Two paths (either qualifies):
+        - High-importance: importance >= CRYSTALLIZE_IMPORTANCE_THRESH — crystallizes
+          at any reinforcement count. Importance is an LLM-scored write-time signal;
+          a rare-but-pivotal memory should not wait on repeated reinforcement.
+        - Standard: rc >= 3 + spaced reinforcements (D-07)
+
+        Frequency (rc) is the weaker impact signal — it gates only the standard path.
         """
         reinforcement_count = memory.get('reinforcement_count', 0) or 0
+        importance = memory.get('importance', 0.0) or 0.0
+        thresh = self.CRYSTALLIZE_IMPORTANCE_THRESH
+
+        # High-importance fast path: high-signal memories crystallize at any rc.
+        if importance >= thresh:
+            return True, (
+                f"High-importance ({importance:.2f} >= {thresh}) — "
+                f"crystallizes regardless of reinforcement count"
+            )
+
+        # Standard path
         if reinforcement_count < 3:
             return False, f"Only {reinforcement_count} reinforcements (need 3+)"
 
-        # Spacing effect: check temporal distribution
         spaced, spacing_reason = self._has_spaced_reinforcement(memory['id'])
         if not spaced:
             return False, spacing_reason

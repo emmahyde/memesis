@@ -1,0 +1,9 @@
+# Default environment — no overrides. `claude` launched in this repo uses your
+# normal ~/.claude config (statusline, plugins, hooks, skills all intact).
+#
+# The memesis clean-room — only the memesis plugin loads, none of the
+# user-level ~/.claude plugins/hooks/skills — is opt-in. Activate it with:
+#
+#     MISE_ENV=cleanroom claude
+#
+# which loads mise.cleanroom.toml and points CLAUDE_CONFIG_DIR at agent-sdk/.

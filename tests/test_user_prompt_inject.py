@@ -139,6 +139,51 @@ class TestAlreadyInjected:
         assert mem.id not in get_already_injected("sess-002")
 
 
+class TestPointerAndCorrection:
+    """Threshold-gated pointer mode and always-full correction injection."""
+
+    def test_is_correction_detects_kind_and_polarity(self):
+        from types import SimpleNamespace
+
+        from hooks.user_prompt_inject import _is_correction
+        assert _is_correction(SimpleNamespace(kind="correction", polarity=None))
+        assert _is_correction(SimpleNamespace(kind=None, polarity="corrective"))
+        assert not _is_correction(SimpleNamespace(kind="finding", polarity="neutral"))
+
+    def test_format_pointer_line(self):
+        from types import SimpleNamespace
+
+        from hooks.user_prompt_inject import _format_pointer_line
+        line = _format_pointer_line(
+            [SimpleNamespace(id="abcd1234ef", tags='["python", "testing"]')]
+        )
+        assert line.startswith("💡 1 related")
+        assert "[abcd1234]" in line
+        assert "python" in line
+
+    def test_weak_matches_collapse_into_pointer(self, base):
+        for i in range(5):
+            _make_memory(stage='consolidated', title=f'Widget Memory {i}',
+                         content=f'widget pipeline configuration content number {i}',
+                         summary=f'Widget memory number {i} summary.')
+        result = search_and_inject("widget pipeline configuration content", "sess-ptr-1")
+        assert result.count("[Memory:") == 1   # only the top match injects full
+        assert "💡" in result                   # weaker matches pointed at
+
+    def test_correction_always_injected_full(self, base):
+        mem = _make_memory(stage='consolidated', title='Correction Note',
+                           content='never use the deprecated widget interface',
+                           summary='Use the new widget interface, not the old one.')
+        Memory.update(kind='correction').where(Memory.id == mem.id).execute()
+        for i in range(4):
+            _make_memory(stage='consolidated', title=f'Widget Filler {i}',
+                         content=f'widget interface deprecated content {i}',
+                         summary=f'Filler memory {i}.')
+        result = search_and_inject("widget interface deprecated", "sess-corr-1")
+        assert "⛔ CORRECTION" in result
+        assert "Correction Note" in result
+
+
 class TestSearchAndInjectHybrid:
     """Tests for hybrid wiring in search_and_inject (via RetrievalEngine)."""
 

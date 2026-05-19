@@ -2081,6 +2081,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tiktoken" },
 ]
 
 [package.optional-dependencies]
@@ -2112,6 +2113,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ragas", marker = "extra == 'eval'" },
     { name = "scikit-learn", specifier = ">=1.4" },
+    { name = "tiktoken", specifier = ">=0.7" },
 ]
 provides-extras = ["eval", "dev"]
 

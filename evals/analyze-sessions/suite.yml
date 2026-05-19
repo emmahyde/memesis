@@ -1,0 +1,57 @@
+name: analyze-sessions-eval
+references: ./references
+models:
+  - openrouter/anthropic/claude-sonnet-4-5
+env:
+  - OPENROUTER_API_KEY
+timeoutSeconds: 300
+
+appendSystemPrompt: |
+  You are a software engineer working on the memesis memory pipeline project.
+  When asked to analyze a session, read the skill file at /work/analyze-sessions/SKILL.md
+  and follow it precisely. Write all output to /work/analysis.md.
+
+  EVAL ENVIRONMENT PATHS (use these instead of ~/.claude/):
+  - Transcripts:  /work/.claude/transcripts/
+  - Cursors DB:   /work/.claude/memesis/cursors.db
+  - Traces:       /work/.claude/memesis/traces/
+  - Ephemeral:    /work/.claude/projects/-Users-emmahyde-projects-memesis/memory/ephemeral/
+  - Scenario file for uv mock: /work/.memesis-eval-scenario
+
+  All shell commands should substitute /work/.claude/ wherever the skill says ~/.claude/.
+  The sqlite3 CLI is not available; use: python3 -c "import sqlite3; ..."
+
+cases:
+  - name: cwd-bug-miss
+    task: |
+      Session ses_cwd001 seems to have produced no memories even though I made
+      several corrections and decisions during it. Please use the analyze-sessions
+      skill at /work/analyze-sessions/SKILL.md to run a full pipeline audit on it.
+      Write the complete diagnostic report to /work/analysis.md.
+    setup:
+      - node $CASE/checks/setup-cwd-bug.mjs
+    graders:
+      - name: identifies-cwd-gap
+        command: node $CASE/checks/grade-cwd-bug.mjs
+
+  - name: max-tokens-truncation
+    task: |
+      Session ses_trunc001 had a very dense coding session but I don't see any
+      observations extracted. Use /work/analyze-sessions/SKILL.md to audit it
+      and figure out what went wrong. Write findings to /work/analysis.md.
+    setup:
+      - node $CASE/checks/setup-max-tokens.mjs
+    graders:
+      - name: identifies-truncation
+        command: node $CASE/checks/grade-max-tokens.mjs
+
+  - name: good-session-control
+    task: |
+      I want to verify the pipeline worked correctly for session ses_good001.
+      Use /work/analyze-sessions/SKILL.md to run the audit.
+      Write the report to /work/analysis.md.
+    setup:
+      - node $CASE/checks/setup-good-session.mjs
+    graders:
+      - name: no-false-alarms
+        command: node $CASE/checks/grade-good-session.mjs

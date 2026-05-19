@@ -17,7 +17,7 @@ SKILLS_DIR = Path(__file__).parent.parent / "skills"
 SKILL_NAMES = [
     "backfill", "connect", "dashboard", "forget", "health",
     "hypotheses", "ideate", "learn", "recall", "reflect", "reindex",
-    "run-eval", "stats", "teach", "threads", "usage",
+    "retrieval", "run-eval", "stats", "teach", "threads",
 ]
 
 INVOCATION_PREFIX = "/memesis:"
@@ -143,6 +143,8 @@ def test_skill_no_shorthand_invocation(name):
         if f"/{name}" in line
         and INVOCATION_PREFIX not in line
         and not line.strip().startswith("#")  # headings are labels, not calls
+        and f"/{name}/" not in line  # exclude dir paths like skills/ops/scripts/
+        and f"/{name}." not in line  # exclude file refs like core/lifecycle.py
     ]
     assert not invocation_lines_without_prefix, (
         f"{name}.md contains shorthand '/{name}' invocation without namespace prefix:\n"

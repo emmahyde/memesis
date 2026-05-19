@@ -26,7 +26,9 @@ via `call_llm_batch`.
 
 import asyncio
 import hashlib
+import json
 import os
+import sys
 import shutil
 import subprocess
 from typing import Optional
@@ -36,6 +38,7 @@ import anthropic
 try:  # optional — only used on the OAuth subscription path
     from claude_agent_sdk import ClaudeAgentOptions, query as _agent_query
     from claude_agent_sdk.types import ResultMessage
+
     _AGENT_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover
     ClaudeAgentOptions = None  # type: ignore[assignment]
@@ -47,10 +50,42 @@ except ImportError:  # pragma: no cover
 DEFAULT_MODEL = "claude-sonnet-4-6"
 BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6"
 
+# System-prompt library — see core/system_prompts/. memesis LLM calls are
+# single-shot, tool-less subprocesses; a task-scoped system prompt frames the
+# model for the job instead of leaving it on the interactive coding-agent
+# preset that the SDK / CLI default to.
+_SYSTEM_PROMPT_DIR = os.path.join(os.path.dirname(__file__), "system_prompts")
+_system_prompt_cache: dict[str, tuple[str, str]] = {}
+
+
+def _load_system_prompt(spec: str | None) -> tuple[str, str] | None:
+    """Resolve a system-prompt spec to (absolute_path, text), or None.
+
+    ``spec`` may be an absolute path, an existing relative path, or a bare
+    name resolved against ``core/system_prompts/<name>.md``. Results are
+    cached by spec. A missing file raises FileNotFoundError — a misnamed
+    system prompt is a bug, not something to swallow silently.
+    """
+    if not spec:
+        return None
+    if spec in _system_prompt_cache:
+        return _system_prompt_cache[spec]
+    if os.path.isabs(spec) or os.path.exists(spec):
+        path = os.path.abspath(spec)
+    else:
+        name = spec[:-3] if spec.endswith(".md") else spec
+        path = os.path.join(_SYSTEM_PROMPT_DIR, f"{name}.md")
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read().strip()
+    resolved = (path, text)
+    _system_prompt_cache[spec] = resolved
+    return resolved
+
 
 try:
     from core.trace import get_active_writer
 except ImportError:  # pragma: no cover
+
     def get_active_writer() -> None:  # type: ignore[misc]
         return None
 
@@ -61,6 +96,7 @@ def _emit_llm_envelope(
     input_tokens: Optional[int],
     output_tokens: Optional[int],
     response_chars: int,
+    cache_read_input_tokens: Optional[int] = None,
 ) -> None:
     """Emit an ``llm_envelope`` trace event if a TraceWriter is active.
 
@@ -71,7 +107,9 @@ def _emit_llm_envelope(
         if writer is None:
             return
         model_key = model if model is not None else ""
-        prompt_hash = hashlib.sha256((model_key + prompt).encode("utf-8")).hexdigest()[:16]
+        prompt_hash = hashlib.sha256((model_key + prompt).encode("utf-8")).hexdigest()[
+            :16
+        ]
         writer.emit(
             stage="llm",
             event="llm_envelope",
@@ -80,6 +118,7 @@ def _emit_llm_envelope(
                 "model": model_key or DEFAULT_MODEL,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
                 "response_chars": response_chars,
             },
         )
@@ -113,7 +152,9 @@ def _repair_json(raw: str, drop_stats: dict | None = None) -> str | None:
     try:
         _json.loads(cleaned)
         if drop_stats is not None:
-            drop_stats["parse_errors_repaired"] = drop_stats.get("parse_errors_repaired", 0) + 1
+            drop_stats["parse_errors_repaired"] = (
+                drop_stats.get("parse_errors_repaired", 0) + 1
+            )
         return cleaned
     except _json.JSONDecodeError:
         pass
@@ -192,10 +233,11 @@ def _have_api_key() -> bool:
 def _call_via_claude_cli(
     prompt: str,
     *,
-    timeout: int = 180,
+    timeout: int = 1800,
     max_attempts: int = 3,
     backoff_base: float = 2.0,
-) -> str:
+    system_prompt_path: str | None = None,
+) -> tuple[str, int | None, int | None, int | None]:
     """Call `claude -p` subprocess using OAuth subscription credentials.
 
     The subprocess inherits the parent env minus ANTHROPIC_API_KEY and
@@ -207,6 +249,7 @@ def _call_via_claude_cli(
 
     Retries with exponential backoff on rc!=0 — the OAuth path can
     transiently fail under burst load (rate-limit, token-refresh races).
+    Returns (text, input_tokens, output_tokens, cache_read_input_tokens).
     """
     import time
 
@@ -216,19 +259,29 @@ def _call_via_claude_cli(
             "cannot reach the Anthropic API."
         )
 
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+    }
+
+    argv = [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--disable-slash-commands",
+        "--disallowed-tools",
+        "Bash Edit Write Read Glob Grep Task WebFetch WebSearch",
+    ]
+    # Replace the default coding-agent system prompt with the task-scoped one.
+    if system_prompt_path is not None:
+        argv += ["--system-prompt-file", system_prompt_path]
 
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         proc = subprocess.run(
-            [
-                "claude", "-p",
-                "--output-format", "text",
-                "--disable-slash-commands",
-                "--disallowed-tools",
-                "Bash Edit Write Read Glob Grep Task WebFetch WebSearch",
-            ],
+            argv,
             input=prompt,
             capture_output=True,
             text=True,
@@ -236,10 +289,47 @@ def _call_via_claude_cli(
             timeout=timeout,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout
+            try:
+                payload = json.loads(proc.stdout)
+                text = ""
+                usage: dict | None = None
+                if isinstance(payload, dict):
+                    text = (
+                        payload.get("result")
+                        or payload.get("text")
+                        or payload.get("output")
+                        or ""
+                    )
+                    usage_obj = payload.get("usage")
+                    if isinstance(usage_obj, dict):
+                        usage = usage_obj
+                elif isinstance(payload, list):
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        if not text and isinstance(item.get("result"), str):
+                            text = item["result"]
+                        if not text and isinstance(item.get("text"), str):
+                            text = item["text"]
+                        usage_obj = item.get("usage")
+                        if isinstance(usage_obj, dict):
+                            usage = usage_obj
+                            break
+                if text:
+                    in_toks = usage.get("input_tokens") if usage else None
+                    out_toks = usage.get("output_tokens") if usage else None
+                    cache_read_toks = (
+                        usage.get("cache_read_input_tokens") if usage else None
+                    )
+                    return text, in_toks, out_toks, cache_read_toks
+            except json.JSONDecodeError:
+                if proc.stdout.strip():
+                    return proc.stdout, None, None, None
+            if proc.stdout.strip():
+                return proc.stdout, None, None, None
         last_err = (proc.stderr.strip() or proc.stdout.strip())[:500]
         if attempt < max_attempts:
-            time.sleep(backoff_base ** attempt)
+            time.sleep(backoff_base**attempt)
     raise RuntimeError(
         f"claude -p subprocess failed after {max_attempts} attempts "
         f"(last rc={proc.returncode}): {last_err}"
@@ -254,13 +344,21 @@ def _strip_oauth_env() -> dict[str, str]:
     the parent env force API-key mode and break OAuth-only login.
     """
     return {
-        k: v for k, v in os.environ.items()
+        k: v
+        for k, v in os.environ.items()
         if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
     }
 
 
-async def _call_via_agent_sdk(prompt: str) -> str:
+async def _call_via_agent_sdk(
+    prompt: str,
+    system_prompt: str | None = None,
+) -> tuple[str, int | None, int | None]:
     """Single-shot LLM call via claude-agent-sdk on OAuth credentials.
+
+    Returns (result_text, input_tokens, output_tokens). Token counts come
+    from the ResultMessage.usage dict and may be None if the SDK version
+    in use does not surface them.
 
     The SDK serializes OAuth refresh internally, so concurrent gather()
     over many calls does not race on token storage the way raw subprocess
@@ -275,27 +373,41 @@ async def _call_via_agent_sdk(prompt: str) -> str:
     for k in saved:
         os.environ.pop(k, None)
 
-    options = ClaudeAgentOptions(
+    def _stderr_sink(line: str) -> None:
+        sys.stderr.write(f"[claude-cli-stderr] {line}")
+        sys.stderr.flush()
+
+    opt_kwargs: dict = dict(
         allowed_tools=[],
         permission_mode="bypassPermissions",
         max_turns=1,
+        stderr=_stderr_sink if os.environ.get("MEMESIS_SDK_STDERR") else None,
     )
+    # A plain-string system_prompt replaces the SDK's default coding-agent
+    # preset — correct for these single-shot, tool-less memory subprocesses.
+    if system_prompt is not None:
+        opt_kwargs["system_prompt"] = system_prompt
+    options = ClaudeAgentOptions(**opt_kwargs)
     try:
         result_text = ""
+        input_tokens: int | None = None
+        output_tokens: int | None = None
         async for msg in _agent_query(prompt=prompt, options=options):
             if ResultMessage is not None and isinstance(msg, ResultMessage):
                 # ResultMessage.result holds the final assistant text in
                 # current SDK versions; older builds expose .text. Try both.
                 result_text = (
-                    getattr(msg, "result", None)
-                    or getattr(msg, "text", None)
-                    or ""
+                    getattr(msg, "result", None) or getattr(msg, "text", None) or ""
                 )
+                usage = getattr(msg, "usage", None)
+                if isinstance(usage, dict):
+                    input_tokens = usage.get("input_tokens")
+                    output_tokens = usage.get("output_tokens")
                 # Do not break — exhaust the generator so it completes naturally.
                 # Breaking mid-generator leaves ag_running=True, causing
                 # "aclose(): asynchronous generator is already running" when
                 # asyncio.run() shuts down the event loop.
-        return result_text
+        return result_text, input_tokens, output_tokens
     finally:
         for k, v in saved.items():
             if v is not None:
@@ -308,18 +420,27 @@ async def call_llm_async(
     max_tokens: int = 8192,
     temperature: float = 0,
     model: str | None = None,
+    system_prompt_file: str | None = None,
 ) -> str:
     """Async variant of call_llm — uses agent-SDK on the OAuth path.
 
     On the API-key / Bedrock paths this is just an asyncio-compat wrapper
     around the synchronous SDK; concurrency gain is real only on the OAuth
     path because that's where we get the SDK's token-refresh serialization.
+
+    ``system_prompt_file`` — see call_llm.
     """
     use_bedrock = bool(os.environ.get("CLAUDE_CODE_USE_BEDROCK"))
 
     if not use_bedrock and not _have_api_key() and _AGENT_SDK_AVAILABLE:
-        raw = await _call_via_agent_sdk(prompt)
-        return strip_markdown_fences(raw)
+        _sp = _load_system_prompt(system_prompt_file)
+        raw_text, in_toks, out_toks = await _call_via_agent_sdk(
+            prompt,
+            _sp[1] if _sp else None,
+        )
+        result = strip_markdown_fences(raw_text)
+        _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
+        return result
 
     return await asyncio.to_thread(
         call_llm,
@@ -327,6 +448,7 @@ async def call_llm_async(
         max_tokens=max_tokens,
         temperature=temperature,
         model=model,
+        system_prompt_file=system_prompt_file,
     )
 
 
@@ -337,6 +459,7 @@ def call_llm_batch(
     max_tokens: int = 8192,
     temperature: float = 0,
     model: str | None = None,
+    system_prompt_file: str | None = None,
 ) -> list[str]:
     """Run N prompts concurrently and return results in input order.
 
@@ -358,7 +481,11 @@ def call_llm_batch(
         async with sem:
             try:
                 return await call_llm_async(
-                    p, max_tokens=max_tokens, temperature=temperature, model=model,
+                    p,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    model=model,
+                    system_prompt_file=system_prompt_file,
                 )
             except Exception as exc:  # noqa: BLE001
                 return f"[ERROR] {type(exc).__name__}: {exc}"[:500]
@@ -375,6 +502,7 @@ def call_llm(
     max_tokens: int = 8192,
     temperature: float = 0,
     model: str | None = None,
+    system_prompt_file: str | None = None,
 ) -> str:
     """
     Call the Anthropic Messages API and return the response text.
@@ -390,6 +518,11 @@ def call_llm(
         temperature: Sampling temperature (ignored on OAuth paths).
         model: Override model ID. If None, selects based on
                CLAUDE_CODE_USE_BEDROCK env var. Ignored on OAuth paths.
+        system_prompt_file: Optional system-prompt spec — a bare name resolved
+               against core/system_prompts/<name>.md, or an explicit path.
+               Frames the call for its task instead of the default coding-
+               agent preset. Applied on every transport. None = no system
+               prompt (legacy behavior).
 
     Returns:
         The response text with markdown fences stripped.
@@ -397,23 +530,39 @@ def call_llm(
     Raises:
         anthropic.APIError: On direct/Bedrock API failures.
         RuntimeError: On OAuth subprocess failure or missing CLI.
+        FileNotFoundError: If system_prompt_file does not resolve to a file.
     """
     use_bedrock = bool(os.environ.get("CLAUDE_CODE_USE_BEDROCK"))
+    _sp = _load_system_prompt(system_prompt_file)
+    _sp_text = _sp[1] if _sp else None
+    _sp_path = _sp[0] if _sp else None
 
     if not use_bedrock and not _have_api_key():
         if _AGENT_SDK_AVAILABLE:
             try:
-                result = strip_markdown_fences(asyncio.run(_call_via_agent_sdk(prompt)))
-                _emit_llm_envelope(model, prompt, None, None, len(result))
+                raw_text, in_toks, out_toks = asyncio.run(
+                    _call_via_agent_sdk(prompt, _sp_text)
+                )
+                result = strip_markdown_fences(raw_text)
+                _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
                 return result
             except RuntimeError as exc:
                 # Common failure: nested asyncio.run from already-running loop.
                 # Fall through to subprocess path in that case.
                 if "asyncio.run" not in str(exc) and "running" not in str(exc).lower():
                     raise
-        raw = _call_via_claude_cli(prompt)
+        raw, in_toks, out_toks, cache_read_toks = _call_via_claude_cli(
+            prompt, system_prompt_path=_sp_path
+        )
         result = strip_markdown_fences(raw)
-        _emit_llm_envelope(model, prompt, None, None, len(result))
+        _emit_llm_envelope(
+            model,
+            prompt,
+            in_toks,
+            out_toks,
+            len(result),
+            cache_read_input_tokens=cache_read_toks,
+        )
         return result
 
     client = _make_client()
@@ -421,12 +570,15 @@ def call_llm(
     if model is None:
         model = BEDROCK_MODEL if use_bedrock else DEFAULT_MODEL
 
-    response = client.messages.create(
+    create_kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
         messages=[{"role": "user", "content": prompt}],
     )
+    if _sp_text is not None:
+        create_kwargs["system"] = _sp_text
+    response = client.messages.create(**create_kwargs)
 
     raw = response.content[0].text
     result = strip_markdown_fences(raw)

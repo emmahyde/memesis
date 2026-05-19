@@ -31,7 +31,7 @@ import nltk
 from nltk.corpus import stopwords as nltk_stopwords
 from nltk.stem import PorterStemmer as NltkStemmer
 
-from .database import get_vec_store
+from .database import get_vec_store, project_slug
 from .models import ConsolidationLog, Memory, db
 
 logger = logging.getLogger(__name__)
@@ -113,9 +113,11 @@ class RelevanceEngine:
         _USAGE_SATURATION = 5  # confirmed uses for full usage_signal
         usage_signal = min(1.0, 0.3 + 0.7 * (usage_count / _USAGE_SATURATION))
 
-        # Context boost: memories from the same project are more relevant
+        # Context boost: memories from the same project are more relevant.
+        # The `project` column holds a slug; project_context is a path —
+        # slugify before comparing so reads and writes agree on one key.
         context_boost = 1.0
-        if project_context and _get("project_context") == project_context:
+        if project_context and _get("project") == project_slug(project_context):
             context_boost = 1.5
 
         # Saturation penalty: memories confirmed as unused in recent injections.

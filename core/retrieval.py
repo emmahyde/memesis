@@ -21,7 +21,7 @@ from peewee import fn
 
 import json
 
-from .database import get_base_dir, get_vec_store
+from .database import get_base_dir, get_vec_store, project_slug
 from .flags import get_flag
 from .models import (
     Memory,
@@ -443,7 +443,7 @@ class RetrievalEngine:
                 "stage": memory.stage,
                 "tags": memory.tag_list,
                 "rank": rrf_score,
-                "project_context": memory.project_context,
+                "project_context": memory.project,
             })
 
         # RISK-11: compute per-module contribution scores and attach to each result
@@ -960,14 +960,14 @@ class RetrievalEngine:
             key=lambda m: m.importance or 0.0,
             reverse=True,
         )
+        # Prefer same-project memories. `project` holds a slug; project_context
+        # is a path — slugify before comparing so this agrees with the write path.
+        _project_key = project_slug(project_context)
         records_sorted = sorted(
             records_sorted,
             key=lambda m: (
                 0
-                if (
-                    project_context is not None
-                    and m.project_context == project_context
-                )
+                if (_project_key is not None and m.project == _project_key)
                 else 1
             ),
         )
@@ -1148,16 +1148,20 @@ class RetrievalEngine:
 
         ranked_ids = [mid for mid, _ in ranked]
 
-        # 1-hop graph expansion: add thread/tag neighbors to candidate pool
-        from .graph import expand_neighbors
+        # 1-hop graph expansion: add thread/tag neighbors + cluster siblings
+        from .graph import expand_clusters, expand_neighbors
         neighbor_ids = expand_neighbors(ranked_ids, max_expansion=10, vec_store=get_vec_store())
-        if neighbor_ids:
-            # Neighbors get a reduced RRF score (half of the lowest seed score)
+        # Cluster anchoring: surfacing one cluster member pulls in its siblings.
+        seen = set(ranked_ids) | set(neighbor_ids)
+        cluster_ids = [c for c in expand_clusters(ranked_ids, max_expansion=10) if c not in seen]
+        expansion_ids = neighbor_ids + cluster_ids
+        if expansion_ids:
+            # Expanded candidates get a reduced RRF score (half the lowest seed score)
             min_score = min(s for _, s in ranked) if ranked else 0.0
             neighbor_score = min_score * 0.5
-            for nid in neighbor_ids:
+            for nid in expansion_ids:
                 ranked.append((nid, neighbor_score))
-            ranked_ids = ranked_ids + neighbor_ids
+            ranked_ids = ranked_ids + expansion_ids
 
         # Include both crystallized and consolidated memories — both have been
         # through quality gates. Crystallized get a boost in the scoring below.
@@ -1184,7 +1188,7 @@ class RetrievalEngine:
             boost = 0.0
             if memory.stage == "crystallized":
                 boost += CRYSTAL_BOOST
-            if project_context is not None and memory.project_context == project_context:
+            if project_context is not None and memory.project == project_slug(project_context):
                 boost += PROJECT_BOOST
             if getattr(memory, "affect_valence", None) == "friction":
                 boost += AFFECT_FRICTION_BOOST

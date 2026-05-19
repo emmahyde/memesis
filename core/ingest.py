@@ -22,8 +22,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .database import get_base_dir
+from .database import get_base_dir, get_commit_ref, get_project
 from .models import Memory, Observation
+from .validators import derive_memory_kind
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,23 @@ NATIVE_TYPE_MAP = {
     "feedback": "correction",
     "project": "decision_context",
     "reference": "domain_knowledge",
+}
+
+# Map native Claude Code memory types to W5 Memory.kind enum values.
+# Memory.kind ∈ {decision, finding, preference, constraint, correction, open_question}
+NATIVE_KIND_MAP = {
+    "user": "preference",      # user role/profile = stable preference signal
+    "feedback": "correction",   # explicit user guidance to adjust behavior
+    "project": "decision",      # ongoing initiative state = product/eng decisions
+    "reference": "finding",     # external-system pointers = factual references
+}
+
+# Map native types to W5 knowledge_type axis.
+NATIVE_KNOWLEDGE_TYPE_MAP = {
+    "user": "metacognitive",    # about how to collaborate with the user
+    "feedback": "procedural",   # how to behave going forward
+    "project": "factual",       # what is true about the project state
+    "reference": "factual",     # what/where external resources are
 }
 
 # Importance defaults for native memory types.
@@ -242,6 +260,7 @@ class NativeMemoryIngestor:
                     filtered_content=content,
                     content_hash=content_hash,
                     status="ingested",
+                    project=get_project(),
                     metadata=json.dumps({
                         "source": "native-claude-code",
                         "native_type": native_type,
@@ -258,6 +277,14 @@ class NativeMemoryIngestor:
                     created_at=now,
                     updated_at=now,
                     content_hash=content_hash,
+                    project=get_project(),
+                    commit_ref=get_commit_ref(),
+                    # W5 schema fields — populate from native frontmatter
+                    kind=NATIVE_KIND_MAP.get(native_type),
+                    memory_kind=derive_memory_kind(NATIVE_KIND_MAP.get(native_type)),
+                    knowledge_type=NATIVE_KNOWLEDGE_TYPE_MAP.get(native_type),
+                    knowledge_type_confidence="high" if native_type in NATIVE_KIND_MAP else None,
+                    subtitle=(mem.get("description") or "")[:150] or None,
                     # Defensive nulls — ingest is a non-card write path (D3)
                     temporal_scope=None,
                     confidence=None,
