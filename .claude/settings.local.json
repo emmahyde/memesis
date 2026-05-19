@@ -8,7 +8,8 @@
       "Bash(rtk grep *)",
       "Bash(uv run *)",
       "Bash(git stash *)",
-      "Bash(git worktree *)"
+      "Bash(git worktree *)",
+      "Bash(rtk read *)"
     ]
   },
   "enabledMcpjsonServers": [

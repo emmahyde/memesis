@@ -15,7 +15,7 @@
           {
             "type": "command",
             "command": "NLTK_DATA=${CLAUDE_PLUGIN_DATA}/nltk_data ${CLAUDE_PLUGIN_DATA}/venv/bin/python3 ${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py",
-            "timeout": 5
+            "timeout": 15
           }
         ]
       }
