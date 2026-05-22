@@ -7,7 +7,7 @@ memories that weren't already loaded at SessionStart.
 
 Must be fast: FTS < 10ms, vec KNN < 3ms, RRF merge < 1ms.  The embedding call
 (~200-400ms) is attempted but never required — FTS-only hybrid is used if
-Bedrock is unavailable.
+the embedding call fails.
 """
 
 import json

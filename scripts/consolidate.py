@@ -22,7 +22,6 @@ Pipeline:
 """
 
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -194,12 +193,8 @@ def consolidate(observations: list, focus: str = None) -> dict:
         focus_block=focus_block,
     )
 
-    if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-        client = anthropic.AnthropicBedrock()
-        model = "us.anthropic.claude-sonnet-4-6"
-    else:
-        client = anthropic.Anthropic()
-        model = "claude-sonnet-4-6"
+    client = anthropic.Anthropic()
+    model = "claude-sonnet-4-6"
 
     try:
         response = client.messages.create(

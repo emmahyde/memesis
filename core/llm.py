@@ -2,20 +2,19 @@
 Shared LLM transport — client selection and response cleaning.
 
 Centralizes the Anthropic API call pattern used across consolidator,
-crystallizer, threads, and self_reflection.  Handles Bedrock vs direct
-client selection and markdown fence stripping.  Does NOT parse JSON or
-implement retry — those are caller responsibilities because the expected
-response shape and error policy differ per caller.
+crystallizer, threads, and self_reflection.  Handles transport selection
+and markdown fence stripping.  Does NOT parse JSON or implement retry —
+those are caller responsibilities because the expected response shape and
+error policy differ per caller.
 
 Transport selection (in order):
-  1. CLAUDE_CODE_USE_BEDROCK=1 → AnthropicBedrock
-  2. claude-agent-sdk present  → ClaudeAgentOptions / query() (subscription OAuth)
-  3. fallback                  → `claude -p` subprocess
+  1. claude-agent-sdk present  → ClaudeAgentOptions / query() (subscription OAuth)
+  2. fallback                  → `claude -p` subprocess
 
 Note: API-key path (`ANTHROPIC_API_KEY`) is intentionally disabled. All
-non-Bedrock calls go through subscription OAuth credentials in `~/.claude/`.
-The env var is stripped from spawned subprocesses to prevent the CLI from
-falling into API-key mode.
+calls go through subscription OAuth credentials in `~/.claude/`. The env
+var is stripped from spawned subprocesses to prevent the CLI from falling
+into API-key mode. Bedrock transport was removed.
 
 The agent-SDK path is preferred over raw subprocess because the SDK
 internally serializes OAuth token refreshes, eliminating the rc=1 races
@@ -33,8 +32,6 @@ import shutil
 import subprocess
 from typing import Optional
 
-import anthropic
-
 try:  # optional — only used on the OAuth subscription path
     from claude_agent_sdk import ClaudeAgentOptions, query as _agent_query
     from claude_agent_sdk.types import ResultMessage
@@ -48,7 +45,6 @@ except ImportError:  # pragma: no cover
 
 # Model constants — one place to update when the model changes.
 DEFAULT_MODEL = "claude-sonnet-4-6"
-BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6"
 
 # System-prompt library — see core/system_prompts/. memesis LLM calls are
 # single-shot, tool-less subprocesses; a task-scoped system prompt frames the
@@ -203,31 +199,6 @@ def strip_markdown_fences(text: str) -> str:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
     return text
-
-
-def _make_client():
-    """
-    Create the appropriate Anthropic client based on environment.
-
-    Returns:
-        anthropic.AnthropicBedrock if CLAUDE_CODE_USE_BEDROCK is set,
-        anthropic.Anthropic otherwise.
-    """
-    if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-        return anthropic.AnthropicBedrock()
-    return anthropic.Anthropic()
-
-
-def _have_api_key() -> bool:
-    """Always False — API-key transport is intentionally disabled.
-
-    All non-Bedrock calls must use subscription OAuth credentials in
-    `~/.claude/`. Returning False forces `call_llm` / `call_llm_async`
-    onto the agent-SDK path (or CLI fallback), both of which strip
-    ANTHROPIC_API_KEY from the spawned subprocess so a stale env key
-    cannot leak into the request.
-    """
-    return False
 
 
 def _call_via_claude_cli(
@@ -424,15 +395,12 @@ async def call_llm_async(
 ) -> str:
     """Async variant of call_llm — uses agent-SDK on the OAuth path.
 
-    On the API-key / Bedrock paths this is just an asyncio-compat wrapper
-    around the synchronous SDK; concurrency gain is real only on the OAuth
-    path because that's where we get the SDK's token-refresh serialization.
+    Concurrency gain is real on the OAuth path because that's where we
+    get the SDK's token-refresh serialization.
 
     ``system_prompt_file`` — see call_llm.
     """
-    use_bedrock = bool(os.environ.get("CLAUDE_CODE_USE_BEDROCK"))
-
-    if not use_bedrock and not _have_api_key() and _AGENT_SDK_AVAILABLE:
+    if _AGENT_SDK_AVAILABLE:
         _sp = _load_system_prompt(system_prompt_file)
         raw_text, in_toks, out_toks = await _call_via_agent_sdk(
             prompt,
@@ -507,17 +475,16 @@ def call_llm(
     """
     Call the Anthropic Messages API and return the response text.
 
-    Handles transport selection (Bedrock / API key / agent-SDK / subprocess)
-    and strips markdown fences from the response. Does NOT parse JSON or
-    retry — callers own their response parsing and error handling.
+    Handles transport selection (agent-SDK / subprocess) and strips markdown
+    fences from the response. Does NOT parse JSON or retry — callers own their
+    response parsing and error handling.
 
     Args:
         prompt: The full prompt to send.
         max_tokens: Maximum tokens in the response (default 8192; ignored on
                     the OAuth paths where the CLI uses its own defaults).
         temperature: Sampling temperature (ignored on OAuth paths).
-        model: Override model ID. If None, selects based on
-               CLAUDE_CODE_USE_BEDROCK env var. Ignored on OAuth paths.
+        model: Override model ID. Ignored on OAuth paths.
         system_prompt_file: Optional system-prompt spec — a bare name resolved
                against core/system_prompts/<name>.md, or an explicit path.
                Frames the call for its task instead of the default coding-
@@ -528,64 +495,36 @@ def call_llm(
         The response text with markdown fences stripped.
 
     Raises:
-        anthropic.APIError: On direct/Bedrock API failures.
         RuntimeError: On OAuth subprocess failure or missing CLI.
         FileNotFoundError: If system_prompt_file does not resolve to a file.
     """
-    use_bedrock = bool(os.environ.get("CLAUDE_CODE_USE_BEDROCK"))
     _sp = _load_system_prompt(system_prompt_file)
     _sp_text = _sp[1] if _sp else None
     _sp_path = _sp[0] if _sp else None
 
-    if not use_bedrock and not _have_api_key():
-        if _AGENT_SDK_AVAILABLE:
-            try:
-                raw_text, in_toks, out_toks = asyncio.run(
-                    _call_via_agent_sdk(prompt, _sp_text)
-                )
-                result = strip_markdown_fences(raw_text)
-                _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
-                return result
-            except RuntimeError as exc:
-                # Common failure: nested asyncio.run from already-running loop.
-                # Fall through to subprocess path in that case.
-                if "asyncio.run" not in str(exc) and "running" not in str(exc).lower():
-                    raise
-        raw, in_toks, out_toks, cache_read_toks = _call_via_claude_cli(
-            prompt, system_prompt_path=_sp_path
-        )
-        result = strip_markdown_fences(raw)
-        _emit_llm_envelope(
-            model,
-            prompt,
-            in_toks,
-            out_toks,
-            len(result),
-            cache_read_input_tokens=cache_read_toks,
-        )
-        return result
-
-    client = _make_client()
-
-    if model is None:
-        model = BEDROCK_MODEL if use_bedrock else DEFAULT_MODEL
-
-    create_kwargs: dict = dict(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
+    if _AGENT_SDK_AVAILABLE:
+        try:
+            raw_text, in_toks, out_toks = asyncio.run(
+                _call_via_agent_sdk(prompt, _sp_text)
+            )
+            result = strip_markdown_fences(raw_text)
+            _emit_llm_envelope(model, prompt, in_toks, out_toks, len(result))
+            return result
+        except RuntimeError as exc:
+            # Common failure: nested asyncio.run from already-running loop.
+            # Fall through to subprocess path in that case.
+            if "asyncio.run" not in str(exc) and "running" not in str(exc).lower():
+                raise
+    raw, in_toks, out_toks, cache_read_toks = _call_via_claude_cli(
+        prompt, system_prompt_path=_sp_path
     )
-    if _sp_text is not None:
-        create_kwargs["system"] = _sp_text
-    response = client.messages.create(**create_kwargs)
-
-    raw = response.content[0].text
     result = strip_markdown_fences(raw)
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    if hasattr(response, "usage") and response.usage is not None:
-        input_tokens = getattr(response.usage, "input_tokens", None)
-        output_tokens = getattr(response.usage, "output_tokens", None)
-    _emit_llm_envelope(model, prompt, input_tokens, output_tokens, len(result))
+    _emit_llm_envelope(
+        model,
+        prompt,
+        in_toks,
+        out_toks,
+        len(result),
+        cache_read_input_tokens=cache_read_toks,
+    )
     return result

@@ -7,9 +7,8 @@ observations, runs LLM-based consolidation against the single global store,
 then runs the full lifecycle: crystallization, thread building, relevance
 maintenance, and periodic self-reflection.
 
-LLM transport: defaults to the agent-SDK / OAuth path used by interactive
-Claude Code sessions. To opt into Bedrock, set CLAUDE_CODE_USE_BEDROCK=1
-in the cron environment.
+LLM transport: the agent-SDK / OAuth path used by interactive Claude Code
+sessions, with `claude -p` subprocess as fallback.
 
 Usage:
     python3 /path/to/consolidate_cron.py

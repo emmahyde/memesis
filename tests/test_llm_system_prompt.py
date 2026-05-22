@@ -77,7 +77,6 @@ def test_result_is_cached():
 
 
 def _force_oauth(monkeypatch):
-    monkeypatch.setattr(llm, "_have_api_key", lambda: False)
     monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
 
 

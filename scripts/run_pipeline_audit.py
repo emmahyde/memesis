@@ -1075,7 +1075,7 @@ def main():
     a("sections use existing observability traces or synthetic estimates clearly marked [MOCK-LLM].")
     a("")
     a("**To get real Stage 1/Stage 2 data:**")
-    a("1. Set `ANTHROPIC_API_KEY` or configure Bedrock via `CLAUDE_CODE_USE_BEDROCK`")
+    a("1. Ensure the `claude` CLI is on PATH with valid OAuth credentials")
     a("2. Reset cursors to 0 for target sessions: `python -c \"from core.cursors import CursorStore; ...`")
     a("3. Run `python scripts/transcript_cron.py` to extract Stage 1 observations")
     a("4. Run `python scripts/consolidate.py` for Stage 2 consolidation")
