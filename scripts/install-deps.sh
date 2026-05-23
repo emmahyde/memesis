@@ -4,11 +4,11 @@ set -euo pipefail
 PLUGIN_ROOT="${1:?Usage: install-deps.sh <PLUGIN_ROOT> <PLUGIN_DATA>}"
 PLUGIN_DATA="${2:?Usage: install-deps.sh <PLUGIN_ROOT> <PLUGIN_DATA>}"
 VENV_DIR="$PLUGIN_DATA/venv"
-REQUIREMENTS="$PLUGIN_ROOT/requirements.txt"
-STAMP="$PLUGIN_DATA/requirements.txt"
+PYPROJECT="$PLUGIN_ROOT/pyproject.toml"
+STAMP="$PLUGIN_DATA/pyproject.toml"
 
 # Skip if deps are current
-if diff -q "$REQUIREMENTS" "$STAMP" >/dev/null 2>&1; then
+if diff -q "$PYPROJECT" "$STAMP" >/dev/null 2>&1; then
     exit 0
 fi
 
@@ -32,8 +32,8 @@ echo "[memesis] Using Python: $PYTHON ($($PYTHON --version 2>&1))" >&2
 mkdir -p "$PLUGIN_DATA"
 "$PYTHON" -m venv --clear "$VENV_DIR"
 
-# Install deps
-"$VENV_DIR/bin/pip" install -q -r "$REQUIREMENTS"
+# Install deps from pyproject.toml (editable, so live-tree edits take effect)
+"$VENV_DIR/bin/pip" install -q -e "$PLUGIN_ROOT"
 
 # Download NLTK data into plugin data dir
 NLTK_DATA="$PLUGIN_DATA/nltk_data" "$VENV_DIR/bin/python3" - <<'PYEOF'
@@ -46,5 +46,5 @@ if not ok:
 PYEOF
 
 # Stamp
-cp "$REQUIREMENTS" "$STAMP"
+cp "$PYPROJECT" "$STAMP"
 echo "[memesis] Dependencies installed." >&2
