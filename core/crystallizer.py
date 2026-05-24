@@ -462,6 +462,19 @@ class Crystallizer:
                 payload={"crystallized_memory_id": str(crystallized_id), "sources_archived": len(group)},
             )
 
+        # Bidirectional native-memory sync (#27): export the crystal to its
+        # slug file under ~/.claude/projects/{project}/memory/. Best-effort —
+        # a missing dir or transient IO error must not block crystallization.
+        try:
+            from .native_memory import export_memory_to_native, native_memory_dir
+            nd = native_memory_dir(get_project())
+            if nd is not None:
+                export_memory_to_native(crystal_mem, nd)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "native_memory export failed for %s: %s", crystallized_id, e
+            )
+
         return {
             "crystallized_id": crystallized_id,
             "source_ids": source_ids,

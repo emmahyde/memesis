@@ -157,6 +157,20 @@ class LifecycleManager:
             to_stage='archived',
             rationale=rationale,
         )
+
+        # Bidirectional native-memory sync (#27): if the demoted memory had a
+        # native slug file, flip its frontmatter to archived: true. We do this
+        # BEFORE delete_instance so the lookup by memesis_id still resolves.
+        if current_stage in ('crystallized', 'instinctive'):
+            try:
+                from .database import get_project
+                from .native_memory import mark_native_archived, native_memory_dir
+                nd = native_memory_dir(get_project())
+                if nd is not None:
+                    mark_native_archived(memory, nd)
+            except Exception:
+                pass
+
         memory.delete_instance()
 
     def get_promotion_candidates(self) -> list[dict]:

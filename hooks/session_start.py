@@ -103,6 +103,17 @@ def main():
         ingestor = NativeMemoryIngestor()
         ingestor.ingest(project_context)
 
+        # #27: refresh DB rows from native slug files edited by the user since
+        # the last session. Operates on type-subdirs (user/, feedback/, …)
+        # that NativeMemoryIngestor skips. Best-effort — never block startup.
+        try:
+            from core.native_memory import ingest_native_memories, native_memory_dir
+            nd = native_memory_dir(get_project())
+            if nd is not None:
+                ingest_native_memories(nd, project=get_project())
+        except Exception as e:
+            emit_stderr(f"native_memory ingest error (non-fatal): {e}")
+
         # Rehydrate archived memories relevant to this project context
         relevance = RelevanceEngine()
         relevance.rehydrate_for_context(project_context)
