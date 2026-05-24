@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hooks._safe import emit_context, emit_stderr, emit_stdout
 
 from core.affect import coherence_probe, load_analyzer, save_analyzer, format_guidance
-from core.database import get_base_dir, get_vec_store, init_db
+from core.database import get_base_dir, get_vec_store, init_db, project_slug
 from core.models import Memory, RetrievalLog
 from core.retrieval import RetrievalEngine
 
@@ -208,10 +208,20 @@ def search_and_inject(
 
     # --- Merge: Tier 2 first, then Tier 3 JIT to fill remaining slots ---
     already_injected = get_already_injected(session_id)
+    # Project scoping: match SessionStart — same project OR project-null (global).
+    # Tier 2 already applies a project boost; Tier 3 hybrid_search does not, so
+    # without this filter cross-project memories leak into JIT injection.
+    current_project = project_slug(project_context)
 
     def _is_eligible(m) -> bool:
+        proj_ok = (
+            current_project is None
+            or m.project is None
+            or m.project == current_project
+        )
         return (
-            m.id not in already_injected
+            proj_ok
+            and m.id not in already_injected
             and not m.archived_at
             and m.stage != "ephemeral"
         )
