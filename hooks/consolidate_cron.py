@@ -33,7 +33,7 @@ from core.embeddings import embed_for_memory
 from core.feedback import FeedbackLoop
 from core.lifecycle import LifecycleManager
 from core.manifest import ManifestGenerator
-from core.models import Memory
+from core.models import Memory, db
 from core.relevance import RelevanceEngine
 from core.self_reflection import SelfReflector
 from core.threads import build_threads
@@ -47,6 +47,27 @@ logger = logging.getLogger(__name__)
 # Run self-reflection every N consolidations.
 REFLECTION_INTERVAL = 5
 STALENESS_INTERVAL = 20  # Run staleness detection every 20 cron consolidations (~daily at hourly cron)
+
+
+def _fts_integrity_or_rebuild() -> None:
+    """Run FTS5 integrity-check; rebuild the index if it fails."""
+    try:
+        db.execute_sql("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
+        logger.debug("memories_fts integrity-check: OK")
+    except Exception as e:
+        logger.warning("memories_fts integrity-check failed: %s — rebuilding", e)
+        db.execute_sql("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        logger.warning("memories_fts rebuild complete")
+
+
+def _assert_fts_sync() -> None:
+    """Detect FTS row-count drift vs the base table; rebuild if diverged."""
+    m = db.execute_sql("SELECT COUNT(*) FROM memories").fetchone()[0]
+    f = db.execute_sql("SELECT COUNT(*) FROM memories_fts").fetchone()[0]
+    if m != f:
+        logger.warning("FTS row drift: memories=%d fts=%d — rebuilding", m, f)
+        db.execute_sql("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        logger.warning("memories_fts rebuild complete after drift detection")
 
 
 def find_ephemeral_buffers() -> list[Path]:
@@ -128,6 +149,14 @@ def process_buffer(ephemeral_path: Path) -> dict | None:
 
     try:
         base_dir = init_db(project=project_slug)
+
+        # --- FTS5 health check before any writes ---
+        try:
+            _fts_integrity_or_rebuild()
+            _assert_fts_sync()
+        except Exception as e:
+            logger.warning("FTS5 health check error (non-fatal): %s", e)
+
         lifecycle = LifecycleManager()
         consolidator = Consolidator(lifecycle)
         manifest = ManifestGenerator()
