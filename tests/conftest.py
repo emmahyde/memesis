@@ -13,8 +13,11 @@ import pytest
 os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)
 
 # Redirect observability JSONL output to a session-scoped temp dir so test
-# runs don't pollute backfill-output/observability/ in the real repo.
-_TEST_OBS_DIR = Path(tempfile.mkdtemp(prefix="memesis-test-obs-"))
+# runs don't pollute backfill-output/observability/ in the real repo. Under
+# pytest-xdist each worker gets its own subdir so workers don't race on the
+# same JSONL files.
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "main")
+_TEST_OBS_DIR = Path(tempfile.mkdtemp(prefix=f"memesis-test-obs-{_XDIST_WORKER}-"))
 os.environ["MEMESIS_OBS_DIR"] = str(_TEST_OBS_DIR)
 
 # Add parent directory to path for imports

@@ -30,6 +30,8 @@ eval = [
 ]
 dev = [
     "pytest>=8.0",
+    "pytest-xdist>=3.5",
+    "pytest-randomly>=3.15",
     "anyio>=4.0",
 ]
 
@@ -39,6 +41,16 @@ memesis-mcp = "core.mcp_server:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "hooks*"]
+
+[tool.pytest.ini_options]
+# `-n auto` runs the suite across all CPU cores via pytest-xdist.
+# `--dist worksteal` keeps slow workers from blocking the tail of the run.
+# `-m "not live_llm"` excludes any future tests that opt into live LLM calls;
+# today there are no such tests in tests/ (eval/ harness is a separate path).
+addopts = "-n auto --dist worksteal -m 'not live_llm'"
+markers = [
+    "live_llm: test issues real LLM calls (skipped by default; opt in with `-m live_llm`)",
+]
 
 [tool.pyright]
 pythonVersion = "3.10"
