@@ -39,7 +39,7 @@ from .models import ConsolidationLog, Memory, Observation
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .importance import calibrate_importance
 from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
-from .validators import classify_memory_kind, derive_memory_kind
+from .validators import is_lifecycle_kind
 from .question_lifecycle import (
     detect_resolution,
     get_unresolved_questions,
@@ -898,10 +898,7 @@ class Consolidator:
             or ""
         )
 
-        # Tag observation kind for retrieval filtering (replaces dead observation_type read).
         obs_kind = decision.get("kind")
-        if obs_kind and obs_kind != "null" and f"kind:{obs_kind}" not in tags:
-            tags.append(f"kind:{obs_kind}")
 
         # Somatic marker — classify valence and boost importance
         from .somatic import classify_valence
@@ -989,16 +986,9 @@ class Consolidator:
             else:
                 mem_importance = min(0.5 + importance_boost, 1.0)
 
-            # Curated kind + deterministic importance calibration (canvas §1/§3):
-            # raise to the per-kind floor and reward action items / numeric evidence.
-            # Two-phase: deterministic map first; LLM fallback for non-open_question nulls.
-            mem_kind = derive_memory_kind(
-                decision.get("kind"), decision.get("evidence_count")
-            )
-            if mem_kind is None and obs_kind != "open_question":
-                mem_kind = classify_memory_kind(title, body_content)
-            # mem_kind is NULL only when both phases fail or obs_kind == "open_question" — both legitimate
-            mem_importance = calibrate_importance(mem_importance, mem_kind, body_content)
+            # Importance calibration: raise to per-kind floor and reward
+            # action items / numeric evidence (single-taxonomy, §1/§3).
+            mem_importance = calibrate_importance(mem_importance, kind=obs_kind, content=body_content)
 
             mem = Memory.create(
                 stage="consolidated",
@@ -1028,7 +1018,6 @@ class Consolidator:
                 rejected_options=json.dumps(card_fields.get("rejected_options")) if card_fields.get("rejected_options") else None,
                 # Stage 2 enrichment fields from consolidation prompt
                 kind=decision.get("kind"),
-                memory_kind=mem_kind,
                 subtitle=decision.get("subtitle"),
                 cwd=decision.get("cwd"),
                 subject=decision.get("subject"),

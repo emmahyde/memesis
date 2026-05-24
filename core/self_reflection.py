@@ -402,7 +402,7 @@ class SelfReflector:
             title=tendency,
             summary=observation.get("correction") or evidence or tendency,
             content=json.dumps(observation),
-            tags=json.dumps(["kind:hypothesis", "self_reflection"]),
+            tags=json.dumps(["self_reflection"]),
             importance=float(confidence) if confidence is not None else 0.5,
             reinforcement_count=0,
             created_at=now,
@@ -447,8 +447,10 @@ class SelfReflector:
             content=content,
             title=SELF_MODEL_TITLE,
             summary=SELF_MODEL_SUMMARY,
-            tags=["self-awareness", "meta-cognition", "kind:finding", "knowledge_type:metacognitive"],
+            tags=["self-awareness", "meta-cognition"],
             importance=0.90,
+            kind="lesson",
+            knowledge_type="metacognitive",
         )
 
     def _seed_observation_habit(self) -> str:
@@ -458,8 +460,10 @@ class SelfReflector:
             content=OBSERVATION_HABIT_CONTENT,
             title=OBSERVATION_HABIT_TITLE,
             summary=OBSERVATION_HABIT_SUMMARY,
-            tags=["meta-cognition", "workflow", "kind:preference", "knowledge_type:procedural"],
+            tags=["meta-cognition", "workflow"],
             importance=0.85,
+            kind="directive",
+            knowledge_type="procedural",
         )
 
     def _seed_compaction_guidance(self) -> str:
@@ -469,13 +473,17 @@ class SelfReflector:
             content=COMPACTION_GUIDANCE_CONTENT,
             title=COMPACTION_GUIDANCE_TITLE,
             summary=COMPACTION_GUIDANCE_SUMMARY,
-            tags=["meta-cognition", "compaction", "kind:preference", "knowledge_type:procedural"],
+            tags=["meta-cognition", "compaction"],
             importance=0.90,
+            kind="directive",
+            knowledge_type="procedural",
         )
 
     def _create_instinctive_memory(
         self, path: str, content: str, title: str, summary: str,
         tags: list, importance: float,
+        kind: str | None = None,
+        knowledge_type: str | None = None,
     ) -> str:
         """Create an instinctive memory with file and DB entry."""
         base_dir = get_base_dir()
@@ -501,9 +509,9 @@ class SelfReflector:
             existing = Memory.select().where(Memory.content_hash == content_hash).first()
             return existing.id
 
-        # Extract W5 enrichment fields encoded in tags ("kind:X", "knowledge_type:Y").
-        kind_tag = next((t.split(":", 1)[1] for t in tags if t.startswith("kind:")), None)
-        kt_tag = next((t.split(":", 1)[1] for t in tags if t.startswith("knowledge_type:")), None)
+        # Strip legacy "kind:X" / "knowledge_type:Y" tag prefixes — kind is
+        # now a first-class column passed directly. Keep all other tags.
+        clean_tags = [t for t in tags if not t.startswith("kind:") and not t.startswith("knowledge_type:")]
 
         now = datetime.now().isoformat()
         mem = Memory.create(
@@ -511,17 +519,17 @@ class SelfReflector:
             title=title,
             summary=summary,
             content=content,   # body only — better FTS signal
-            tags=json.dumps(tags),
+            tags=json.dumps(clean_tags),
             importance=importance,
             reinforcement_count=0,
             created_at=now,
             updated_at=now,
             content_hash=content_hash,
             project=get_project(),
-            # W5 schema fields — parsed from tag conventions used by seeders
-            kind=kind_tag,
-            knowledge_type=kt_tag,
-            knowledge_type_confidence="high" if kt_tag else None,
+            # Kind read directly from column, not parsed from tag convention.
+            kind=kind,
+            knowledge_type=knowledge_type,
+            knowledge_type_confidence="high" if knowledge_type else None,
             subtitle=summary or None,
             # Defensive nulls — self_reflection is a non-card write path (D3)
             temporal_scope=None,

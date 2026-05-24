@@ -14,6 +14,7 @@ from peewee import fn
 
 from .database import get_base_dir
 from .models import ConsolidationLog, Memory, RetrievalLog, db
+from .validators import is_lifecycle_kind
 
 
 class LifecycleManager:
@@ -281,11 +282,11 @@ class LifecycleManager:
             return True, "Eligible for consolidation"
 
         if current_stage == 'consolidated' and next_stage == 'crystallized':
-            # Stage-gated invariant: a memory must be classified before it can
-            # crystallize. open_question rows are exempt — they are a lifecycle
-            # state, not a knowledge kind, and carry memory_kind=NULL by design.
-            if not memory.memory_kind and memory.kind != 'open_question':
-                return False, "Unclassified: memory_kind is NULL"
+            # Stage-gated: a memory must have a kind before crystallizing.
+            # Lifecycle kinds (open_question, hypothesis) have kind set and
+            # pass this check — they are exempt from content-kind requirements.
+            if not memory.kind:
+                return False, "Unclassified: kind is NULL"
             mem_dict = {
                 'id': memory.id,
                 'reinforcement_count': memory.reinforcement_count,
