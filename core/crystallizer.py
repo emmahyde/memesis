@@ -45,7 +45,7 @@ CRYSTALLIZATION_PROMPT = """You are transforming episodic observations into sema
 SOURCE OBSERVATIONS (these have proven valuable across multiple sessions):
 {observations}
 
-YOUR TASK: Synthesize these into ONE crystallized insight.
+YOUR TASK: Synthesize these into ONE crystallized insight, and classify what KIND of knowledge it is.
 
 THE TRANSFORMATION:
 - Strip away session-specific details (dates, file paths, one-time contexts)
@@ -55,13 +55,31 @@ THE TRANSFORMATION:
 
 EPISODIC → SEMANTIC EXAMPLES:
 - "Bedrock requires AnthropicBedrock()" + "Bedrock model IDs use us.anthropic prefix" + "Bedrock doesn't support all API features"
-  → "AWS Bedrock wraps the Anthropic API but diverges at every interface point: client class, model ID format, and feature availability. Treat each surface as potentially different."
+  → "AWS Bedrock wraps the Anthropic API but diverges at every interface point: client class, model ID format, and feature availability. Treat each surface as potentially different."  (kind: fact)
 
 - "Emma prefers single PRs for refactors" + "Emma slices large PRs by abstraction layer"
-  → "PR sizing follows a principle: one PR per coherent change, where 'coherent' means a single abstraction layer or a complete refactor. Splitting within a layer adds review overhead without reducing risk."
+  → "PR sizing follows a principle: one PR per coherent change, where 'coherent' means a single abstraction layer or a complete refactor. Splitting within a layer adds review overhead without reducing risk."  (kind: preference)
 
 - "I defaulted to PostgreSQL when SQLite was fine" + "I suggested threads when asyncio was right"
-  → "Pattern: I reach for heavyweight/familiar tools before checking if the problem's actual constraints allow something simpler. The correction isn't 'always use the simple thing' — it's 'check the constraints first.'"
+  → "Pattern: I reach for heavyweight/familiar tools before checking if the problem's actual constraints allow something simpler. The correction isn't 'always use the simple thing' — it's 'check the constraints first.'"  (kind: lesson)
+
+KIND TAXONOMY (pick exactly one):
+- decision: a choice that was made and the rationale behind it (architectural call, tradeoff resolution)
+- fact: a true statement about the system, API, library, environment, or domain
+- lesson: a generalised pattern extracted from past mistakes or wins; behavioural correction
+- correction: an explicit user directive overriding prior behaviour ("don't do X", "stop doing Y")
+- directive: a standing rule or constraint the user has imposed ("always run uv run", "never edit X")
+- preference: how the user works — style, taste, tooling, workflow choices
+- goal: a stated objective or outcome the user is pursuing
+- hypothesis: an unverified theory worth checking, not yet promoted to fact
+- open_question: a known unknown the user wants tracked
+
+CHOOSING KIND:
+- If the sources are mostly user-directives → directive
+- If the sources are corrections of past behaviour → correction or lesson (correction = explicit user override; lesson = self-derived pattern)
+- If the sources are system/API truths → fact
+- If the sources describe how Emma works → preference
+- When sources mix kinds, pick the one that captures the BEHAVIOURAL force of the insight, not the surface form
 
 RULES:
 - Title should be a general principle, not a specific fact
@@ -73,10 +91,17 @@ Respond ONLY with valid JSON:
 {{
   "title": "General principle (not a specific fact)",
   "insight": "The crystallized understanding — dense, behavioral, pattern-level",
-  "observation_type": "correction|preference_signal|workflow_pattern|self_observation|domain_knowledge|shared_insight|decision_context",
+  "kind": "decision|fact|lesson|correction|directive|preference|goal|hypothesis|open_question",
   "tags": ["tag1", "tag2"],
   "source_pattern": "One sentence: what these observations have in common"
 }}"""
+
+# Canonical 7+2 kind taxonomy (single source of truth shared with the prompt).
+VALID_KINDS = {
+    "decision", "fact", "lesson", "correction",
+    "directive", "preference", "goal",
+    "hypothesis", "open_question",
+}
 
 
 
@@ -364,9 +389,21 @@ class Crystallizer:
         # §8 (ambiguity-verbosity trade-off) for theoretical framing.
 
         tags = list(result.get("tags", []))
-        obs_type = result.get("observation_type", "")
-        if obs_type and f"type:{obs_type}" not in tags:
-            tags.append(f"type:{obs_type}")
+
+        # Validate kind against the canonical taxonomy. Fall back to the
+        # majority kind from the source group (mode), then "lesson" if even
+        # that is missing — crystals must always carry a kind for #27 native
+        # sync and for kind-driven retrieval.
+        kind = (result.get("kind") or "").strip().lower()
+        if kind not in VALID_KINDS:
+            kind_counts: dict[str, int] = {}
+            for m in group:
+                k = (m.kind or "").strip().lower()
+                if k in VALID_KINDS:
+                    kind_counts[k] = kind_counts.get(k, 0) + 1
+            kind = max(kind_counts, key=kind_counts.get) if kind_counts else "lesson"
+
+        tags.append(f"kind:{kind}")
         tags.append("source:crystallization")
 
         content = result["insight"]
@@ -415,6 +452,7 @@ class Crystallizer:
             summary=result["insight"][:150],
             content=content,   # body only — better FTS, consistent hash
             tags=json.dumps(tags),
+            kind=kind,
             importance=crystal_importance,
             reinforcement_count=0,
             created_at=now,

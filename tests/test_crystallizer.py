@@ -166,7 +166,7 @@ def test_group_two_candidates_always_singletons(crystallizer):
 MOCK_LLM_RESPONSE = {
     "title": "Bedrock SDK diverges at every interface point",
     "insight": "AWS Bedrock wraps the Anthropic API but diverges at every surface: client class, model IDs, and feature set. Treat each as potentially different.",
-    "observation_type": "correction",
+    "kind": "fact",
     "tags": ["aws", "bedrock", "sdk"],
     "source_pattern": "Multiple corrections about Bedrock-specific API differences",
 }
@@ -491,3 +491,67 @@ class TestEmbeddingGrouping:
         group_sets = [frozenset(c.id for c in g) for g in groups]
         shared_ids = frozenset([ids[0], ids[1]])
         assert any(shared_ids <= gs for gs in group_sets)
+
+
+# --- Kind preservation across crystallization (regression) ----------------
+
+
+@patch("core.crystallizer.call_llm")
+def test_crystal_inherits_kind_from_llm(mock_llm, crystallizer, base):
+    """When the LLM returns a valid kind, the crystal row carries it through."""
+    mock_llm.return_value = json.dumps({**MOCK_LLM_RESPONSE, "kind": "lesson"})
+
+    _create_consolidated(
+        "Source Mem", "Source content", tags=["type:correction", "bedrock"],
+        reinforcement_count=3,
+    )
+    results = crystallizer.crystallize_candidates()
+    crystal = Memory.get_by_id(results[0]["crystallized_id"])
+    assert crystal.kind == "lesson"
+    assert "kind:lesson" in (crystal.tags or "")
+
+
+@patch("core.crystallizer.call_llm")
+def test_crystal_falls_back_to_majority_kind_when_llm_omits(mock_llm, crystallizer, base):
+    """LLM response with invalid/missing kind → use the source group's majority."""
+    bad_response = dict(MOCK_LLM_RESPONSE)
+    bad_response.pop("kind", None)
+    bad_response["kind"] = "bogus_kind"
+    mock_llm.return_value = json.dumps(bad_response)
+
+    # Shared "bedrock" tag groups all three together. Within the group:
+    # two corrections, one fact → majority kind is correction.
+    for i in range(2):
+        _create_consolidated(
+            f"Correction {i}", f"Body {i}",
+            tags=["type:correction", "bedrock"],
+            reinforcement_count=3,
+        )
+    _create_consolidated(
+        "Fact one", "Body fact",
+        tags=["type:fact", "bedrock"],
+        reinforcement_count=3,
+    )
+
+    results = crystallizer.crystallize_candidates()
+    assert len(results) == 1  # all grouped together
+    crystal = Memory.get_by_id(results[0]["crystallized_id"])
+    assert crystal.kind == "correction"
+
+
+@patch("core.crystallizer.call_llm")
+def test_crystal_defaults_to_lesson_when_no_kind_anywhere(mock_llm, crystallizer, base):
+    """If neither the LLM nor any source carries a kind, fall back to 'lesson'."""
+    no_kind = dict(MOCK_LLM_RESPONSE)
+    no_kind.pop("kind", None)
+    mock_llm.return_value = json.dumps(no_kind)
+
+    # Source with kind manually wiped to NULL.
+    mem_id = _create_consolidated(
+        "Source", "Body", tags=["bedrock"], reinforcement_count=3,
+    )
+    Memory.update(kind=None).where(Memory.id == mem_id).execute()
+
+    results = crystallizer.crystallize_candidates()
+    crystal = Memory.get_by_id(results[0]["crystallized_id"])
+    assert crystal.kind == "lesson"
