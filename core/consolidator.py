@@ -26,6 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .code_refs import extract_code_refs, merge_code_refs
 from .compression import compress_memory_for_stage, compression_ratio, get_stage_depth
 
 from .database import db, get_base_dir, get_commit_ref, get_project
@@ -1025,6 +1026,13 @@ class Consolidator:
                 knowledge_type=decision.get("knowledge_type"),
                 knowledge_type_confidence=decision.get("knowledge_type_confidence"),
                 raw_importance=decision.get("_raw_stage1_importance"),
+                # Task #18: code refs — LLM override wins when valid; else regex baseline
+                code_refs=json.dumps(
+                    merge_code_refs(
+                        extract_code_refs(body_content),
+                        decision.get("code_refs"),
+                    )
+                ),
             )
             memory_id = mem.id
 

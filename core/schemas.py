@@ -156,6 +156,10 @@ class ConsolidationDecision(BaseModel):
     criterion_weights: dict[str, str] | None = None
     rejected_options: list[dict[str, Any]] | None = None
 
+    # Task #18: LLM-supplied code references (overrides regex baseline when valid).
+    # Each entry: {"symbol": str, "file": str|None, "lang": str|None, "line": int|None}
+    code_refs: list[dict[str, Any]] | None = None
+
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------

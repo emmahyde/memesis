@@ -143,6 +143,11 @@ class Memory(BaseModel):
     # Bundled-row decomposer: 1 once the decomposer sweep has audited this row
     decompose_checked = IntegerField(default=0, null=True)  # see core/decomposer.py
 
+    # Task #18: structured code references extracted from memory content.
+    # JSON array of {symbol, file?, lang?, line?} dicts.
+    # NULL = not yet extracted; "[]" = extracted but none found.
+    code_refs = TextField(null=True)  # JSON array; see core/code_refs.py
+
     class Meta:
         table_name = "memories"
 

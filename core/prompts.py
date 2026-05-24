@@ -375,10 +375,21 @@ Respond ONLY with valid JSON (no markdown, no explanation):
       "target_path": "category/filename.md (keep only)",
       "reinforces": "memory_id or null (required when action=promote)",
       "contradicts": "memory_id or null (required when action=archive)",
-      "resolves_question_id": "memory_id of the open_question this resolves, or null"
+      "resolves_question_id": "memory_id of the open_question this resolves, or null",
+      "code_refs": [
+        {{"symbol": "dotted.name.or.ClassName", "file": "path/to/file.py", "lang": "py", "line": null}}
+      ]
     }}
   ]
-}}"""
+}}
+
+code_refs (optional): structured references to source-code symbols, files, or
+line citations that this memory is about. Emit this field ONLY when the observation
+is concretely about specific code — a function, class, module, or file location.
+Omit entirely (or set to null) for preference, workflow, personality, or domain
+observations that mention no code. Each entry must have at minimum a "symbol" key;
+"file", "lang", and "line" are optional. Use repo-relative file paths when known.
+"""
 
 # ---------------------------------------------------------------------------
 # Self-reflection prompt (for periodic self-model updates)

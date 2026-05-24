@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .code_refs import extract_code_refs
 from .database import get_base_dir, get_commit_ref, get_project
 from .models import Memory, Observation
 
@@ -292,6 +293,8 @@ class NativeMemoryIngestor:
                     actor=None,
                     criterion_weights=None,
                     rejected_options=None,
+                    # Task #18: regex baseline code refs (no LLM override on this path)
+                    code_refs=json.dumps(extract_code_refs(content)),
                 )
                 observation.memory_id = new_mem.id
                 observation.save()
