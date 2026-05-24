@@ -148,7 +148,7 @@ class TestPointerAndCorrection:
         from hooks.user_prompt_inject import _is_correction
         assert _is_correction(SimpleNamespace(kind="correction", polarity=None))
         assert _is_correction(SimpleNamespace(kind=None, polarity="corrective"))
-        assert not _is_correction(SimpleNamespace(kind="finding", polarity="neutral"))
+        assert not _is_correction(SimpleNamespace(kind="fact", polarity="neutral"))
 
     def test_format_pointer_line(self):
         from types import SimpleNamespace

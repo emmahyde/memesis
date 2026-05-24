@@ -507,7 +507,7 @@ class TestHypothesisPromotion:
             reinforcement_count=0,
             created_at=now,
             updated_at=now,
-            kind="finding",
+            kind="fact",
             evidence_count=0,
             evidence_session_ids="[]",
         )

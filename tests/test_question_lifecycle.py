@@ -70,7 +70,7 @@ def _attach_embedding(memory: Memory, embedding: list[float]) -> None:
 class TestGetUnresolvedQuestions:
     def test_returns_only_open_question_kind(self, store):
         _create_memory(kind="open_question", title="Q1", importance=0.7)
-        _create_memory(kind="finding", title="F1", importance=0.9)
+        _create_memory(kind="fact", title="F1", importance=0.9)
         results = get_unresolved_questions()
         assert all(m.kind == "open_question" for m in results)
 
@@ -109,7 +109,7 @@ class TestGetUnresolvedQuestions:
         assert q.id not in ids
 
     def test_empty_when_no_questions(self, store):
-        _create_memory(kind="finding", title="Not a question")
+        _create_memory(kind="fact", title="Not a question")
         results = get_unresolved_questions()
         assert results == []
 
@@ -154,7 +154,7 @@ class TestDetectResolution:
         assert result == str(q.id)
 
     def test_returns_question_id_for_finding_kind(self, store):
-        new_mem = _create_memory(kind="finding", title="Find")
+        new_mem = _create_memory(kind="fact", title="Find")
         q = _create_memory(kind="open_question", title="Q")
         _attach_embedding(new_mem, [1.0, 1.0, 0.0, 0.0])
         _attach_embedding(q, [1.0, 1.0, 0.0, 0.0])
@@ -188,7 +188,7 @@ class TestDetectResolution:
         assert result is None
 
     def test_returns_best_matching_question(self, store):
-        new_mem = _create_memory(kind="finding", title="Find")
+        new_mem = _create_memory(kind="fact", title="Find")
         q_low = _create_memory(kind="open_question", title="QLow")
         q_high = _create_memory(kind="open_question", title="QHigh")
         # new_mem is closer to q_high
@@ -221,7 +221,7 @@ class TestMarkResolved:
 
     def test_atomic_both_rows_updated(self, store):
         q = _create_memory(kind="open_question", title="Q")
-        resolving = _create_memory(kind="finding", title="Find")
+        resolving = _create_memory(kind="fact", title="Find")
         mark_resolved(q, resolving)
         q_fresh = Memory.get_by_id(q.id)
         r_fresh = Memory.get_by_id(resolving.id)
@@ -249,7 +249,7 @@ class TestPinOpenQuestion:
         assert q_fresh.is_pinned == 1
 
     def test_raises_for_non_open_question_kind(self, store):
-        m = _create_memory(kind="finding", title="Find")
+        m = _create_memory(kind="fact", title="Find")
         with pytest.raises(ValueError, match="open_question"):
             pin_open_question(m)
 

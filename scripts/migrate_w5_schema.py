@@ -119,7 +119,12 @@ def derive_from_concept_tags(concept_tags_json: str | None) -> dict:
 
 
 def derive_kind_from_mode(mode: str | None) -> str | None:
-    """Map legacy mode → kind (1:1)."""
+    """Map legacy mode → kind (1:1).
+
+    Archival: pre-#17 vocab. Live data uses the post-#17 KIND_VALUES set
+    (core/validators.py). Kept as-is so this one-shot migration script
+    can still be reproduced against historical snapshots.
+    """
     valid = {"decision", "finding", "preference", "constraint", "correction", "open_question"}
     if mode in valid:
         return mode

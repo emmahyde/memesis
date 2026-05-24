@@ -242,28 +242,14 @@ class Memory(BaseModel):
         This is the ONLY sanctioned path for raw deletion — no app code
         should issue raw DELETE FROM memories outside this method.
 
-        Note: the explicit FTS delete below is redundant since migration 0020
-        installed the memories_ad BEFORE DELETE trigger, but is retained for
-        one release cycle as a belt-and-suspenders guard until trigger coverage
-        is confirmed in production.
+        FTS5 sync is handled by the memories_ad BEFORE DELETE trigger
+        (migration 0020). Doing an additional explicit FTS delete here
+        double-deletes the row and corrupts the FTS index.
         """
         with db.atomic():
-            # FTS5 cascade (belt-and-suspenders; memories_ad trigger also handles this)
-            cursor = db.execute_sql(
-                "SELECT rowid, title, summary, tags, content FROM memories WHERE id = ?",
-                (memory_id,),
-            )
-            row = cursor.fetchone()
-            if row is not None:
-                rowid, title, summary, tags, content = row
-                db.execute_sql(
-                    "INSERT INTO memories_fts(memories_fts, rowid, title, summary, tags, content) "
-                    "VALUES('delete', ?, ?, ?, ?, ?)",
-                    (rowid, title or "", summary or "", tags or "", content or ""),
-                )
             # memory_embeddings cascade
             MemoryEmbedding.delete().where(MemoryEmbedding.memory_id == memory_id).execute()
-            # Primary row
+            # Primary row — FTS row removed by memories_ad trigger.
             db.execute_sql("DELETE FROM memories WHERE id = ?", (memory_id,))
 
     @classmethod

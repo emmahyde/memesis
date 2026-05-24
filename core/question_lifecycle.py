@@ -3,7 +3,7 @@ Open question lifecycle management (Sprint B WS-H, DS-F9).
 
 Implements:
 - get_unresolved_questions: surface unresolved open_questions for session injection
-- detect_resolution: cosine + knowledge_type alignment check for correction/finding → question
+- detect_resolution: cosine + knowledge_type alignment check for correction/fact → question
 - mark_resolved: atomic two-row update
 - pin_open_question: set is_pinned=True on open_question memories
 
@@ -23,7 +23,7 @@ QUESTION_RESOLUTION_THRESHOLD: float = float(
     os.environ.get("MEMESIS_QUESTION_THRESHOLD", "0.85")
 )
 
-_RESOLVING_KINDS = frozenset({"correction", "finding"})
+_RESOLVING_KINDS = frozenset({"correction", "fact"})
 
 
 # ---------------------------------------------------------------------------
@@ -52,13 +52,13 @@ def get_unresolved_questions(limit: int = 20) -> list:
 
 def detect_resolution(new_memory, candidate_questions: list | None = None) -> str | None:
     """
-    Given a newly created Memory (kind=correction OR finding), check whether
+    Given a newly created Memory (kind=correction OR fact), check whether
     it semantically resolves any unresolved open_question.
 
     Returns the question's memory_id if found, else None.
 
     Resolution criteria:
-    - new_memory.kind must be in ('correction', 'finding')
+    - new_memory.kind must be in ('correction', 'fact')
     - cosine similarity between new_memory and candidate >= QUESTION_RESOLUTION_THRESHOLD
     - knowledge_type alignment: if question has a non-null knowledge_type, it must match
       new_memory's knowledge_type (if null on question, any knowledge_type is accepted)

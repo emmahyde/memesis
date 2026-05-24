@@ -23,7 +23,7 @@ from core.validators import (
 # ---------------------------------------------------------------------------
 
 VALID_STAGE1 = {
-    "kind": "finding",
+    "kind": "fact",
     "knowledge_type": "factual",
     "knowledge_type_confidence": "high",
     "importance": 0.7,
@@ -96,7 +96,7 @@ class TestValidateStage1Hard:
     def test_valid_record_passes(self):
         obs = validate_stage1(VALID_STAGE1)
         assert isinstance(obs, Stage1Observation)
-        assert obs.kind == "finding"
+        assert obs.kind == "fact"
         assert obs.importance == 0.7
 
     def test_all_kind_values_accepted(self):

@@ -16,7 +16,6 @@ SYSTEM_PROMPT_NAMES = [
     "extraction",
     "consolidation",
     "curation",
-    "classification",
 ]
 
 

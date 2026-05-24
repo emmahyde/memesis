@@ -102,7 +102,7 @@ class TestStage1PromptStructure:
         )
 
     def test_kind_enum_values_present(self):
-        for value in ("decision", "finding", "preference", "constraint", "correction", "open_question"):
+        for value in ("decision", "fact", "preference", "directive", "correction", "open_question"):
             assert value in OBSERVATION_EXTRACT_PROMPT
 
     def test_knowledge_type_enum_values_present(self):
@@ -396,7 +396,7 @@ class TestOrphanQualityGateBoundary:
 
 class TestCrossPromptConsistency:
     def test_kind_enum_consistent(self):
-        kind_values = ["decision", "finding", "preference", "constraint", "correction", "open_question"]
+        kind_values = ["decision", "fact", "preference", "directive", "correction", "open_question"]
         for v in kind_values:
             assert v in OBSERVATION_EXTRACT_PROMPT, f"kind value '{v}' missing from Stage 1"
             assert v in CONSOLIDATION_PROMPT, f"kind value '{v}' missing from Stage 2"

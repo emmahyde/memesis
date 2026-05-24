@@ -171,7 +171,7 @@ def test_log_consolidation_decision_appends_valid_jsonl(isolate_obs_dir):
         observation_id="obs-1",
         decision="KEEP",
         importance=0.7,
-        kind="finding",
+        kind="fact",
         knowledge_type="conceptual",
         rationale="Load-bearing architecture detail.",
     )
@@ -179,7 +179,7 @@ def test_log_consolidation_decision_appends_valid_jsonl(isolate_obs_dir):
     record = json.loads(path.read_text().strip())
     assert record["decision"] == "KEEP"
     assert record["importance"] == 0.7
-    assert record["kind"] == "finding"
+    assert record["kind"] == "fact"
 
 
 def test_log_consolidation_decision_tolerates_none_fields(isolate_obs_dir):

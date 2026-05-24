@@ -208,7 +208,7 @@ def test_detect_topic_drift_all_axes_differ_returns_true():
     from core.linking import detect_topic_drift
 
     new_mem = _make_memory(kind="decision", subject="user", knowledge_type="procedural")
-    linked = _make_memory(kind="finding", subject="system", knowledge_type="factual")
+    linked = _make_memory(kind="fact", subject="system", knowledge_type="factual")
     assert detect_topic_drift(new_mem, linked) is True
 
 
@@ -225,7 +225,7 @@ def test_detect_topic_drift_null_axis_returns_false():
     from core.linking import detect_topic_drift
 
     new_mem = _make_memory(kind="decision", subject=None, knowledge_type="procedural")
-    linked = _make_memory(kind="finding", subject="system", knowledge_type="factual")
+    linked = _make_memory(kind="fact", subject="system", knowledge_type="factual")
     assert detect_topic_drift(new_mem, linked) is False
 
 

@@ -46,8 +46,8 @@ def _create_memory(stage='ephemeral', title='Test Memory', content='Test content
         reinforcement_count=kwargs.get('reinforcement_count', 0),
         usage_count=kwargs.get('usage_count', 0),
         # Classified by default so consolidated rows clear the can_promote
-        # memory_kind gate; tests exercising the gate pass memory_kind=None.
-        memory_kind=kwargs.get('memory_kind', 'fact'),
+        # kind gate; tests exercising the gate pass kind=None.
+        kind=kwargs.get('kind', 'fact'),
         created_at=now,
         updated_at=now,
     )

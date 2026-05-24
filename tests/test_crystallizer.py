@@ -48,10 +48,10 @@ def _create_consolidated(title, content, tags=None, reinforcement_count=0, impor
             break
     kind = {
         "decision": "decision",
-        "correction": "gotcha",
-        "constraint": "invariant",
-        "preference": "opinion",
-        "finding": "fact",
+        "correction": "correction",
+        "directive": "directive",
+        "preference": "preference",
+        "fact": "fact",
     }.get(obs_kind, "fact")
     mem = Memory.create(
         stage="consolidated",
@@ -59,7 +59,7 @@ def _create_consolidated(title, content, tags=None, reinforcement_count=0, impor
         summary=content[:100],
         content=content,
         tags=json.dumps(tags or []),
-        memory_kind=kind,
+        kind=kind,
         importance=importance,
         reinforcement_count=reinforcement_count,
         created_at=now,
