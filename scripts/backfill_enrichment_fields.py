@@ -207,6 +207,13 @@ def run(dry_run: bool, verbose: bool) -> None:
         sys.exit(1)
 
     import sqlite3
+    # Rule-1 note: raw sqlite3.connect() is used here intentionally because
+    # this script runs as a one-off migration tool, not as part of the live
+    # Peewee-managed application path.  FTS5 sync for any memories rows
+    # written here is handled automatically by the SQL triggers installed in
+    # migration 0020 (memories_ai / memories_au / memories_ad), so these
+    # writes are safe.  Do NOT replicate this pattern in application code —
+    # use init_db() + Peewee models or db.execute_sql() instead.
     conn = sqlite3.connect(str(PROJECT_DB))
     conn.execute("PRAGMA journal_mode=wal")
     conn.execute("PRAGMA busy_timeout=5000")

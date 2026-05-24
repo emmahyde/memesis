@@ -96,6 +96,20 @@ def consolidate(dry_run: bool, verbose: bool) -> None:
         log.error("Global DB not found: %s", GLOBAL_DB)
         sys.exit(1)
 
+    # Rule-1 note: raw sqlite3.connect() is used here because this is a
+    # one-off migration/consolidation script that runs outside the normal
+    # application lifecycle.  FTS5 sync for every INSERT/UPDATE to the
+    # memories table is handled automatically by the SQL triggers installed
+    # in migration 0020 (memories_ai / memories_au / memories_ad), so these
+    # raw writes are safe with respect to FTS consistency.
+    #
+    # The INSERT OR IGNORE and UPDATE statements below touch only columns
+    # that are part of the FTS index (title, summary, tags, content), which
+    # the triggers cover.  Columns outside the FTS schema (e.g. importance,
+    # stage) can be written without trigger involvement.
+    #
+    # Do NOT replicate this pattern in application code — use init_db() +
+    # Peewee models or db.execute_sql() instead (CLAUDE.md Rule 1).
     global_conn = sqlite3.connect(str(GLOBAL_DB))
     global_conn.execute("PRAGMA journal_mode=wal")
     global_conn.execute("PRAGMA busy_timeout=5000")
