@@ -150,10 +150,11 @@ def init_db(
     # Bind deferred database
     db.init(
         str(dp),
+        # busy_timeout first; see make_connection() for rationale (#25).
         pragmas={
+            "busy_timeout": 5000,
             "journal_mode": "wal",
             "synchronous": "normal",
-            "busy_timeout": 5000,
         },
     )
 
@@ -208,10 +209,11 @@ def connect_light(base_dir: str = None) -> Path:
     _db_path = dp
     db.init(
         str(dp),
+        # busy_timeout first; see make_connection() for rationale (#25).
         pragmas={
+            "busy_timeout": 5000,
             "journal_mode": "wal",
             "synchronous": "normal",
-            "busy_timeout": 5000,
         },
     )
     return bd
@@ -232,12 +234,15 @@ def make_connection(db_path: str) -> SqliteDatabase:
     Returns:
         A configured (but not yet opened/init'd) SqliteDatabase instance.
     """
+    # busy_timeout must come FIRST so subsequent pragmas (journal_mode=wal in
+    # particular) themselves honour the back-off when another thread is mid-
+    # pragma. Peewee applies pragmas in dict insertion order. — see #25.
     return SqliteDatabase(
         db_path,
         pragmas={
+            "busy_timeout": 5000,
             "journal_mode": "wal",
             "synchronous": "normal",
-            "busy_timeout": 5000,
         },
     )
 
