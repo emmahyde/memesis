@@ -238,12 +238,17 @@ class Memory(BaseModel):
     def hard_delete(cls, memory_id: str) -> None:
         """Hard-delete a memory with cascade to FTS5 and memory_embeddings.
 
-        All three DELETE statements run inside a single db.atomic() block.
+        All statements run inside a single db.atomic() block.
         This is the ONLY sanctioned path for raw deletion — no app code
         should issue raw DELETE FROM memories outside this method.
+
+        Note: the explicit FTS delete below is redundant since migration 0020
+        installed the memories_ad BEFORE DELETE trigger, but is retained for
+        one release cycle as a belt-and-suspenders guard until trigger coverage
+        is confirmed in production.
         """
         with db.atomic():
-            # FTS5 cascade: fetch current DB values first (same as _fts_delete_from_db)
+            # FTS5 cascade (belt-and-suspenders; memories_ad trigger also handles this)
             cursor = db.execute_sql(
                 "SELECT rowid, title, summary, tags, content FROM memories WHERE id = ?",
                 (memory_id,),
@@ -352,7 +357,14 @@ class Memory(BaseModel):
     # -- Save / Delete with FTS sync -----------------------------------
 
     def save(self, force_insert=False, only=None):
-        """Override save to keep FTS index and embeddings in sync (atomic)."""
+        """Override save to keep embeddings in sync (atomic).
+
+        FTS5 sync is handled automatically by SQL triggers (memories_ai,
+        memories_au) installed by migration 0020. No Python-level FTS
+        calls are needed here; the triggers fire on every INSERT/UPDATE
+        regardless of whether the write comes through Peewee or a raw
+        sqlite3 connection.
+        """
         self.updated_at = datetime.now().isoformat()
         new_hash = self.compute_hash(self.content) if self.content else None
 
@@ -376,10 +388,7 @@ class Memory(BaseModel):
             self.content_hash = new_hash
 
         with db.atomic():
-            if is_update:
-                self._fts_delete_from_db()
             result = super().save(force_insert=force_insert, only=only)
-            self._fts_insert()
             if embedding_stale:
                 self._refresh_embedding()
         return result
@@ -406,8 +415,11 @@ class Memory(BaseModel):
             )
 
     def delete_instance(self, recursive=False, delete_nullable=False):
-        """Override delete to remove FTS entry."""
-        self._fts_delete()
+        """Override delete to cascade to memory_embeddings.
+
+        FTS5 sync is handled automatically by the memories_ad BEFORE DELETE
+        trigger installed by migration 0020. No explicit Python FTS call needed.
+        """
         return super().delete_instance(
             recursive=recursive, delete_nullable=delete_nullable
         )
@@ -419,70 +431,6 @@ class Memory(BaseModel):
             return True
         except Memory.DoesNotExist:
             return False
-
-    def _fts_insert(self):
-        """Insert a row into the FTS5 index."""
-        rowid = self._get_rowid()
-        if rowid is None:
-            return
-        db.execute_sql(
-            "INSERT INTO memories_fts(rowid, title, summary, tags, content) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                rowid,
-                self.title or "",
-                self.summary or "",
-                self.tags or "",
-                self.content or "",
-            ),
-        )
-
-    def _fts_delete(self):
-        """Delete a row from the FTS5 index using in-memory values."""
-        rowid = self._get_rowid()
-        if rowid is None:
-            return
-        db.execute_sql(
-            "INSERT INTO memories_fts(memories_fts, rowid, title, summary, tags, content) "
-            "VALUES('delete', ?, ?, ?, ?, ?)",
-            (
-                rowid,
-                self.title or "",
-                self.summary or "",
-                self.tags or "",
-                self.content or "",
-            ),
-        )
-
-    def _fts_delete_from_db(self):
-        """Delete a row from the FTS5 index using current DB values (not in-memory)."""
-        cursor = db.execute_sql(
-            "SELECT rowid, title, summary, tags, content FROM memories WHERE id = ?",
-            (self.id,),
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return
-        rowid, title, summary, tags, content = row
-        db.execute_sql(
-            "INSERT INTO memories_fts(memories_fts, rowid, title, summary, tags, content) "
-            "VALUES('delete', ?, ?, ?, ?, ?)",
-            (
-                rowid,
-                title or "",
-                summary or "",
-                tags or "",
-                content or "",
-            ),
-        )
-
-    def _get_rowid(self):
-        """Get the SQLite rowid for this memory."""
-        cursor = db.execute_sql(
-            "SELECT rowid FROM memories WHERE id = ?", (self.id,)
-        )
-        row = cursor.fetchone()
-        return row[0] if row else None
 
 
 # ---------------------------------------------------------------------------
