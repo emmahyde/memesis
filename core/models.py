@@ -268,11 +268,19 @@ class Memory(BaseModel):
     # -- FTS search ----------------------------------------------------
 
     @classmethod
-    def search_fts(cls, query, limit=10):
+    def search_fts(cls, query, limit=10, project=None):
         """
         Full-text search across memories via FTS5.
 
-        Returns a list of Memory model instances with an extra ``rank``
+        Args:
+            query: FTS5 MATCH expression.
+            limit: Max rows to return.
+            project: Optional project slug. When set, returns only memories
+                where ``project == <slug>`` OR ``project IS NULL`` (i.e.
+                same-project or unscoped). Matches the SessionStart filter
+                in hooks/session_start.py — see task #26.
+
+        Returns a list of Memory model instances with an extra ``_rank``
         attribute.
         """
         sql = (
@@ -280,10 +288,14 @@ class Memory(BaseModel):
             "FROM memories_fts fts "
             "JOIN memories m ON fts.rowid = m.rowid "
             "WHERE memories_fts MATCH ? "
-            "ORDER BY fts.rank "
-            "LIMIT ?"
         )
-        cursor = db.execute_sql(sql, (query, limit))
+        params: list = [query]
+        if project is not None:
+            sql += "AND (m.project = ? OR m.project IS NULL) "
+            params.append(project)
+        sql += "ORDER BY fts.rank LIMIT ?"
+        params.append(limit)
+        cursor = db.execute_sql(sql, tuple(params))
         desc = [d[0] for d in cursor.description]
         results = []
         for row in cursor.fetchall():

@@ -545,6 +545,7 @@ class RetrievalEngine:
         k: int = 20,
         rrf_k: int = 60,
         vec_store: "VecStore | None" = None,
+        project_context: str | None = None,
     ) -> list[tuple[str, float]]:
         """
         Reciprocal Rank Fusion over FTS and vector search legs.
@@ -568,9 +569,17 @@ class RetrievalEngine:
             List of (memory_id, rrf_score) tuples, sorted by score descending,
             limited to at most ``k`` entries.
         """
+        # Resolve project scope. When set, both legs are restricted to
+        # same-project-or-NULL memories — #26 closes the cross-project leak
+        # previously patched in hooks/user_prompt_inject.py.
+        proj_key = project_slug(project_context) if project_context else None
+
         # --- FTS leg -------------------------------------------------------
         fts_query = Memory.tokenize_fts_query(query)
-        fts_results = Memory.search_fts(fts_query, limit=k)
+        # Over-fetch when filtering by project so the project-local rank
+        # ceiling is not silently truncated by cross-project results.
+        fts_limit = k * 4 if proj_key else k
+        fts_results = Memory.search_fts(fts_query, limit=fts_limit, project=proj_key)
         # Build {memory_id: 1-based rank} from FTS order
         fts_ranks: dict[str, int] = {
             mem.id: rank for rank, mem in enumerate(fts_results, start=1)
@@ -584,7 +593,22 @@ class RetrievalEngine:
             and query_embedding is not None
         )
         if use_vec:
-            vec_results = vec_store.search_vector(query_embedding, k=k)
+            # VecStore (numpy-backed brute-force KNN) has no metadata filter;
+            # over-fetch and post-filter against the Memory.project column
+            # when project_context is set.
+            vec_limit = k * 4 if proj_key else k
+            vec_results = vec_store.search_vector(query_embedding, k=vec_limit)
+            if proj_key:
+                vec_ids = [r["memory_id"] for r in vec_results]
+                if vec_ids:
+                    allowed = {
+                        m.id
+                        for m in Memory.select(Memory.id, Memory.project).where(
+                            Memory.id.in_(vec_ids)
+                            & ((Memory.project == proj_key) | Memory.project.is_null())
+                        )
+                    }
+                    vec_results = [r for r in vec_results if r["memory_id"] in allowed]
             vec_ranks = {
                 r["memory_id"]: rank
                 for rank, r in enumerate(vec_results, start=1)

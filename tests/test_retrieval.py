@@ -976,6 +976,95 @@ class TestHybridSearch:
         # Archived memory must not appear; live one may appear
         assert id_archived not in result_ids
 
+    # ----- #26: project_context filter --------------------------------------
+
+    def test_hybrid_search_filters_by_project_context_fts_leg(self, base, engine):
+        """When project_context is set, FTS leg must drop other-project hits."""
+        id_local = _make_memory(
+            "cross project leak guard",
+            "consolidated",
+            "Local Memesis",
+            project_context="/Users/test/memesis",
+        )
+        id_other = _make_memory(
+            "cross project leak guard",
+            "consolidated",
+            "Other Sector",
+            project_context="/Users/test/sector",
+        )
+        id_unscoped = _make_memory(
+            "cross project leak guard",
+            "consolidated",
+            "Unscoped Global",
+        )
+
+        results = engine.hybrid_search(
+            query="cross project leak guard",
+            query_embedding=None,
+            k=10,
+            vec_store=None,
+            project_context="/Users/test/memesis",
+        )
+        result_ids = {r[0] for r in results}
+        assert id_local in result_ids
+        assert id_unscoped in result_ids  # NULL project allowed (global)
+        assert id_other not in result_ids
+
+    def test_hybrid_search_filters_by_project_context_vec_leg(self, base, engine):
+        """Vector leg results from other projects must be post-filtered out."""
+        id_local = _make_memory(
+            "alpha vec project content",
+            "consolidated",
+            "Vec Local",
+            project_context="/Users/test/memesis",
+        )
+        id_other = _make_memory(
+            "alpha vec project content",
+            "consolidated",
+            "Vec Other",
+            project_context="/Users/test/sector",
+        )
+
+        vec_store = MockVecStore([(id_other, 0.1), (id_local, 0.2)])
+        dummy_embedding = b"\x00" * 4
+
+        results = engine.hybrid_search(
+            query="alpha vec",
+            query_embedding=dummy_embedding,
+            k=10,
+            vec_store=vec_store,
+            project_context="/Users/test/memesis",
+        )
+        result_ids = {r[0] for r in results}
+        assert id_local in result_ids
+        assert id_other not in result_ids
+
+    def test_hybrid_search_no_project_context_returns_all(self, base, engine):
+        """Without project_context, the filter is a no-op — all projects surface."""
+        id_a = _make_memory(
+            "noproj filter content",
+            "consolidated",
+            "Proj A",
+            project_context="/Users/test/aaa",
+        )
+        id_b = _make_memory(
+            "noproj filter content",
+            "consolidated",
+            "Proj B",
+            project_context="/Users/test/bbb",
+        )
+
+        results = engine.hybrid_search(
+            query="noproj filter content",
+            query_embedding=None,
+            k=10,
+            vec_store=None,
+            project_context=None,
+        )
+        result_ids = {r[0] for r in results}
+        assert id_a in result_ids
+        assert id_b in result_ids
+
 
 # ---------------------------------------------------------------------------
 # Wiring: hybrid_search into get_crystallized_for_context and active_search

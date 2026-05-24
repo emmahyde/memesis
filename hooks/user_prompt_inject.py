@@ -192,6 +192,7 @@ def search_and_inject(
             query_embedding=query_embedding,
             k=10,
             vec_store=get_vec_store(),
+            project_context=project_context,
         )
         if ranked:
             ranked_ids = [mid for mid, _ in ranked]
@@ -208,9 +209,9 @@ def search_and_inject(
 
     # --- Merge: Tier 2 first, then Tier 3 JIT to fill remaining slots ---
     already_injected = get_already_injected(session_id)
-    # Project scoping: match SessionStart — same project OR project-null (global).
-    # Tier 2 already applies a project boost; Tier 3 hybrid_search does not, so
-    # without this filter cross-project memories leak into JIT injection.
+    # Project scoping now applied inside hybrid_search() (task #26). The
+    # post-filter here is a defensive belt-and-suspenders for Tier 2 only
+    # (Tier 2 originates from inject_for_session which scopes separately).
     current_project = project_slug(project_context)
 
     def _is_eligible(m) -> bool:
