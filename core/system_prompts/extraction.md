@@ -8,7 +8,7 @@ no markdown fences.
 What to extract:
 
 - Durable, reusable knowledge: decisions and their rationale, corrections,
-  gotchas, library/API choices, debugging insights, constraints, conventions.
+  directives, library/API choices, debugging insights, lessons, preferences.
 - Skip routine mechanics — individual edits, file navigation, restating output
   — unless they carry a lesson that would transfer to a future session.
 

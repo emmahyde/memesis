@@ -268,17 +268,20 @@ lifecycle. Score against the consequences:
              AND it applies beyond the session it came from. A score in this band
              CRYSTALLIZES the memory: it is synthesized into a permanent record and
              reinjected at session start for months. Do not enter this band casually.
-  0.85–1.00  INVARIANT / CORRECTIVE — an explicit user correction, a hard constraint, or
+  0.85–1.00  DIRECTIVE / CORRECTIVE — an explicit user correction, a hard directive, or
              a behavioral rule that should fire unprompted every session. A score here
              makes the memory eligible to become INSTINCTIVE — an always-on rule that
              never expires. Reserve for memories that are wrong to ever forget.
 
 KIND SETS THE DEFAULT BAND (soft — override with a stated reason in `rationale`):
-  correction, constraint  → default to the 0.85–1.00 band
+  correction, directive   → default to the 0.85–1.00 band
+  goal                    → default to the 0.85–1.00 band
   decision, preference    → default to the 0.75–0.84 band
+  lesson                  → default to 0.70+ (significant pattern)
+  fact                    → default to 0.30–0.55 (context band)
   open_question           → default to 0.30–0.55, UNLESS it carries an action item
                             ("should X", "needs Y"), then 0.75–0.84
-  finding                 → no default shift; score purely on the band tests above
+  hypothesis              → no default shift; score on evidence strength
 You may move a memory off its kind's default band, but when you do, the `rationale`
 must say why (e.g. "decision, but scoped to a throwaway spike — CONTEXT band").
 
@@ -308,7 +311,7 @@ subject — what or whom is this observation about?
 
 work_event — only when the observation traces directly to a discrete code action this session:
   bugfix | feature | refactor | discovery | change
-  Set to null for preference, constraint, correction, and open_question observations.
+  Set to null for preference, directive, correction, and open_question observations.
   Most observations should have work_event=null. Do not hallucinate a code action.
 
   HARD RULE — work_event MUST be null when session_type != 'code'.
@@ -355,7 +358,7 @@ Respond ONLY with valid JSON (no markdown, no explanation):
     {{
       "obs_ids": [1],
       "importance": 0.0,
-      "kind": "decision|finding|preference|constraint|correction|open_question",
+      "kind": "decision|fact|lesson|correction|directive|preference|goal|open_question|hypothesis",
       "knowledge_type": "factual|conceptual|procedural|metacognitive",
       "knowledge_type_confidence": "low|high",
       "facts": ["Named subject did what, when/where — no pronouns"],
@@ -502,7 +505,7 @@ there is no friction, problem, or correction attached. Extract these explicitly.
   Positive example:
     "bin/test runs both Sector.Engine.Tests and Sector.Game.Tests by default — no need
      to specify project; Emma discovered this while debugging a filter flag."
-    → kind: "finding", knowledge_type: "procedural", importance: 0.7
+    → kind: "fact", knowledge_type: "procedural", importance: 0.7
     → This is durable gold: saves 30s every test run, not derivable without discovery.
 
   Negative example (skip): "Tests passed" — no finding attached, not novel.
@@ -517,12 +520,19 @@ freely, without requiring a friction or problem frame to justify inclusion.
 KIND AXIS — what type of claim is this? (pick the best fit; kind and knowledge_type are
 independent dimensions — do not collapse them)
 
-  decision      — a choice made, with rationale; the constraints that produced it
-  finding       — something learned about the system or codebase
-  preference    — how the user wants to work
-  constraint    — a requirement or limit going forward
-  correction    — an earlier belief was wrong; state the correct version
-  open_question — an unresolved issue worth surfacing next session
+  decision      — settled choice with rationale and rejected options; prevents re-litigation
+  fact          — pinned true claim, context-free; config values, API contracts, stack declarations
+  lesson        — pattern extracted from 2+ incidents; prescribes future behavior
+  correction    — explicit user fix; original behavior was wrong; never repeat
+  directive     — behavioral imperative the agent must follow ("always X", "never Y"); includes constraints and invariants
+  preference    — subjective stance or style; how the user wants to work
+  goal          — north-star objective; lifecycle-tracked
+  open_question — unresolved issue worth surfacing next session; resolves on answer or evidence
+  hypothesis    — self-reflection state pending confirmation; promotes via evidence gate
+
+RETIRED VOCABULARY — these kind values are no longer valid and will be rejected:
+  finding (→ use fact or lesson), constraint (→ use directive), gotcha (→ use correction),
+  invariant (→ use directive), opinion (→ use preference)
 
 ---
 
@@ -582,7 +592,9 @@ ANTI-INVENTION RULE (per-observation, not just per-fact):
 ---
 
 RETIRED VOCABULARY — DO NOT USE these legacy values, they will be rejected:
-  kind:           NOT 'insight', 'observation', 'preference_signal', 'system_change'
+  kind:           NOT 'finding' (→ fact or lesson), 'constraint' (→ directive),
+                  'gotcha' (→ correction), 'invariant' (→ directive), 'opinion' (→ preference),
+                  'insight', 'observation', 'preference_signal', 'system_change'
   knowledge_type: NOT 'descriptive', 'episodic', 'semantic', 'procedural-knowledge'
   knowledge_type_confidence: NOT 'medium', 'unsure', 'maybe' — only 'high' or 'low'
   importance:     MUST be in [0.0, 1.0]; 1.5 / 2.0 / above-1 will be rejected
@@ -647,7 +659,7 @@ Return either an array of observations OR a skip signal. No markdown fences. No 
 Array form:
 [
   {{
-    "kind": "decision|finding|preference|constraint|correction|open_question",
+    "kind": "decision|fact|lesson|correction|directive|preference|goal|open_question|hypothesis",
     "knowledge_type": "factual|conceptual|procedural|metacognitive",
     "knowledge_type_confidence": "low|high",
     "importance": 0.0,
