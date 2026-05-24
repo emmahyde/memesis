@@ -35,7 +35,7 @@ _EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 
 def sync_rules_from_memories() -> dict:
-    """Sync the Rule table from crystallized/instinctive invariant memories.
+    """Sync the Rule table from crystallized/instinctive directive memories.
 
     Upserts one semantic Rule per qualifying memory. Deactivates rules whose
     backing memory was archived or demoted below crystallized. Returns counts
@@ -48,7 +48,7 @@ def sync_rules_from_memories() -> dict:
     qualifying = list(
         Memory.select()
         .where(
-            Memory.memory_kind == "invariant",
+            Memory.kind == "directive",
             Memory.stage.in_(["crystallized", "instinctive"]),
             Memory.archived_at.is_null(),
         )

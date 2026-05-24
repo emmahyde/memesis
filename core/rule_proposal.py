@@ -1,9 +1,9 @@
 """
 Rule proposal — derive candidate guardrails from enforceable memories.
 
-A memory of kind invariant / gotcha / correction may encode a rule the agent
-should be held to. run_rule_proposal_sweep() audits such memories with one LLM
-call each: the LLM extracts a machine-checkable predicate, and the result is
+A memory of kind directive or correction may encode a rule the agent should
+be held to. run_rule_proposal_sweep() audits such memories with one LLM call
+each: the LLM extracts a machine-checkable predicate, and the result is
 inserted as a Rule with status='proposed' — inert until the user activates it
 via /memesis:rules.
 
@@ -25,14 +25,14 @@ from core.rules import CHECK_KINDS, _extract_json
 logger = logging.getLogger(__name__)
 
 # Memory kinds whose contents may prescribe an enforceable rule.
-_RULE_BEARING_KINDS = ("invariant", "gotcha")
+_RULE_BEARING_KINDS = ("directive", "correction")
 _VALID_SEVERITIES = frozenset({"block", "ask", "warn"})
 
 
 def _propose_one(memory: Memory) -> dict | None:
     """Audit one memory. Return a sanitised rule spec, or None if not a rule."""
     prompt = RULE_PROPOSAL_PROMPT.format(
-        kind=memory.memory_kind or memory.kind or "",
+        kind=memory.kind or "",
         title=memory.title or "",
         content=(memory.content or "")[:3000],
     )
@@ -82,8 +82,7 @@ def run_rule_proposal_sweep(limit: int = 10) -> dict:
     }
 
     query = Memory.active().where(
-        (Memory.memory_kind.in_(list(_RULE_BEARING_KINDS)))
-        | (Memory.kind == "correction")
+        Memory.kind.in_(list(_RULE_BEARING_KINDS))
     )
     candidates = [m for m in query if m.id not in sourced][:limit]
 

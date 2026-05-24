@@ -21,18 +21,18 @@ from __future__ import annotations
 
 import re
 
-# Per-kind importance floor — canvas review §1 taxonomy table.
+# Per-kind importance floor — aligned with consolidation-prompt bands
+# (core/prompts.py:270-282, consequence-anchored rubric from commit 8bccf7c).
+# Floors raised 2026-05-23 to match prompt prose; calibrate_importance applies
+# max(score, floor) so raising floors only lifts under-scored rows.
 KIND_IMPORTANCE_FLOOR: dict[str, float] = {
-    "decision": 0.50,
-    "lesson": 0.70,
-    "gotcha": 0.55,
-    "goal": 0.85,
-    "invariant": 0.70,
-    "opinion": 0.55,
-    "bias": 0.65,
-    "todo": 0.50,
-    "debt": 0.40,
-    "fact": 0.30,
+    "correction": 0.85,  # explicit user fix; prompt band 0.85–1.00
+    "directive": 0.85,   # behavioral imperative; prompt band 0.85–1.00
+    "goal": 0.85,        # north-star objective; prompt band 0.85+
+    "decision": 0.75,    # settled choice; prompt band 0.75–0.84
+    "preference": 0.75,  # subjective stance; prompt band 0.75–0.84 (was opinion 0.55)
+    "lesson": 0.70,      # pattern from >=2 incidents; unchanged
+    "fact": 0.30,        # pinned claim; unchanged
 }
 
 # Additive-axis bonus magnitude.
@@ -67,8 +67,11 @@ def has_numeric_evidence(text: str) -> bool:
 
 def calibrate_importance(
     base: float | None,
-    memory_kind: str | None = None,
+    kind: str | None = None,
     content: str = "",
+    # Legacy parameter alias kept for call sites not yet updated; ignored when
+    # kind is provided.
+    memory_kind: str | None = None,
 ) -> float:
     """Apply deterministic calibration to an LLM-scored importance.
 
@@ -77,7 +80,8 @@ def calibrate_importance(
     """
     score = 0.5 if base is None else float(base)
 
-    floor = KIND_IMPORTANCE_FLOOR.get(memory_kind or "")
+    effective_kind = kind or memory_kind or ""
+    floor = KIND_IMPORTANCE_FLOOR.get(effective_kind)
     if floor is not None:
         score = max(score, floor)
 
