@@ -182,7 +182,13 @@ class ThreadDetector:
         return result
 
     def _cluster_by_tags(self, memories: list) -> list[list]:
-        """Group memories by tag overlap using greedy transitive clustering."""
+        """Group memories by tag overlap using greedy transitive clustering.
+
+        Two memories with different ``project`` values are never unioned —
+        threads are scoped per-project (#thread-project-isolation). Cross-
+        project pattern echoes are real but belong upstream of threading;
+        a thread is supposed to be a coherent local arc, not a meta-cluster.
+        """
         generic_prefixes = {"source:", "stage:"}
 
         def get_meaningful_tags(mem) -> set[str]:
@@ -214,6 +220,8 @@ class ThreadDetector:
 
         for i in range(n):
             for j in range(i + 1, n):
+                if (memories[i].project or None) != (memories[j].project or None):
+                    continue  # project boundary
                 ti, tj = tags_list[i], tags_list[j]
                 if not ti or not tj:
                     continue
@@ -257,10 +265,14 @@ class ThreadDetector:
 
         for i in range(n):
             for j in range(i + 1, n):
-                if sims[i, j] >= threshold:
-                    ri, rj = find(i), find(j)
-                    if ri != rj:
-                        parent[ri] = rj
+                if sims[i, j] < threshold:
+                    continue
+                # Project boundary — see _cluster_by_tags for rationale.
+                if (memories[i].project or None) != (memories[j].project or None):
+                    continue
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
 
         groups: dict[int, list] = {}
         for i in range(n):

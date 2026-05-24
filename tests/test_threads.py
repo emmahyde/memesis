@@ -741,3 +741,67 @@ class TestEmbeddingClustering:
         assert len(clusters) >= 1
         all_member_ids = {m.id for c in clusters for m in c}
         assert all(mid in all_member_ids for mid in ids)
+
+
+# ---------------------------------------------------------------------------
+# Project isolation in clustering (regression for cross-project mixing)
+# ---------------------------------------------------------------------------
+
+
+class TestProjectBoundary:
+    """No cluster may contain memories from more than one project."""
+
+    @staticmethod
+    def _stamp_project(memory_id: str, project: str) -> None:
+        Memory.update(project=project).where(Memory.id == memory_id).execute()
+
+    def test_tag_clustering_does_not_cross_projects(self, base):
+        # Six memories sharing the same tag, split across two projects.
+        # Without the project guard they would all merge into one cluster.
+        ids_a, ids_b = [], []
+        for i in range(3):
+            mid = _create_memory(f"A{i}", "Content A", tags=["shared"],
+                                 created_at=(datetime.now() - timedelta(days=i)).isoformat())
+            self._stamp_project(mid, "-Users-test-project-a")
+            ids_a.append(mid)
+        for i in range(3):
+            mid = _create_memory(f"B{i}", "Content B", tags=["shared"],
+                                 created_at=(datetime.now() - timedelta(days=i)).isoformat())
+            self._stamp_project(mid, "-Users-test-project-b")
+            ids_b.append(mid)
+
+        detector = ThreadDetector()
+        vec = get_vec_store()
+        # Force tag-clustering path by mocking embeddings unavailable.
+        with patch.object(vec, "get_embedding", return_value=None):
+            clusters = detector.detect_threads()
+
+        for cluster in clusters:
+            projs = {m.project for m in cluster}
+            assert len(projs) == 1, f"Mixed-project cluster: {projs}"
+
+    def test_embedding_clustering_does_not_cross_projects(self, base):
+        # Two near-identical content groups, one per project. With embeddings
+        # they'd be cosine-similar across projects; guard must hold.
+        ids = []
+        for proj in ("-Users-test-project-a", "-Users-test-project-b"):
+            for i in range(3):
+                mid = _create_memory(
+                    f"{proj[-1]}{i}", "same exact content for embedding similarity",
+                    tags=["x"],
+                    created_at=(datetime.now() - timedelta(days=i)).isoformat(),
+                )
+                self._stamp_project(mid, proj)
+                ids.append(mid)
+
+        # Fake unit-vector embedding shared across all six rows.
+        n = len(ids)
+        fake = np.ones((n, 512), dtype=np.float32)
+
+        detector = ThreadDetector()
+        with patch("core.threads._get_embeddings", return_value=fake):
+            clusters = detector.detect_threads()
+
+        for cluster in clusters:
+            projs = {m.project for m in cluster}
+            assert len(projs) == 1, f"Mixed-project cluster: {projs}"
