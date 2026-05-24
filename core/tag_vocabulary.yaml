@@ -1,0 +1,68 @@
+# Two-tier tag vocabulary for memesis.
+#
+# Tier-1: canonical namespaces with closed value lists.
+#   Values here are validated; tags using these namespaces with off-list values
+#   fall through to tier-2 (accepted, but logged for periodic curation review).
+#
+# Tier-2: any namespace NOT listed here, OR an off-list value in a tier-1 namespace.
+#   Allowed but recorded in tag_review_log table for periodic curation.
+#
+# Tag format: <namespace>:<value>  (both lowercase, value matches [a-z0-9][a-z0-9-]*)
+
+namespaces:
+  technology:
+    description: "Specific tools, languages, libraries, frameworks"
+    values:
+      - python
+      - peewee
+      - sqlite
+      - tree-sitter
+      - typescript
+      - javascript
+      - ruby
+      - csharp
+      - claude-code
+      - anthropic-sdk
+      - fastembed
+      - nltk
+      - scikit-learn
+      - numpy
+      - flask
+      - mcp
+      - pydantic
+
+  domain:
+    description: "Functional area within the system"
+    values:
+      - database
+      - retrieval
+      - extraction
+      - consolidation
+      - crystallization
+      - llm
+      - ingest
+      - hooks
+      - embedding
+      - promotion
+      - coherence
+      - relevance
+      - migration
+      - evaluation
+      - mcp-server
+      - memory-lifecycle
+
+  scope:
+    description: "Where the memory applies"
+    values:
+      - project-local
+      - global
+      - plugin
+      - session
+
+  severity:
+    description: "Impact category for negative-polarity memories"
+    values:
+      - data-loss
+      - performance
+      - correctness
+      - usability
