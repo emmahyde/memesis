@@ -1,55 +1,105 @@
 # Two-tier tag vocabulary for memesis.
 #
+# This file ships with the plugin and defines the canonical (tier-1) tag
+# vocabulary — cross-project software engineering concepts that transfer
+# across any codebase.
+#
 # Tier-1: canonical namespaces with closed value lists.
-#   Values here are validated; tags using these namespaces with off-list values
-#   fall through to tier-2 (accepted, but logged for periodic curation review).
+#   Values here are validated; tags using these namespaces with off-list
+#   values fall through to tier-2 (accepted, but logged for periodic
+#   curation review).
 #
-# Tier-2: any namespace NOT listed here, OR an off-list value in a tier-1 namespace.
-#   Allowed but recorded in tag_review_log table for periodic curation.
+# Tier-2: any namespace NOT listed here, OR an off-list value in a tier-1
+#   namespace. Allowed but recorded in `tag_review_log` for later review.
 #
-# Tag format: <namespace>:<value>  (both lowercase, value matches [a-z0-9][a-z0-9-]*)
+# Tag format: <namespace>:<value>  (both lowercase, value matches
+# `[a-z0-9][a-z0-9-]*`).
+#
+# ----------------------------------------------------------------------
+# Per-project extensions
+# ----------------------------------------------------------------------
+#
+# Projects can add their own canonical tags by dropping a file at:
+#
+#   ~/.claude/memory/projects/<project>/tag_vocabulary.yaml
+#
+# or by setting `MEMESIS_PROJECT_TAGS=/path/to/file.yaml`. The loader
+# merges project entries on top of this canonical file:
+#
+#   * Adding a new namespace makes it tier-1 for that project.
+#   * Adding values to an existing namespace extends the closed list.
+#
+# A project file uses the same shape as this one. Example for a memesis
+# fork that wants its internal domains promoted to tier-1:
+#
+#   namespaces:
+#     domain:
+#       values:
+#         - crystallization
+#         - consolidation
+#         - extraction
+#     project:
+#       description: "Project-specific concept"
+#       values:
+#         - memory-lifecycle
+#         - promotion-gate
 
 namespaces:
   technology:
     description: "Specific tools, languages, libraries, frameworks"
     values:
       - python
-      - peewee
-      - sqlite
-      - tree-sitter
       - typescript
       - javascript
       - ruby
       - csharp
+      - sqlite
+      - postgres
+      - mysql
+      - redis
+      - peewee
+      - sqlalchemy
+      - django
+      - flask
+      - rails
+      - react
+      - nodejs
+      - docker
+      - kubernetes
       - claude-code
       - anthropic-sdk
-      - fastembed
-      - nltk
-      - scikit-learn
-      - numpy
-      - flask
       - mcp
       - pydantic
+      - tree-sitter
+      - fastembed
+      - numpy
 
   domain:
-    description: "Functional area within the system"
+    description: "Functional area of software engineering"
     values:
-      - database
-      - retrieval
-      - extraction
-      - consolidation
-      - crystallization
-      - llm
-      - ingest
-      - hooks
-      - embedding
-      - promotion
-      - coherence
-      - relevance
-      - migration
-      - evaluation
-      - mcp-server
-      - memory-lifecycle
+      - database          # storage, ORM, queries
+      - api               # HTTP, REST, GraphQL, RPC
+      - auth              # authn / authz / sessions / tokens
+      - ui                # frontend, components, styling
+      - backend           # server-side logic, services
+      - testing           # unit, integration, e2e, fixtures
+      - build             # bundlers, compilers, packaging
+      - deployment        # CI/CD, release, infra
+      - configuration     # env vars, config files, secrets
+      - logging           # structured logs, levels
+      - observability     # metrics, tracing, telemetry
+      - error-handling    # exceptions, retries, fallbacks
+      - performance       # latency, throughput, profiling
+      - concurrency       # async, threads, locks
+      - caching           # in-memory, distributed
+      - search            # indexing, querying (incl. FTS)
+      - llm               # prompts, models, agents
+      - embedding         # vectors, similarity
+      - migration         # schema/data migrations
+      - dependencies      # package management, versioning
+      - documentation     # docs, comments, examples
+      - tooling           # dev tools, linters, formatters
+      - refactoring       # restructuring, cleanup
 
   scope:
     description: "Where the memory applies"
@@ -66,3 +116,4 @@ namespaces:
       - performance
       - correctness
       - usability
+      - security

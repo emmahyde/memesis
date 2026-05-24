@@ -271,3 +271,94 @@ def test_render_for_prompt_includes_tier2_note(vocab_path: Path) -> None:
     v = load_vocabulary(path=vocab_path)
     rendered = render_for_prompt(vocab=v)
     assert "reviewed later" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Project-local overlay tests
+# ---------------------------------------------------------------------------
+
+
+OVERLAY_NEW_NAMESPACE = textwrap.dedent("""\
+    namespaces:
+      project:
+        description: "Project-specific concepts"
+        values:
+          - widget
+          - sprocket
+""")
+
+
+OVERLAY_EXTEND_EXISTING = textwrap.dedent("""\
+    namespaces:
+      technology:
+        values:
+          - rust
+          - go
+      domain:
+        values:
+          - retrieval
+""")
+
+
+def test_overlay_adds_new_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    """A project overlay can introduce an entirely new tier-1 namespace."""
+    overlay = tmp_path / "project_overlay.yaml"
+    overlay.write_text(OVERLAY_NEW_NAMESPACE, encoding="utf-8")
+    monkeypatch.setenv("MEMESIS_PROJECT_TAGS", str(overlay))
+
+    v = load_vocabulary(path=vocab_path, project="any-name")
+    assert "project" in v["namespaces"]
+    assert is_tier1("project:widget", vocab=v) is True
+    # base namespaces still tier-1
+    assert is_tier1("technology:python", vocab=v) is True
+
+
+def test_overlay_extends_existing_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Overlay values for an existing namespace extend the closed list."""
+    overlay = tmp_path / "project_overlay.yaml"
+    overlay.write_text(OVERLAY_EXTEND_EXISTING, encoding="utf-8")
+    monkeypatch.setenv("MEMESIS_PROJECT_TAGS", str(overlay))
+
+    v = load_vocabulary(path=vocab_path, project="any-name")
+    # rust was not in fixture but overlay adds it
+    assert is_tier1("technology:rust", vocab=v) is True
+    # original fixture values still in
+    assert is_tier1("technology:python", vocab=v) is True
+    # retrieval added to domain
+    assert is_tier1("domain:retrieval", vocab=v) is True
+
+
+def test_overlay_missing_file_is_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    """A configured overlay path that doesn't exist loads as if no overlay set."""
+    monkeypatch.setenv("MEMESIS_PROJECT_TAGS", str(tmp_path / "missing.yaml"))
+    v = load_vocabulary(path=vocab_path, project="any-name")
+    # base vocab loaded unchanged
+    assert "technology" in v["namespaces"]
+    assert "python" in v["namespaces"]["technology"]["values"]
+
+
+def test_overlay_env_overrides_project_path(
+    monkeypatch: pytest.MonkeyPatch,
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    """MEMESIS_PROJECT_TAGS takes precedence over the project-name default path."""
+    overlay = tmp_path / "env_overlay.yaml"
+    overlay.write_text(OVERLAY_NEW_NAMESPACE, encoding="utf-8")
+    monkeypatch.setenv("MEMESIS_PROJECT_TAGS", str(overlay))
+
+    v = load_vocabulary(path=vocab_path, project="nonexistent-project")
+    # widget is from env overlay, not from default project path
+    assert is_tier1("project:widget", vocab=v) is True

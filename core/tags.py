@@ -12,6 +12,7 @@ and is rejected outright (not returned in accepted_tags).
 
 from __future__ import annotations
 
+import os
 import re
 import textwrap
 from pathlib import Path
@@ -24,101 +25,70 @@ from typing import Literal
 _VOCAB_PATH = Path(__file__).parent / "tag_vocabulary.yaml"
 _TAG_RE = re.compile(r"^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9-]*$")
 
+# Env override for the project-local extension file.
+_PROJECT_TAGS_ENV = "MEMESIS_PROJECT_TAGS"
+
 _vocab_cache: dict | None = None
 
 
-def _load_yaml(path: Path) -> dict:
-    """Load a YAML file using PyYAML when available.
+def _project_overlay_path(project: str | None) -> Path | None:
+    """Resolve the per-project tag vocabulary path, if any.
 
-    Falls back to a nested-aware minimal parser that handles the specific
-    shape of tag_vocabulary.yaml (mapping of mappings with string-list leaves).
-    The fallback is intentionally limited; if the file structure grows beyond
-    what it supports, a clear ValueError is raised rather than silently returning
-    wrong data.
+    Order of precedence:
+      1. ``MEMESIS_PROJECT_TAGS`` env var (absolute path).
+      2. ``~/.claude/memory/projects/<project>/tag_vocabulary.yaml`` when
+         *project* is given.
+
+    Returns ``None`` when no override is configured. Does not check the
+    file exists — the caller decides whether a missing overlay is an
+    error.
     """
-    try:
-        import yaml  # type: ignore[import]
+    env_path = os.environ.get(_PROJECT_TAGS_ENV)
+    if env_path:
+        return Path(env_path).expanduser()
+    if project:
+        return (
+            Path.home()
+            / ".claude" / "memory" / "projects" / project / "tag_vocabulary.yaml"
+        )
+    return None
 
-        with open(path, "r", encoding="utf-8") as fh:
-            return yaml.safe_load(fh) or {}
-    except ImportError:
-        pass
-    except Exception as exc:
-        raise ValueError(f"Failed to parse YAML at {path}: {exc}") from exc
 
-    # Minimal fallback for the tag_vocabulary.yaml nested structure.
-    # Handles:
-    #   top_key:
-    #     nested_key:
-    #       description: "..."
-    #       values:
-    #         - item
-    text = path.read_text(encoding="utf-8")
-    result: dict = {}
-    stack: list[tuple[int, str, dict | list]] = []  # (indent, key, container)
-    current_list: list | None = None
-    current_list_key: str | None = None
-    current_dict: dict = result
+def _merge_vocab(base: dict, overlay: dict) -> dict:
+    """Merge an overlay vocabulary on top of *base*.
 
-    for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.strip().startswith("#"):
+    Rules:
+      * Overlay namespaces that don't exist in base are added wholesale.
+      * Overlay namespaces that exist in base extend the base's value list
+        (de-duplicated, base order preserved, new items appended).
+      * Overlay descriptions only fill in when base has none.
+    """
+    if not overlay:
+        return base
+    merged_ns = dict(base.get("namespaces", {}))
+    for ns, meta in overlay.get("namespaces", {}).items():
+        if not isinstance(meta, dict):
             continue
-        indent = len(raw_line) - len(raw_line.lstrip())
-        stripped = raw_line.strip()
-
-        if stripped.startswith("- "):
-            # List item
-            if current_list is not None:
-                current_list.append(stripped[2:].strip())
+        new_values = list(meta.get("values", []))
+        if ns not in merged_ns:
+            merged_ns[ns] = {
+                "description": meta.get("description", ""),
+                "values": new_values,
+            }
             continue
-
-        if ":" not in stripped:
+        existing = merged_ns[ns]
+        if not isinstance(existing, dict):
             continue
-
-        k, _, v = stripped.partition(":")
-        k = k.strip()
-        v = v.strip()
-
-        # Pop stack entries that are at a deeper or equal indent level.
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-
-        if v == "" or v is None:
-            # Mapping value — start a nested dict.
-            new_dict: dict = {}
-            if stack:
-                parent = stack[-1][2]
-                if isinstance(parent, dict):
-                    parent[k] = new_dict
-            else:
-                result[k] = new_dict
-            current_dict = new_dict
-            current_list = None
-            stack.append((indent, k, new_dict))
-        elif k == "values" and v == "":
-            # Handled above — values: with no inline value starts a list block.
-            new_list: list = []
-            current_dict[k] = new_list
-            current_list = new_list
-            current_list_key = k
-        else:
-            # Scalar value — strip surrounding quotes.
-            v_clean = v.strip('"').strip("'")
-            if stack:
-                parent = stack[-1][2]
-                if isinstance(parent, dict):
-                    parent[k] = v_clean
-                    if k == "values":
-                        # inline list start (shouldn't happen in our YAML)
-                        pass
-            else:
-                result[k] = v_clean
-            current_list = None
-
-    raise ValueError(
-        "PyYAML is not installed and the built-in fallback parser could not handle "
-        f"{path}. Install PyYAML (pip install pyyaml) to load nested YAML files."
-    )
+        existing_values = list(existing.get("values", []))
+        for v in new_values:
+            if v not in existing_values:
+                existing_values.append(v)
+        existing["values"] = existing_values
+        if not existing.get("description") and meta.get("description"):
+            existing["description"] = meta["description"]
+    merged = dict(base)
+    merged["namespaces"] = merged_ns
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +96,30 @@ def _load_yaml(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def load_vocabulary(path: Path | None = None) -> dict:
+def _read_yaml(path: Path) -> dict:
+    """Read a single YAML file. Returns ``{}`` for a missing file."""
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError:
+        raise RuntimeError(
+            "PyYAML is required to load tag vocabulary files. "
+            "Install it with: pip install pyyaml"
+        )
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    except OSError as exc:
+        raise ValueError(f"Cannot read tag vocabulary at {path}: {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"Failed to parse tag vocabulary at {path}: {exc}") from exc
+
+
+def load_vocabulary(
+    path: Path | None = None,
+    project: str | None = None,
+) -> dict:
     """Return the parsed tag vocabulary, lazy-cached after first load.
 
     The returned dict has the shape::
@@ -139,32 +132,30 @@ def load_vocabulary(path: Path | None = None) -> dict:
         }
 
     Args:
-        path: Override the default ``core/tag_vocabulary.yaml`` path.  Useful
-              in tests to point at a fixture file.
+        path:    Override the default ``core/tag_vocabulary.yaml`` path.
+                 Useful in tests to point at a fixture file.
+        project: When set, also layer the per-project overlay file at
+                 ``~/.claude/memory/projects/<project>/tag_vocabulary.yaml``
+                 (or the ``MEMESIS_PROJECT_TAGS`` env override) on top of
+                 the canonical vocabulary.
+
+    Caching only applies to the default-path, no-project case. Any
+    explicit *path* or *project* skips the cache for test isolation and
+    correctness when multiple projects share a process.
     """
     global _vocab_cache
-    if path is None and _vocab_cache is not None:
+    use_cache = path is None and project is None
+    if use_cache and _vocab_cache is not None:
         return _vocab_cache
 
-    resolved = path or _VOCAB_PATH
-    try:
-        import yaml  # type: ignore[import]
+    base = _read_yaml(path or _VOCAB_PATH)
+    overlay_path = _project_overlay_path(project)
+    overlay = _read_yaml(overlay_path) if overlay_path else {}
+    merged = _merge_vocab(base, overlay)
 
-        with open(resolved, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-    except ImportError:
-        raise RuntimeError(
-            "PyYAML is required to load core/tag_vocabulary.yaml. "
-            "Install it with: pip install pyyaml"
-        )
-    except OSError as exc:
-        raise ValueError(f"Cannot read tag vocabulary at {resolved}: {exc}") from exc
-    except Exception as exc:
-        raise ValueError(f"Failed to parse tag vocabulary at {resolved}: {exc}") from exc
-
-    if path is None:
-        _vocab_cache = data
-    return data
+    if use_cache:
+        _vocab_cache = merged
+    return merged
 
 
 def _canonical_namespaces(vocab: dict | None = None) -> dict[str, set[str]]:
