@@ -115,5 +115,5 @@ def test_token_budget_trims_oldest_sessions():
 def test_legend_lists_kind_emoji():
     panel = render_panel([_mem("a", "A")], session_topics={}, edges=[], rules=[])
     assert "legend" in panel
-    assert KIND_EMOJI["gotcha"] in panel
-    assert KIND_EMOJI["invariant"] in panel
+    assert KIND_EMOJI["correction"] in panel
+    assert KIND_EMOJI["directive"] in panel

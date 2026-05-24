@@ -861,7 +861,7 @@ Return ONLY valid JSON, no prose outside it:
   "verdict": "COHERENT" or "SPLIT",
   "children": [
     {{"title": "<short title>", "content": "<self-contained body>",
-      "memory_kind": "decision|lesson|gotcha|goal|invariant|opinion|bias|todo|debt|fact"}}
+      "kind": "decision|fact|lesson|correction|directive|preference|goal"}}
   ],
   "rationale": "<one sentence>"
 }}

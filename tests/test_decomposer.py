@@ -35,9 +35,9 @@ SPLIT_RESPONSE = json.dumps({
     "verdict": "SPLIT",
     "children": [
         {"title": "API key location", "content": "The API key lives in env var FOO.",
-         "memory_kind": "fact"},
+         "kind": "fact"},
         {"title": "User friction on retries", "content": "Emma abandons after two retries.",
-         "memory_kind": "lesson"},
+         "kind": "lesson"},
     ],
     "rationale": "Two unrelated atoms.",
 })
@@ -55,7 +55,7 @@ def test_decompose_one_returns_children_on_split(db):
     with patch("core.decomposer.call_llm", return_value=SPLIT_RESPONSE):
         children = _decompose_one(m)
     assert children is not None and len(children) == 2
-    assert children[0]["memory_kind"] == "fact"
+    assert children[0]["kind"] == "fact"
 
 
 def test_decompose_one_returns_none_on_coherent(db):
@@ -68,7 +68,7 @@ def test_single_child_split_is_rejected(db):
     """A 'split' into one fragment is not a real split — guard against over-split."""
     one_child = json.dumps({
         "verdict": "SPLIT",
-        "children": [{"title": "x", "content": "y", "memory_kind": "fact"}],
+        "children": [{"title": "x", "content": "y", "kind": "fact"}],
         "rationale": "r",
     })
     m = _mem(_long("text"))
@@ -76,20 +76,20 @@ def test_single_child_split_is_rejected(db):
         assert _decompose_one(m) is None
 
 
-def test_invalid_memory_kind_coerced_to_none(db):
+def test_invalid_kind_coerced_to_none(db):
     bad_kind = json.dumps({
         "verdict": "SPLIT",
         "children": [
-            {"title": "a", "content": "aaa", "memory_kind": "bogus"},
-            {"title": "b", "content": "bbb", "memory_kind": "lesson"},
+            {"title": "a", "content": "aaa", "kind": "bogus"},
+            {"title": "b", "content": "bbb", "kind": "lesson"},
         ],
         "rationale": "r",
     })
     m = _mem(_long("text"))
     with patch("core.decomposer.call_llm", return_value=bad_kind):
         children = _decompose_one(m)
-    assert children[0]["memory_kind"] is None
-    assert children[1]["memory_kind"] == "lesson"
+    assert children[0]["kind"] is None
+    assert children[1]["kind"] == "lesson"
 
 
 # --- run_decomposer_sweep ---------------------------------------------------

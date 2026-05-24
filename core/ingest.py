@@ -24,7 +24,6 @@ from typing import Optional
 
 from .database import get_base_dir, get_commit_ref, get_project
 from .models import Memory, Observation
-from .validators import derive_memory_kind
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +35,14 @@ NATIVE_TYPE_MAP = {
     "reference": "domain_knowledge",
 }
 
-# Map native Claude Code memory types to W5 Memory.kind enum values.
-# Memory.kind ∈ {decision, finding, preference, constraint, correction, open_question}
+# Map native Claude Code memory types to the post-#17 Memory.kind taxonomy
+# (decision, fact, lesson, correction, directive, preference, goal + the two
+# lifecycle states open_question / hypothesis).
 NATIVE_KIND_MAP = {
     "user": "preference",      # user role/profile = stable preference signal
     "feedback": "correction",   # explicit user guidance to adjust behavior
     "project": "decision",      # ongoing initiative state = product/eng decisions
-    "reference": "finding",     # external-system pointers = factual references
+    "reference": "fact",        # external-system pointers = factual references
 }
 
 # Map native types to W5 knowledge_type axis.
@@ -279,9 +279,9 @@ class NativeMemoryIngestor:
                     content_hash=content_hash,
                     project=get_project(),
                     commit_ref=get_commit_ref(),
-                    # W5 schema fields — populate from native frontmatter
+                    # W5 schema fields — populate from native frontmatter.
+                    # Post-#17: kind is the single taxonomy axis; memory_kind is gone.
                     kind=NATIVE_KIND_MAP.get(native_type),
-                    memory_kind=derive_memory_kind(NATIVE_KIND_MAP.get(native_type)),
                     knowledge_type=NATIVE_KNOWLEDGE_TYPE_MAP.get(native_type),
                     knowledge_type_confidence="high" if native_type in NATIVE_KIND_MAP else None,
                     subtitle=(mem.get("description") or "")[:150] or None,

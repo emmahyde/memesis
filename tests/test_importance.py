@@ -26,9 +26,11 @@ def test_floor_does_not_lower_a_high_score():
     assert calibrate_importance(0.9, "fact", "") == pytest.approx(0.9)
 
 
-def test_every_curated_kind_has_a_floor():
-    from core.validators import MEMORY_KIND_VALUES
-    assert set(KIND_IMPORTANCE_FLOOR) == set(MEMORY_KIND_VALUES)
+def test_every_content_kind_has_a_floor():
+    """Every content kind (KIND_VALUES minus lifecycle states) carries a floor."""
+    from core.validators import KIND_VALUES, is_lifecycle_kind
+    content_kinds = {k for k in KIND_VALUES if not is_lifecycle_kind(k)}
+    assert set(KIND_IMPORTANCE_FLOOR) == content_kinds
 
 
 def test_unknown_kind_applies_no_floor():

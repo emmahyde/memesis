@@ -28,7 +28,7 @@ from core.importance import calibrate_importance
 from core.llm import call_llm
 from core.models import ConsolidationLog, Memory
 from core.prompts import MEMORY_DECOMPOSITION_PROMPT
-from core.validators import MEMORY_KIND_VALUES
+from core.validators import KIND_VALUES, is_lifecycle_kind
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def _decompose_one(memory: Memory) -> list[dict] | None:
     """Audit one memory. Return a list of child specs to split into, or None.
 
     None means COHERENT (or an unusable verdict) — leave the memory intact.
-    Each returned child spec is a sanitised {title, content, memory_kind} dict.
+    Each returned child spec is a sanitised {title, content, kind} dict.
     """
     prompt = MEMORY_DECOMPOSITION_PROMPT.format(
         title=memory.title or "",
@@ -71,13 +71,15 @@ def _decompose_one(memory: Memory) -> list[dict] | None:
         content = (child.get("content") or "").strip()
         if not content:
             continue
-        kind = child.get("memory_kind")
-        if kind not in MEMORY_KIND_VALUES:
+        kind = child.get("kind")
+        # Lifecycle kinds (open_question, hypothesis) are not valid SPLIT outputs;
+        # a decomposed child must carry a content kind or NULL.
+        if kind not in KIND_VALUES or is_lifecycle_kind(kind):
             kind = None
         children.append({
             "title": (child.get("title") or "").strip() or "(untitled)",
             "content": content,
-            "memory_kind": kind,
+            "kind": kind,
         })
 
     # Guard against over-splitting: a real split has >=2 self-contained children.
@@ -98,9 +100,9 @@ def _apply_split(memory: Memory, children: list[dict]) -> None:
             summary=spec["title"],
             content=spec["content"],
             tags=memory.tags,
-            memory_kind=spec["memory_kind"],
+            kind=spec["kind"],
             importance=calibrate_importance(
-                memory.importance, spec["memory_kind"], spec["content"]
+                memory.importance, kind=spec["kind"], content=spec["content"]
             ),
             reinforcement_count=0,
             created_at=now,

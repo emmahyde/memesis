@@ -66,11 +66,8 @@ def _build_panel() -> str:
     except Exception:
         role = None
 
-    # WATCH — recent gotchas and corrections.
-    watch = [
-        m.title for m in mems
-        if (m.memory_kind == "gotcha" or m.kind == "correction")
-    ][:3]
+    # WATCH — recent corrections (post-#17 'gotcha' folded into 'correction').
+    watch = [m.title for m in mems if m.kind == "correction"][:3]
 
     return render_index(
         mems,

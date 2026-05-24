@@ -19,11 +19,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-# Emoji per memory_kind — also the legend.
+# Emoji per kind — also the legend. Post-#17 single 7+2 vocab.
 KIND_EMOJI = {
-    "decision": "📌", "lesson": "💡", "gotcha": "⚠️", "goal": "🎯",
-    "invariant": "⚖️", "opinion": "💬", "bias": "🎭", "todo": "☑️",
-    "debt": "🧾", "fact": "🔹",
+    "decision": "📌", "fact": "🔹", "lesson": "💡", "correction": "⚠️",
+    "directive": "⚖️", "preference": "💬", "goal": "🎯",
+    "open_question": "❓", "hypothesis": "🧪",
 }
 _DEFAULT_EMOJI = "🔸"
 _SEVERITY_TAG = {"block": "⛔", "ask": "❓", "warn": "⚠️"}
@@ -107,7 +107,7 @@ class _Mem:
     def __init__(self, src):
         self.id = _get(src, "id") or ""
         self.title = (_get(src, "title") or "(untitled)").strip()
-        self.kind = _get(src, "memory_kind")
+        self.kind = _get(src, "kind")
         self.session = _get(src, "source_session") or ""
         self.cluster = _get(src, "cluster")
         self.created_at = _get(src, "created_at") or ""
@@ -159,7 +159,7 @@ def render_panel(
 ) -> str:
     """Render the SessionStart panel.
 
-    memories: objects/dicts with id, title, memory_kind, source_session,
+    memories: objects/dicts with id, title, kind, source_session,
         cluster, created_at.
     session_topics: {session_id: {"topic": str, "created_at": str}}.
     edges: iterable of (source_id, target_id, edge_type).
