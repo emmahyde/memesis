@@ -40,7 +40,6 @@ from .models import ConsolidationLog, Memory, Observation
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .importance import calibrate_importance
 from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
-from .validators import is_lifecycle_kind
 from .question_lifecycle import (
     detect_resolution,
     get_unresolved_questions,
