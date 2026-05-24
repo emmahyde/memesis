@@ -18,7 +18,7 @@ from peewee import fn
 
 from .database import get_base_dir
 from .lifecycle import LifecycleManager
-from .models import Memory, RetrievalLog, db
+from .models import ConsolidationLog, Memory, RetrievalLog, db
 
 
 def _ensure_nltk_data():
@@ -563,7 +563,19 @@ def cards_unused_in_subsequent_sessions(
 
 
 def _record_usage(memory_id: str, session_id: str) -> None:
-    """Record that a memory was actively used (not just injected)."""
+    """Record that a memory was actively used (not just injected).
+
+    Also propagates cross-session reinforcement: when a memory is used in a
+    session distinct from its source session AND has not already been
+    reinforced in this session, bump ``reinforcement_count`` and log a
+    ``promoted`` row (with ``from_stage == to_stage``) so the spacing query
+    in ``LifecycleManager._has_spaced_reinforcement`` counts it.
+
+    Without this propagation, ``reinforcement_count`` only ever increments
+    from consolidator PROMOTE decisions, which fire rarely. Genuine usage
+    across sessions never feeds the crystallization gate — leaving rc=0 on
+    memories that have demonstrably proved their worth.
+    """
     now = datetime.now().isoformat()
     Memory.update(
         last_used_at=now,
@@ -583,3 +595,56 @@ def _record_usage(memory_id: str, session_id: str) -> None:
         RetrievalLog.session_id == session_id,
         RetrievalLog.timestamp == subq,
     ).execute()
+
+    _propagate_reinforcement(memory_id, session_id, now)
+
+
+def _propagate_reinforcement(memory_id: str, session_id: str, now: str) -> None:
+    """Bump ``reinforcement_count`` once per cross-session usage event.
+
+    Guards:
+    - Skip if memory does not exist or is archived.
+    - Skip if the using session is the memory's source session (self-use is
+      not evidence of durability).
+    - Skip if a reinforcement was already logged for this (memory, session)
+      pair — usage can fire multiple times per session as more of the
+      assistant's response streams in; we count the session, not the call.
+    """
+    try:
+        memory = Memory.get_by_id(memory_id)
+    except Memory.DoesNotExist:
+        return
+
+    if memory.archived_at:
+        return
+    if memory.source_session and memory.source_session == session_id:
+        return
+
+    # Already reinforced in this session — idempotent.
+    already = (
+        ConsolidationLog.select()
+        .where(
+            ConsolidationLog.memory_id == memory_id,
+            ConsolidationLog.session_id == session_id,
+            ConsolidationLog.action == "promoted",
+            ConsolidationLog.from_stage == ConsolidationLog.to_stage,
+        )
+        .exists()
+    )
+    if already:
+        return
+
+    current_rc = memory.reinforcement_count or 0
+    Memory.update(
+        reinforcement_count=current_rc + 1,
+    ).where(Memory.id == memory_id).execute()
+
+    ConsolidationLog.create(
+        timestamp=now,
+        session_id=session_id,
+        action="promoted",
+        memory_id=memory_id,
+        from_stage=memory.stage,
+        to_stage=memory.stage,
+        rationale="cross-session usage reinforcement",
+    )

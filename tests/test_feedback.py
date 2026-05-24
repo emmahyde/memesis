@@ -598,3 +598,94 @@ class TestInjectionCountDecoupling:
 
         assert Memory.get_by_id(mem_low.id).importance == 0.5
         assert Memory.get_by_id(mem_high.id).importance == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Cross-session reinforcement propagation (task #3)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossSessionReinforcement:
+    """
+    `_record_usage` must bump `reinforcement_count` once per distinct session
+    when usage happens outside the memory's source session. Same-session
+    self-use does not count. Re-firing in the same session is idempotent.
+    """
+
+    def _make(self, *, source_session: str | None = None, rc: int = 0) -> str:
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="consolidated",
+            title="t", summary="s", content="c", tags="[]",
+            importance=0.5,
+            reinforcement_count=rc,
+            source_session=source_session,
+            created_at=now, updated_at=now,
+        )
+        return mem.id
+
+    def test_bumps_rc_in_new_session(self, base):
+        from core.feedback import _record_usage as prod_record_usage
+        from core.models import ConsolidationLog
+
+        mid = self._make(source_session="sess-orig", rc=0)
+        prod_record_usage(mid, "sess-later")
+
+        assert Memory.get_by_id(mid).reinforcement_count == 1
+        log = ConsolidationLog.select().where(
+            ConsolidationLog.memory_id == mid,
+            ConsolidationLog.action == "promoted",
+        ).get()
+        assert log.from_stage == log.to_stage == "consolidated"
+        assert log.session_id == "sess-later"
+
+    def test_same_session_does_not_bump(self, base):
+        from core.feedback import _record_usage as prod_record_usage
+
+        mid = self._make(source_session="sess-A", rc=0)
+        prod_record_usage(mid, "sess-A")
+
+        assert Memory.get_by_id(mid).reinforcement_count == 0
+
+    def test_idempotent_within_session(self, base):
+        from core.feedback import _record_usage as prod_record_usage
+
+        mid = self._make(source_session="sess-orig", rc=0)
+        prod_record_usage(mid, "sess-later")
+        prod_record_usage(mid, "sess-later")
+        prod_record_usage(mid, "sess-later")
+
+        assert Memory.get_by_id(mid).reinforcement_count == 1
+
+    def test_distinct_sessions_each_bump(self, base):
+        from core.feedback import _record_usage as prod_record_usage
+
+        mid = self._make(source_session="sess-orig", rc=0)
+        prod_record_usage(mid, "sess-A")
+        prod_record_usage(mid, "sess-B")
+        prod_record_usage(mid, "sess-C")
+
+        assert Memory.get_by_id(mid).reinforcement_count == 3
+
+    def test_archived_memory_skipped(self, base):
+        from core.feedback import _record_usage as prod_record_usage
+
+        now = datetime.now().isoformat()
+        mem = Memory.create(
+            stage="consolidated",
+            title="t", summary="s", content="c", tags="[]",
+            importance=0.5, reinforcement_count=0,
+            source_session="sess-orig",
+            archived_at=now,
+            created_at=now, updated_at=now,
+        )
+        prod_record_usage(mem.id, "sess-later")
+        assert Memory.get_by_id(mem.id).reinforcement_count == 0
+
+    def test_null_source_session_still_bumps(self, base):
+        """Legacy memories with NULL source_session bump on any usage."""
+        from core.feedback import _record_usage as prod_record_usage
+
+        mid = self._make(source_session=None, rc=0)
+        prod_record_usage(mid, "sess-X")
+        assert Memory.get_by_id(mid).reinforcement_count == 1
