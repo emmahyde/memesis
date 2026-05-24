@@ -40,6 +40,7 @@ from .models import ConsolidationLog, Memory, Observation
 from .prompts import CONSOLIDATION_PROMPT, CONTRADICTION_RESOLUTION_PROMPT
 from .importance import calibrate_importance
 from .schemas import ConsolidationDecision as _ConsolidationDecisionSchema
+from .validators import default_knowledge_type_for_kind
 from .question_lifecycle import (
     detect_resolution,
     get_unresolved_questions,
@@ -1022,7 +1023,11 @@ class Consolidator:
                 cwd=decision.get("cwd"),
                 subject=decision.get("subject"),
                 work_event=decision.get("work_event"),
-                knowledge_type=decision.get("knowledge_type"),
+                # LLM value wins; fall back to kind→Bloom default when LLM omits it.
+                knowledge_type=(
+                    decision.get("knowledge_type")
+                    or default_knowledge_type_for_kind(obs_kind or "")
+                ),
                 knowledge_type_confidence=decision.get("knowledge_type_confidence"),
                 raw_importance=decision.get("_raw_stage1_importance"),
                 # Task #18: code refs — LLM override wins when valid; else regex baseline

@@ -297,6 +297,51 @@ class TestSessionTypeGuidanceDict:
         missing = self.EXPECTED_KEYS - set(SESSION_TYPE_GUIDANCE.keys())
         assert not missing, f"SESSION_TYPE_GUIDANCE missing keys: {missing}"
 
+
+# ---------------------------------------------------------------------------
+# Task #20 — knowledge_type kind→Bloom default table in CONSOLIDATION_PROMPT
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidationPromptKnowledgeTypeDefaults:
+    """#20: CONSOLIDATION_PROMPT documents the kind→knowledge_type default table."""
+
+    def test_knowledge_type_axis_section_present(self):
+        assert "knowledge_type" in CONSOLIDATION_PROMPT
+
+    def test_four_bloom_values_documented(self):
+        for value in ("factual", "conceptual", "procedural", "metacognitive"):
+            assert value in CONSOLIDATION_PROMPT, (
+                f"Bloom value '{value}' missing from CONSOLIDATION_PROMPT"
+            )
+
+    def test_kind_to_knowledge_type_defaults_documented(self):
+        # Each kind must appear alongside its default in the prompt.
+        kind_defaults = {
+            "decision":      "conceptual",
+            "fact":          "factual",
+            "lesson":        "metacognitive",
+            "correction":    "metacognitive",
+            "directive":     "procedural",
+            "preference":    "metacognitive",
+            "goal":          "conceptual",
+            "open_question": "conceptual",
+            "hypothesis":    "conceptual",
+        }
+        for kind, expected_type in kind_defaults.items():
+            assert kind in CONSOLIDATION_PROMPT, (
+                f"kind '{kind}' missing from CONSOLIDATION_PROMPT default table"
+            )
+        # The four knowledge_type values must all be present
+        for kt in set(kind_defaults.values()):
+            assert kt in CONSOLIDATION_PROMPT
+
+    def test_override_guidance_present(self):
+        lower = CONSOLIDATION_PROMPT.lower()
+        assert "override" in lower, (
+            "CONSOLIDATION_PROMPT must document that LLM may override the kind→knowledge_type default"
+        )
+
     def test_all_values_are_strings(self):
         for key, val in SESSION_TYPE_GUIDANCE.items():
             assert isinstance(val, str), f"SESSION_TYPE_GUIDANCE['{key}'] must be a string"

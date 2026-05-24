@@ -51,6 +51,38 @@ def is_lifecycle_kind(kind: str) -> bool:
     return kind in ("open_question", "hypothesis")
 
 
+# Default knowledge_type mapping per kind (Bloom's taxonomy).
+# The LLM SHOULD override this when context warrants — the table is a
+# fallback used when the LLM omits knowledge_type from its decision.
+_KIND_TO_KNOWLEDGE_TYPE: dict[str, str] = {
+    "decision":      "conceptual",
+    "fact":          "factual",
+    "lesson":        "metacognitive",
+    "correction":    "metacognitive",
+    "directive":     "procedural",
+    "preference":    "metacognitive",
+    "goal":          "conceptual",
+    "open_question": "conceptual",
+    "hypothesis":    "conceptual",
+}
+
+
+def default_knowledge_type_for_kind(kind: str) -> str:
+    """Return the default knowledge_type for a given memory kind.
+
+    Used as a fallback when the LLM consolidation decision omits
+    knowledge_type.  The LLM's explicit value always takes precedence.
+
+    Args:
+        kind: A valid kind string from KIND_VALUES.
+
+    Returns:
+        One of "factual", "conceptual", "procedural", "metacognitive".
+        Falls back to "factual" for unknown kind values.
+    """
+    return _KIND_TO_KNOWLEDGE_TYPE.get(kind, "factual")
+
+
 KNOWLEDGE_TYPE_VALUES = frozenset({
     "factual",
     "conceptual",

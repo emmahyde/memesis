@@ -298,6 +298,29 @@ anything already enforced mechanically by a test, hook, type, or CI check.
 
 STAGE 2 AXIS PROMPTS:
 
+knowledge_type — Bloom's Revised taxonomy (4-way):
+  factual       — discrete fact, specific value, terminology
+  conceptual    — mechanism, principle, model, classification
+  procedural    — how-to, method, required call order, step sequence
+  metacognitive — strategy, self-knowledge, trade-off awareness, vigilance
+
+  Default mapping by kind (fallback when context is neutral — OVERRIDE when
+  the observation's content clearly fits a different category):
+    decision      → conceptual      (settled choice is a conceptual model update)
+    fact          → factual         (pinned claim about a specific value or contract)
+    lesson        → metacognitive   (pattern across incidents → self-knowledge)
+    correction    → metacognitive   (wrong behavior corrected → self-knowledge)
+    directive     → procedural      (behavioral imperative → how-to constraint)
+    preference    → metacognitive   (subjective stance → self-knowledge about style)
+    goal          → conceptual      (north-star objective → conceptual framing)
+    open_question → conceptual      (unresolved issue → conceptual gap)
+    hypothesis    → conceptual      (pending confirmation → conceptual model)
+
+  Override examples:
+    kind=lesson but the lesson is a specific API call order → procedural
+    kind=fact but the fact explains WHY a mechanism works → conceptual
+    kind=directive but the directive is a hard factual constraint → factual
+
 subject — what or whom is this observation about?
   self          — the AI's own tendencies or failure modes
   user          — developer personality, aesthetics, collaboration style
