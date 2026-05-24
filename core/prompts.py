@@ -247,6 +247,20 @@ MEMORY SHAPE — every memory you KEEP must be shaped to transfer to a future se
    Phrase friction as a workflow pattern, not a feeling. A passive friction
    description normalizes broken tooling — PRUNE it or give it a stance.
 
+6. CODE EXAMPLES — PRESERVE, DO NOT SUMMARISE. When observations already contain
+   a fenced code snippet, carry it into the memory's `content` (observation field)
+   unchanged. Do NOT replace a snippet with a prose description — the literal code
+   is evidence and the primary retrieval signal for "fact" and "lesson" kinds.
+
+   When consolidating code-bearing observations:
+   - Retain the fenced block verbatim (language tag included).
+   - Snippets count toward the memory's evidence weight; a memory with a quoted
+     snippet is stronger than one without, all else equal.
+   - Maximum 12 lines per retained snippet; trim only if the original is longer
+     and the trimmed version still demonstrates the pattern.
+   - New memories (KEEP decisions) may include a fenced code block in the
+     `observation` field when the snippet is the core finding.
+
 ---
 
 IMPORTANCE RE-SCORING (panel C7):
@@ -632,6 +646,33 @@ RETIRED VOCABULARY — DO NOT USE these legacy values, they will be rejected:
   knowledge_type: NOT 'descriptive', 'episodic', 'semantic', 'procedural-knowledge'
   knowledge_type_confidence: NOT 'medium', 'unsure', 'maybe' — only 'high' or 'low'
   importance:     MUST be in [0.0, 1.0]; 1.5 / 2.0 / above-1 will be rejected
+
+---
+
+CODE EXAMPLES:
+
+When a useful pattern, API usage, fix, or configuration is demonstrated in code
+during the session, capture the minimal snippet VERBATIM inside the observation's
+facts as a fenced code block with the language tag. Do NOT paraphrase a snippet —
+quote it directly from the transcript.
+
+Rules:
+- Maximum 12 lines per snippet; prefer 3–6 lines.
+- Include the language tag (e.g. ```python, ```bash, ```ts).
+- One snippet per fact item; a fact can be a fenced block.
+- Only include snippets that are load-bearing: the code itself is the finding,
+  not a prose summary of it. A snippet that could be replaced by "call X with Y"
+  is not worth including.
+- Do NOT invent or tidy up code not present in the transcript.
+
+Example (acceptable):
+  "facts": [
+    "Emma discovered that uv run forwards the virtualenv correctly; bare python3 does not:",
+    "```bash\\nuv run python -m pytest tests/\\n```"
+  ]
+
+Example (skip — paraphrase instead):
+  A 40-line function body that explains nothing without surrounding context.
 
 ---
 

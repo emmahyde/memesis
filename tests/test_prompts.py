@@ -342,6 +342,54 @@ class TestConsolidationPromptKnowledgeTypeDefaults:
             "CONSOLIDATION_PROMPT must document that LLM may override the kind→knowledge_type default"
         )
 
+
+# ---------------------------------------------------------------------------
+# Task #21 — code example callouts in EXTRACTION and CONSOLIDATION prompts
+# ---------------------------------------------------------------------------
+
+
+class TestExtractionPromptCodeExamples:
+    """#21: OBSERVATION_EXTRACT_PROMPT contains code-example guidance."""
+
+    def test_code_examples_section_present(self):
+        assert "CODE EXAMPLES" in OBSERVATION_EXTRACT_PROMPT
+
+    def test_verbatim_quote_instruction(self):
+        lower = OBSERVATION_EXTRACT_PROMPT.lower()
+        assert "verbatim" in lower or "do not paraphrase" in lower or "not paraphrase" in lower
+
+    def test_fenced_code_block_language_tag_mentioned(self):
+        assert "language tag" in OBSERVATION_EXTRACT_PROMPT or "```python" in OBSERVATION_EXTRACT_PROMPT
+
+    def test_line_limit_documented(self):
+        assert "12" in OBSERVATION_EXTRACT_PROMPT
+
+    def test_load_bearing_qualifier(self):
+        lower = OBSERVATION_EXTRACT_PROMPT.lower()
+        assert "load-bearing" in lower or "load bearing" in lower
+
+
+class TestConsolidationPromptCodeExamples:
+    """#21: CONSOLIDATION_PROMPT contains code-example preservation guidance."""
+
+    def test_code_examples_section_present(self):
+        assert "CODE EXAMPLES" in CONSOLIDATION_PROMPT
+
+    def test_preserve_not_summarise_instruction(self):
+        lower = CONSOLIDATION_PROMPT.lower()
+        assert "preserve" in lower or "do not summarise" in lower or "do not replace" in lower
+
+    def test_fenced_block_verbatim_mentioned(self):
+        lower = CONSOLIDATION_PROMPT.lower()
+        assert "verbatim" in lower or "fenced" in lower
+
+    def test_fact_and_lesson_kinds_called_out(self):
+        lower = CONSOLIDATION_PROMPT.lower()
+        assert "fact" in lower and "lesson" in lower
+
+    def test_line_limit_documented(self):
+        assert "12" in CONSOLIDATION_PROMPT
+
     def test_all_values_are_strings(self):
         for key, val in SESSION_TYPE_GUIDANCE.items():
             assert isinstance(val, str), f"SESSION_TYPE_GUIDANCE['{key}'] must be a string"
