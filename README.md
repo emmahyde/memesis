@@ -203,9 +203,8 @@ The transcript sweep ingests new content from Claude Code session transcripts
 and extracts durable observations into the ephemeral buffer for downstream
 consolidation. It runs as a standalone process — no hook involvement.
 
-```
-scripts/transcript_cron.py
-```
+Entry point: `core/transcript_ingest.py` (orchestrator) — thin wrapper:
+`scripts/transcript_cron.py`.
 
 Run without arguments to sweep **all projects** under
 `~/.claude/projects/*/*.jsonl`:
@@ -228,18 +227,121 @@ for an hourly sweep of a single project:
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
-| `--project PATH` | *(all)* | Only scan transcripts from this folder (`{PATH}/*.jsonl`). |
-| `--max-sessions N` | *(unlimited)* | Cap the number of sessions processed per tick. |
-| `--dry-run` | *(off)* | Print observations without writing anything. |
+| `--project PATH` | *(all projects)* | Only scan transcripts from this folder (`{PATH}/*.jsonl`). |
+| `--max-sessions N` | *(unlimited)* | Cap the number of sessions processed per tick. Newest sessions first. |
+| `--dry-run` | *(off)* | Print observations without writing anything (cursor, ephemeral, DB). |
 
-### How it works
+### Technical Architecture
 
-Each tick discovers recently-modified JSONL transcripts, reads new content
-since the last cursor (byte-offset), calls the LLM to extract structured
-observations, and appends them to the ephemeral buffer via an `fcntl.flock`
-protected write. The tick is **idempotent** — cursors ensure each session's
-delta is processed exactly once regardless of cadence.
+#### Pipeline (single tick)
 
-New sessions are seeded silently: the cursor starts at EOF on first contact,
-so extraction begins on the second tick when the session has accumulated
-content beyond the cursor.
+Each invocation of `tick()` (defined at `core/transcript_ingest.py:1220`):
+
+1. **Discovery** — `discover_transcripts()` globs JSONL files modified
+   within the last 25 hours. When `--project` is set, scopes the glob to
+   `{project_path}/*.jsonl` instead of `~/.claude/projects/*/*.jsonl`.
+   Sorted by mtime descending so `--max-sessions N` processes the N
+   most-recently-active sessions.
+
+2. **Cursor check** — Each session has a byte-offset cursor in SQLite.
+   If no cursor exists (new session): seed it at EOF and skip
+   (extraction begins next tick). If the on-disk path changed (rotation):
+   reset cursor to EOF. See [CursorStore DB](#cursorstore-db) below.
+
+3. **Delta read** — `read_transcript_from()` opens the JSONL at the cursor
+   offset, reads all new entries, and returns `(entries, new_offset, cwd)`.
+   The cwd is detected from `attachment` entries carrying the working
+   directory field.
+
+4. **Session type detection** — `detect_session_type()` at
+   `core/session_detector.py:182` classifies the session as `code`,
+   `writing`, `research`, or `unknown` using two heuristics:
+   - **Path-based**: substrings in cwd (e.g. `/manuscript/` → `writing`,
+     `/.claude-mem` → `research`, `/projects/sector` → `code`).
+   - **Tool-mix**: ratio of Edit/Write/Bash calls to WebFetch/Read calls,
+     combined with file extension patterns. Research requires web tools
+     + `.md` reads; writing requires prose extensions without code files.
+
+5. **LLM extraction** — `extract_observations()` (line 216) calls the LLM
+   with `format_extract_prompt()` (system prompt: `extraction`). The LLM
+   returns a JSON array of observations. Each observation carries
+   `content`, `importance` [0, 1], `kind` (decision, finding, preference,
+   constraint, correction, open_question), and `knowledge_type`.
+   Observations below `importance < 0.3` are dropped. The LLM may also
+   return `{"skipped": true, "reason": "..."}` to intentionally skip
+   low-signal windows.
+
+6. **Append to ephemeral** — `append_to_ephemeral()` formats each
+   observation as a tagged line (`[observation_type] content`) and
+   appends to `<global>/ephemeral/<project_slug>/<date>.md`. The write is
+   protected by `fcntl.flock` on a `.lock` file in the target directory.
+
+7. **Self-reflection** — After extraction, `reflect_on_extraction()`
+   evaluates heuristic rules over run stats (parse errors, productive
+   windows, knowledge-type variety). Confirmed rules update
+   `self_model.md` and feed back into the next tick's `ParameterOverrides`
+   via the rule registry (`core/rule_registry.py`).
+
+#### CursorStore DB
+
+File: `~/.claude/memesis/cursors.db`
+
+```sql
+CREATE TABLE IF NOT EXISTS transcript_cursors (
+  session_id       TEXT PRIMARY KEY,    -- UUID stem of the JSONL file
+  transcript_path  TEXT NOT NULL,        -- absolute path to the JSONL
+  last_byte_offset INTEGER NOT NULL DEFAULT 0,  -- resume point
+  first_seen_at    INTEGER NOT NULL,    -- Unix timestamp of first contact
+  last_run_at      INTEGER NOT NULL,    -- Unix timestamp of last tick
+  cwd              TEXT DEFAULT NULL     -- last known working directory
+);
+CREATE INDEX IF NOT EXISTS idx_cursors_last_run
+  ON transcript_cursors(last_run_at);
+```
+
+- **New session**: cursor is inserted at `last_byte_offset = file_size`
+  (EOF) on first tick. Nothing extracted. Extraction begins on the second
+  tick after the session accumulates content beyond the cursor.
+- **Path rotation**: if `transcript_path` changes (Claude Code rotated the
+  file), cursor resets to the new file's EOF.
+- **Idempotency**: replaying a tick without new bytes is a no-op. The
+  cursor advances only after a successful extract-and-append cycle.
+- **Crash safety**: if extraction or ephemeral append fails mid-tick, the
+  cursor is not advanced. The next tick re-reads the same delta.
+
+#### Discovery behavior by mode
+
+| Mode | Source | Glob pattern | Max age |
+| ---- | ------ | ------------ | ------- |
+| Default (`--project` unset) | `discover_transcripts()` | `~/.claude/projects/*/*.jsonl` | 25 h |
+| Single-folder (`--project PATH`) | Inline `Path.glob` | `{PATH}/*.jsonl` | 25 h |
+
+Both modes sort results by modification time descending and apply the same
+max-age cutoff (`time.time() - 25 * 3600`).
+
+#### Design properties
+
+- **No long-running state** — Each tick is a standalone Python process.
+  Persistence: SQLite (cursors) + filesystem (ephemeral buffer).
+- **Crash-safe** — Cursor not advanced on failure. `fcntl.flock` prevents
+  interleaved writes to the ephemeral buffer.
+- **Quota-free** — Every eligible window triggers an LLM call. Quality
+  gating is post-hoc (importance filter, validator traces).
+- **Stage 1 of two** — This pipeline captures episodic observations
+  (Tulving 1972). Stage 2 (`core/consolidator.py`) elaborates these toward
+  semantic memory via the PreCompact hook. See [Architecture](#what-it-does)
+  for the full lifecycle.
+
+#### Module index
+
+| Module | File | Role |
+| ------ | ---- | ---- |
+| `transcript_ingest` | `core/transcript_ingest.py` | Orchestrator: `tick()`, `discover_transcripts()`, `extract_observations()`, `append_to_ephemeral()` |
+| `cursors` | `core/cursors.py` | SQLite cursor store: `CursorStore.get()`, `CursorStore.upsert()` |
+| `transcript` | `core/transcript.py` | JSONL parsing: `read_transcript_from()`, `summarize()`, `iter_windows()` |
+| `session_detector` | `core/session_detector.py` | `detect_session_type()` — path + tool-mix heuristics |
+| `extraction_affect` | `core/extraction_affect.py` | Somatic pre-pass over transcript windows |
+| `issue_cards` | `core/issue_cards.py` | Stage 1.5 card synthesis over flat observations |
+| `self_reflection_extraction` | `core/self_reflection_extraction.py` | Post-extraction heuristic rules and self-model updates |
+
+Links: [Architecture overview](#what-it-does) · [CursorStore DB](#cursorstore-db) · [Flags](#flags) · [Consolidation pipeline](#what-it-does)
