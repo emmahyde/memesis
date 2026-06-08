@@ -7,12 +7,17 @@ extracts durable observations via LLM, and appends them to the project's
 ephemeral session buffer for downstream consolidation.
 
 Usage:
-    python3 scripts/transcript_cron.py
+    python3 scripts/transcript_cron.py                        # all projects
+    python3 scripts/transcript_cron.py --project ~/projects/sector  # one project
     python3 scripts/transcript_cron.py --dry-run
     python3 scripts/transcript_cron.py --dry-run --max-sessions 5
+    python3 scripts/transcript_cron.py --project ... --max-sessions 3
 
-Install (crontab):
+Install (crontab) — all projects:
     */15 * * * * /usr/local/bin/python3 /path/to/scripts/transcript_cron.py >> /tmp/memesis-transcript.log 2>&1
+
+Install (launchd) — single project, hourly:
+    python3 scripts/transcript_cron.py --project /Users/emmahyde/.claude/projects/-Users-emmahyde-projects-sector
 """
 import argparse
 import logging
@@ -30,6 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Transcript delta ingestion cron")
     parser.add_argument(
@@ -44,12 +50,26 @@ def main() -> None:
         metavar="N",
         help="Cap the number of sessions processed per tick",
     )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Only scan transcripts from this folder (e.g. ~/.claude/projects/-Users-...)",
+    )
     args = parser.parse_args()
 
     if args.dry_run:
         logger.info("Running in dry-run mode — no writes")
 
-    results = tick(dry_run=args.dry_run, max_sessions=args.max_sessions)
+    scope = f"project={args.project}" if args.project else "all projects"
+    logger.info("Sweep scope: %s", scope)
+
+    results = tick(
+        dry_run=args.dry_run,
+        max_sessions=args.max_sessions,
+        project_path=args.project,
+    )
 
     logger.info(
         "Done: %d session(s) processed, %d observation(s) appended, %d skipped",
@@ -57,7 +77,6 @@ def main() -> None:
         results["observations_total"],
         results["skipped"],
     )
-
 
 if __name__ == "__main__":
     main()

@@ -1217,12 +1217,38 @@ def append_to_ephemeral(
     return len(observations)
 
 
-def tick(dry_run: bool = False, max_sessions: int | None = None) -> dict:
-    """Run one ingestion tick across all recently-modified transcripts."""
+def tick(
+    dry_run: bool = False,
+    max_sessions: int | None = None,
+    project_path: str | Path | None = None,
+) -> dict:
+    """Run one ingestion tick.
+
+    Parameters
+    ----------
+    dry_run:
+        If True, print observations without writing anything.
+    max_sessions:
+        Cap the number of sessions processed per tick.
+    project_path:
+        If set, only scan transcripts from this specific folder
+        (``{project_path}/*.jsonl``).  If None, scan all
+        ``~/.claude/projects/*/*.jsonl`` (the default "all projects"
+        sweep).
+    """
     results = {"processed": 0, "observations_total": 0, "skipped": 0}
 
     with CursorStore() as store:
-        transcripts = discover_transcripts()
+        if project_path is not None:
+            # Single-folder sweep — glob *.jsonl directly.
+            folder = Path(project_path).resolve()
+            cutoff = time.time() - 25 * 3600
+            transcripts = sorted(
+                [p for p in folder.glob("*.jsonl") if p.stat().st_mtime >= cutoff],
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )
+        else:
+            transcripts = discover_transcripts()
         if max_sessions is not None:
             transcripts = transcripts[:max_sessions]
 
