@@ -196,3 +196,50 @@ If using `uv` instead of a virtualenv:
 
 Use `which uv` and `which python` to confirm binary paths — Claude Code does
 not inherit your shell PATH.
+
+## Transcript Sweep (Cron)
+
+The transcript sweep ingests new content from Claude Code session transcripts
+and extracts durable observations into the ephemeral buffer for downstream
+consolidation. It runs as a standalone process — no hook involvement.
+
+```
+scripts/transcript_cron.py
+```
+
+Run without arguments to sweep **all projects** under
+`~/.claude/projects/*/*.jsonl`:
+
+```bash
+# Default: all projects, every 15 min via crontab
+*/15 * * * * uv run --directory /path/to/memesis python scripts/transcript_cron.py
+```
+
+Use `--project` to sweep transcripts from **one specific folder** — useful
+for an hourly sweep of a single project:
+
+```bash
+# Single project — hourly
+0 * * * * uv run --directory /path/to/memesis python scripts/transcript_cron.py \
+    --project ~/.claude/projects/-Users-emmahyde-projects-sector
+```
+
+### Flags
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--project PATH` | *(all)* | Only scan transcripts from this folder (`{PATH}/*.jsonl`). |
+| `--max-sessions N` | *(unlimited)* | Cap the number of sessions processed per tick. |
+| `--dry-run` | *(off)* | Print observations without writing anything. |
+
+### How it works
+
+Each tick discovers recently-modified JSONL transcripts, reads new content
+since the last cursor (byte-offset), calls the LLM to extract structured
+observations, and appends them to the ephemeral buffer via an `fcntl.flock`
+protected write. The tick is **idempotent** — cursors ensure each session's
+delta is processed exactly once regardless of cadence.
+
+New sessions are seeded silently: the cursor starts at EOF on first contact,
+so extraction begins on the second tick when the session has accumulated
+content beyond the cursor.
